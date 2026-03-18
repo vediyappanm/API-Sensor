@@ -1,0 +1,47 @@
+[package]
+name = "api-sec-sensor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.api-sec-sensor]
+path = ".."
+
+[[bin]]
+name = "fuzz_http"
+path = "fuzz_targets/fuzz_http.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_http2"
+path = "fuzz_targets/fuzz_http2.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_websocket"
+path = "fuzz_targets/fuzz_websocket.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_grpc"
+path = "fuzz_targets/fuzz_grpc.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_mcp"
+path = "fuzz_targets/fuzz_mcp.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_redaction"
+path = "fuzz_targets/fuzz_redaction.rs"
+doc = false
+
+[workspace]
+members = ["."]

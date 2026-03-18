@@ -1,0 +1,23 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CARGO_HOME=/root/.cargo
+ENV RUSTUP_HOME=/root/.rustup
+ENV PATH="/root/.cargo/bin:/usr/local/go/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y \
+    clang llvm libbpf-dev linux-tools-common \
+    build-essential pkg-config libssl-dev libelf-dev zlib1g-dev libzstd-dev \
+    curl git python3 openssl ca-certificates protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+# Install Go
+RUN curl -fsSL https://go.dev/dl/go1.21.13.linux-amd64.tar.gz -o /tmp/go.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz
+
+WORKDIR /sensor/ebpf
+CMD ["bash"]

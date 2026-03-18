@@ -1,0 +1,39 @@
+image:
+  repository: ghcr.io/api-sentinel-team/sensor
+  tag: latest
+  pullPolicy: IfNotPresent
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+sensor:
+  bpfObjectPath: /opt/sensor/http_trace.bpf.o
+  ingestUrl: http://api-sentinel-ingest:8080/v1/events
+  accountId: "1000000"
+  batchSize: "200"
+  role: server
+  maxBufferBytes: "65536"
+  maxTotalBufferBytes: "104857600"
+  metricsPort: 9090
+  sampleDefault: "100"
+  sampleHealth: "5"
+
+apiKeySecret:
+  name: api-sentinel-sensor
+  key: api-key
+
+serviceAccount:
+  create: true
+  name: api-sentinel-sensor
+
+metricsService:
+  enabled: true
+  port: 9090
+
+nodeSelector: {}
+tolerations: []

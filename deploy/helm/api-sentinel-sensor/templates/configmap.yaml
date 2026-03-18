@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-sentinel-sensor
+  labels:
+    app.kubernetes.io/name: api-sentinel-sensor
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  INGEST_URL: {{ .Values.sensor.ingestUrl | quote }}
+  ACCOUNT_ID: {{ .Values.sensor.accountId | quote }}
+  BATCH_SIZE: {{ .Values.sensor.batchSize | quote }}
+  ROLE: {{ .Values.sensor.role | quote }}
+  MAX_BUFFER_BYTES: {{ .Values.sensor.maxBufferBytes | quote }}
+  MAX_TOTAL_BUFFER_BYTES: {{ .Values.sensor.maxTotalBufferBytes | quote }}
+  METRICS_PORT: {{ .Values.sensor.metricsPort | quote }}
+  SAMPLE_DEFAULT: {{ .Values.sensor.sampleDefault | quote }}
+  SAMPLE_HEALTH: {{ .Values.sensor.sampleHealth | quote }}
