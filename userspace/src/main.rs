@@ -1,0 +1,369 @@
+mod types;
+mod metrics;
+mod redaction;
+mod websocket;
+mod grpc;
+mod mcp;
+mod http2;
+mod http;
+mod go_tls;
+mod boringssl;
+mod container;
+mod stream;
+mod ingest;
+mod bpf;
+
+use anyhow::Result;
+use clap::Parser;
+use libbpf_rs::{ObjectBuilder, RingBufferBuilder};
+use std::env;
+use std::fs;
+use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time;
+
+use crate::bpf::{attach_tls_uprobes, attach_kernel_probes};
+use crate::boringssl::attach_boring_ssl_static;
+use crate::container::{ContainerLookupRequest, ContainerResolver, fetch_container_metadata};
+use crate::go_tls::{attach_go_tls_probes, detect_go_binary, find_go_tls_offsets};
+use crate::http::discover_tls_libs;
+use crate::ingest::send_batch_with_client;
+use crate::metrics::*;
+use crate::stream::ShardedStreamState;
+use crate::types::*;
+
+// ---------------------------------------------------------------------------
+// CLI Args
+// ---------------------------------------------------------------------------
+
+#[derive(Parser, Debug)]
+#[command(about = "API Security eBPF Sensor")]
+struct Args {
+    #[arg(long)]
+    bpf: String,
+    #[arg(long)]
+    ingest: String,
+    #[arg(long, env = "API_KEY", default_value = "")]
+    api_key: String,
+    #[arg(long, default_value = "1000000")]
+    account_id: u64,
+    #[arg(long, default_value = "200")]
+    batch_size: usize,
+    #[arg(long, default_value = "server")]
+    role: String,
+    #[arg(long, value_delimiter = ',', default_value = "/usr/lib/x86_64-linux-gnu/libssl.so.3")]
+    tls_libs: Vec<String>,
+    #[arg(long, default_value = "auto")]
+    tls_provider: String,
+    #[arg(long, default_value = "-1")]
+    pid: i32,
+    #[arg(long, default_value_t = false)]
+    discover_libs: bool,
+    #[arg(long, default_value = "65536")]
+    max_buffer_bytes: usize,
+    #[arg(long, default_value = "104857600")]
+    max_total_buffer_bytes: usize,
+    #[arg(long, default_value = "9090")]
+    metrics_port: u16,
+    #[arg(long, default_value_t = false)]
+    go_tls: bool,
+    #[arg(long, default_value = "100")]
+    sample_default: u8,
+    #[arg(long, default_value = "5")]
+    sample_health: u8,
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    // Record start time
+    let start_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    START_TIME_SECS.store(start_secs, Ordering::Relaxed);
+
+    let args = Args::parse();
+
+    // Validate required args
+    if args.api_key.is_empty() {
+        anyhow::bail!("--api-key or API_KEY env var is required");
+    }
+    let role = match args.role.as_str() {
+        "server" => TrafficRole::Server,
+        "client" => TrafficRole::Client,
+        other => anyhow::bail!("invalid --role '{}': must be 'server' or 'client'", other),
+    };
+    let sample_default = args.sample_default.min(100);
+    let sample_health = args.sample_health.min(100);
+
+    tracing::info!(bpf = %args.bpf, ingest = %args.ingest, "starting sensor");
+
+    // Start metrics server
+    tokio::spawn(start_metrics_server(args.metrics_port));
+
+    let obj_data = fs::read(&args.bpf)?;
+    let mut obj = ObjectBuilder::default().open_memory(&obj_data)?.load()?;
+
+    let mut links = Vec::new();
+    let mut tls_libs = args.tls_libs.clone();
+    if args.discover_libs {
+        let discovered = discover_tls_libs(args.pid);
+        if !discovered.is_empty() {
+            tls_libs = discovered;
+        }
+    }
+    attach_tls_uprobes(&mut obj, &args.tls_provider, args.pid, args.go_tls, &tls_libs, &mut links)?;
+    attach_kernel_probes(&mut obj, &mut links)?;
+
+    // Initialize sampling_config — must happen before polling starts.
+    // BPF arrays are zero-initialized; rate=0 means "filter everything".
+    if let Some(map) = obj.map_mut("sampling_config") {
+        let key: u32 = 0;
+        let cfg_bytes: [u8; 4] = [sample_default, sample_health, 0, 0];
+        if let Err(e) = map.update(&key.to_ne_bytes(), &cfg_bytes, libbpf_rs::MapFlags::ANY) {
+            tracing::warn!(error = %e, "failed to set sampling_config");
+        }
+    } else {
+        tracing::warn!("sampling_config map not found in BPF object");
+    }
+
+    // Go TLS probes
+    if args.go_tls {
+        tracing::info!(pid = args.pid, "Go TLS: scanning");
+        if let Some(go_bin) = detect_go_binary(args.pid) {
+            tracing::info!(binary = %go_bin, "Go TLS: detected binary");
+            if let Some(offsets) = find_go_tls_offsets(&go_bin) {
+                tracing::info!(binary = %go_bin, version = %offsets.go_version, "attaching Go TLS probes");
+                attach_go_tls_probes(&mut obj, &offsets, &mut links, args.pid);
+            } else {
+                tracing::warn!(binary = %go_bin, "Go TLS: no offsets found");
+            }
+        } else {
+            tracing::warn!(pid = args.pid, "Go TLS: no Go binary found");
+        }
+        // Check for static BoringSSL in the target binary
+        if args.pid > 0 {
+            let maps_path = format!("/proc/{}/maps", args.pid);
+            if let Ok(maps) = fs::read_to_string(&maps_path) {
+                for line in maps.lines() {
+                    if line.contains("r-xp") {
+                        if let Some(path) = line.split_whitespace().last() {
+                            if path.starts_with('/') {
+                                attach_boring_ssl_static(&mut obj, path, args.pid, &mut links);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Final guard: if --go-tls and nothing attached, bail
+    if args.go_tls && links.is_empty() {
+        anyhow::bail!("no probes attached; --go-tls enabled but no TLS library or Go binary found");
+    }
+
+    let node_name = env::var("NODE_NAME")
+        .or_else(|_| env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown-node".to_string());
+    let cri_socket = env::var("CRI_SOCKET")
+        .unwrap_or_else(|_| "/run/containerd/containerd.sock".to_string());
+
+    let (lookup_tx, mut lookup_rx) = mpsc::channel::<ContainerLookupRequest>(1024);
+    let container_resolver = Arc::new(ContainerResolver::new(lookup_tx, node_name));
+    let resolver_handle = container_resolver.clone();
+    tokio::spawn(async move {
+        while let Some(req) = lookup_rx.recv().await {
+            match fetch_container_metadata(&cri_socket, &req.container_id_full).await {
+                Ok(meta) => resolver_handle.update_from_cri(req.cgroup_id, meta),
+                Err(e) => {
+                    tracing::warn!(container = %req.container_id_full, error = %e, "CRI lookup failed");
+                    resolver_handle.mark_lookup_failed(req.cgroup_id);
+                }
+            }
+        }
+    });
+
+    let (tx, mut rx) = mpsc::channel::<ApiTrafficEvent>(10000);
+
+    let http_client = Arc::new(
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(4)
+            .timeout(Duration::from_secs(10))
+            .build()?,
+    );
+
+    let ingest_url  = args.ingest.clone();
+    let api_key     = args.api_key.clone();
+    let batch_size  = args.batch_size;
+    let client_handle = http_client.clone();
+    let batch_handle = tokio::spawn(async move {
+        let mut batch: Vec<ApiTrafficEvent> = Vec::new();
+        let mut flush_interval = time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                ev = rx.recv() => {
+                    match ev {
+                        Some(event) => {
+                            batch.push(event);
+                            if batch.len() >= batch_size {
+                                let payload = std::mem::take(&mut batch);
+                                let _ = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await;
+                            }
+                        }
+                        None => {
+                            // Channel closed — flush remaining events before exit
+                            if !batch.is_empty() {
+                                let payload = std::mem::take(&mut batch);
+                                let _ = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await;
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ = flush_interval.tick() => {
+                    if !batch.is_empty() {
+                        let payload = std::mem::take(&mut batch);
+                        let _ = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await;
+                    }
+                }
+            }
+        }
+    });
+
+    // Use ShardedStreamState
+    let state = Arc::new(ShardedStreamState::new(
+        args.account_id,
+        role,
+        args.max_buffer_bytes,
+        container_resolver.clone(),
+        args.max_total_buffer_bytes,
+    ));
+
+    let mut ringbuf = RingBufferBuilder::new();
+    let sender = tx.clone();
+    let state_handle = state.clone();
+
+    let events_map = obj
+        .map_mut("events")
+        .ok_or_else(|| anyhow::anyhow!("missing events map"))? as *mut libbpf_rs::Map;
+    let close_events_map = obj
+        .map_mut("close_events")
+        .ok_or_else(|| anyhow::anyhow!("missing close_events map"))? as *mut libbpf_rs::Map;
+
+    let channel_capacity = 10000u64;
+    unsafe {
+        ringbuf.add(&mut *events_map, move |data| {
+            if let Some((header, payload)) = TlsEventHeader::from_bytes(data) {
+                EVENTS_CAPTURED.fetch_add(1, Ordering::Relaxed);
+                // Compute channel watermark for backpressure monitoring
+                let current_len = channel_capacity.saturating_sub(sender.capacity() as u64);
+                let watermark = (current_len * 100) / channel_capacity;
+                CHANNEL_WATERMARK_PCT.store(watermark, Ordering::Relaxed);
+
+                let events = state_handle.handle_event(header, payload);
+                for item in events {
+                    if sender.try_send(item).is_err() {
+                        EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            0
+        })?;
+    }
+
+    let state_handle_close = state.clone();
+    unsafe {
+        ringbuf.add(&mut *close_events_map, move |data| {
+            if data.len() < size_of::<CloseEvent>() {
+                return 0;
+            }
+            let ev = std::ptr::read_unaligned(data.as_ptr() as *const CloseEvent);
+            let key = ConnKey { pid: ev.pid, ssl_ptr: ev.ssl_ptr, born_ms: 0 };
+            state_handle_close.evict_connection(&key);
+            0
+        })?;
+    }
+
+    // proc_events ring buffer (optional — map may not exist).
+    // Only log new process info; do NOT call detect_go_binary here as it
+    // reads entire binaries from disk and would block ring buffer processing.
+    let proc_events_result = obj.map_mut("proc_events");
+    if let Some(proc_map) = proc_events_result {
+        let proc_map_ptr = proc_map as *mut libbpf_rs::Map;
+        unsafe {
+            let _ = ringbuf.add(&mut *proc_map_ptr, move |data| {
+                if data.len() < size_of::<NewProcEvent>() {
+                    return 0;
+                }
+                let ev = std::ptr::read_unaligned(data.as_ptr() as *const NewProcEvent);
+                let filename_end = ev.filename.iter().position(|&b| b == 0).unwrap_or(ev.filename.len());
+                let filename = String::from_utf8_lossy(&ev.filename[..filename_end]);
+                tracing::debug!(pid = ev.pid, file = %filename, "new process");
+                0
+            });
+        }
+    }
+
+    let ringbuf = ringbuf.build()?;
+    tracing::info!("probes attached, polling ring buffer");
+
+    // Graceful shutdown on SIGINT/SIGTERM
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    tokio::spawn(async move {
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("failed to register SIGINT handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = sigint.recv() => tracing::info!("received SIGINT, shutting down"),
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
+        }
+        r.store(false, Ordering::Relaxed);
+    });
+
+    // Poll loop — log errors instead of crashing
+    while running.load(Ordering::Relaxed) {
+        if let Err(e) = ringbuf.poll(Duration::from_millis(200)) {
+            tracing::warn!(error = %e, "ring buffer poll error");
+            RINGBUF_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // Drop tx to signal batch task to flush remaining events, then await it
+    drop(tx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), batch_handle).await;
+
+    tracing::info!("shutdown complete");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    fn resolve_owner_pid_tgid(owner: Option<u64>, current: u64) -> u64 {
+        owner.unwrap_or(current)
+    }
+
+    #[test]
+    fn test_ssl_ptr_to_pid_resolution() {
+        let owner   = Some(0x1234_0000_0001u64);
+        let current = 0x9999_0000_0002u64;
+        assert_eq!(resolve_owner_pid_tgid(owner, current), 0x1234_0000_0001);
+        assert_eq!(resolve_owner_pid_tgid(None, current), current);
+    }
+}

@@ -1,0 +1,53 @@
+version: "3.8"
+
+# APISentinel Sensor — Integration Test Harness
+# Usage: docker-compose up -d && cargo test --test integration
+
+services:
+
+  # HTTP/1.1 + HTTP/2 target
+  httpbin:
+    image: kennethreitz/httpbin
+    ports: ["18080:80"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/get"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Go HTTPS service — tests Go crypto/tls capture
+  go-api:
+    build: ./test-servers/go
+    ports: ["18443:8443"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "https://localhost:8443/health", "--no-check-certificate"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Node.js HTTPS — OpenSSL dynamic link (standard path)
+  node-api:
+    build: ./test-servers/node
+    ports: ["18444:8444"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "https://localhost:8444/health", "--no-check-certificate"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # WebSocket server (wss://)
+  ws-server:
+    build: ./test-servers/websocket
+    ports: ["18445:8445"]
+
+  # MCP/SSE server — JSON-RPC 2.0 over SSE
+  mcp-server:
+    build: ./test-servers/mcp
+    ports: ["17777:7777"]
+
+  # Ingest validator — collects and validates captured events
+  ingest-validator:
+    build: ./test-servers/validator
+    ports: ["19999:9999"]
+    environment:
+      - VALIDATOR_PORT=9999

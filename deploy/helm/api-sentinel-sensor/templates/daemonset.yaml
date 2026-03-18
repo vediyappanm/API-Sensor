@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: api-sentinel-sensor
+  labels:
+    app.kubernetes.io/name: api-sentinel-sensor
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api-sentinel-sensor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api-sentinel-sensor
+        app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.sensor.metricsPort | quote }}
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      hostPID: true
+      containers:
+        - name: sensor
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --bpf={{ .Values.sensor.bpfObjectPath }}
+            - --ingest=$(INGEST_URL)
+            - --api-key=$(API_KEY)
+            - --account-id=$(ACCOUNT_ID)
+            - --batch-size=$(BATCH_SIZE)
+            - --role=$(ROLE)
+            - --max-buffer-bytes=$(MAX_BUFFER_BYTES)
+            - --max-total-buffer-bytes=$(MAX_TOTAL_BUFFER_BYTES)
+            - --metrics-port=$(METRICS_PORT)
+            - --sample-default=$(SAMPLE_DEFAULT)
+            - --sample-health=$(SAMPLE_HEALTH)
+            - --discover-libs
+          envFrom:
+            - configMapRef:
+                name: api-sentinel-sensor
+          env:
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKeySecret.name }}
+                  key: {{ .Values.apiKeySecret.key }}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: RUST_LOG
+              value: "info"
+          securityContext:
+            privileged: false
+            capabilities:
+              add:
+                - BPF
+                - PERFMON
+                - SYS_ADMIN
+                - SYS_PTRACE
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.sensor.metricsPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+              readOnly: true
+            - name: bpf-maps
+              mountPath: /sys/fs/bpf
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+      volumes:
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+        - name: bpf-maps
+          hostPath:
+            path: /sys/fs/bpf
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

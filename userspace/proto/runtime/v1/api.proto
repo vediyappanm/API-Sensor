@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+service RuntimeService {
+  rpc ContainerStatus(ContainerStatusRequest) returns (ContainerStatusResponse);
+}
+
+message ContainerStatusRequest {
+  string container_id = 1;
+  bool verbose = 2;
+}
+
+message ContainerStatusResponse {
+  ContainerStatus status = 1;
+  map<string, string> info = 2;
+}
+
+message ContainerStatus {
+  string id = 1;
+  ContainerMetadata metadata = 2;
+  ContainerState state = 3;
+  int64 created_at = 4;
+  int64 started_at = 5;
+  int64 finished_at = 6;
+  int64 exit_code = 7;
+  string image = 8;
+  string image_ref = 9;
+  string reason = 10;
+  string message = 11;
+  map<string, string> labels = 12;
+  map<string, string> annotations = 13;
+}
+
+message ContainerMetadata {
+  string name = 1;
+  uint32 attempt = 2;
+}
+
+enum ContainerState {
+  CONTAINER_CREATED = 0;
+  CONTAINER_RUNNING = 1;
+  CONTAINER_EXITED = 2;
+  CONTAINER_UNKNOWN = 3;
+}
