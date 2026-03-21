@@ -12,6 +12,8 @@ mod container;
 mod stream;
 mod ingest;
 mod bpf;
+mod dns;
+mod quic;
 
 use anyhow::Result;
 use clap::Parser;
@@ -25,13 +27,15 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
 
-use crate::bpf::{attach_tls_uprobes, attach_kernel_probes};
+use crate::bpf::{attach_tls_uprobes, attach_kernel_probes, attach_quic_uprobes};
 use crate::boringssl::attach_boring_ssl_static;
 use crate::container::{ContainerLookupRequest, ContainerResolver, fetch_container_metadata};
+use crate::dns::{DnsResolver, reverse_dns_lookup};
 use crate::go_tls::{attach_go_tls_probes, detect_go_binary, find_go_tls_offsets};
 use crate::http::discover_tls_libs;
 use crate::ingest::send_batch_with_client;
 use crate::metrics::*;
+use crate::quic::discover_quic_libs;
 use crate::stream::ShardedStreamState;
 use crate::types::*;
 
@@ -197,6 +201,40 @@ async fn main() -> Result<()> {
         }
     });
 
+    // DNS reverse-resolution (background worker)
+    let (dns_tx, mut dns_rx) = mpsc::channel::<std::net::IpAddr>(4096);
+    let dns_resolver = Arc::new(DnsResolver::new(dns_tx));
+    let dns_handle = dns_resolver.clone();
+    tokio::spawn(async move {
+        while let Some(ip) = dns_rx.recv().await {
+            let handle = dns_handle.clone();
+            tokio::spawn(async move {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tokio::task::spawn_blocking(move || reverse_dns_lookup(ip)),
+                )
+                .await;
+                match result {
+                    Ok(Ok(hostname)) => handle.insert(ip, hostname),
+                    _ => handle.insert(ip, None),
+                }
+            });
+        }
+    });
+
+    // Discover and attach QUIC library probes
+    if args.discover_libs || args.go_tls {
+        let quic_libs = discover_quic_libs(args.pid);
+        if !quic_libs.is_empty() {
+            tracing::info!(libs = ?quic_libs, "discovered QUIC libraries");
+            match attach_quic_uprobes(&mut obj, args.pid, &quic_libs, &mut links) {
+                Ok(n) if n > 0 => tracing::info!(attached = n, "QUIC probes active"),
+                Ok(_) => tracing::debug!("no QUIC symbols resolved"),
+                Err(e) => tracing::warn!(error = %e, "QUIC uprobe attachment failed"),
+            }
+        }
+    }
+
     let (tx, mut rx) = mpsc::channel::<ApiTrafficEvent>(10000);
 
     let http_client = Arc::new(
@@ -257,6 +295,7 @@ async fn main() -> Result<()> {
         args.max_buffer_bytes,
         container_resolver.clone(),
         args.max_total_buffer_bytes,
+        dns_resolver.clone(),
     ));
 
     let mut ringbuf = RingBufferBuilder::new();
