@@ -308,11 +308,10 @@ static __always_inline int emit_event(struct pt_regs *ctx, const void *buf, __u3
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
     __u32 tid = (__u32)pid_tgid;
-    __u32 read_len = len > MAX_DATA ? MAX_DATA : len;
+    __u32 read_len = len;
+    if (read_len >= MAX_DATA) read_len = MAX_DATA - 1;
 
-    // Apply sampling filter — copy first 64 bytes from user space into a
-    // verified BPF stack buffer before examining content.  We cannot
-    // dereference the raw user pointer (scalar) directly in the verifier.
+    // Apply sampling filter
     if (read_len > 0) {
         char sample_hdr[64] = {};
         __u32 sample_len = read_len < 64 ? read_len : 64;
@@ -322,11 +321,11 @@ static __always_inline int emit_event(struct pt_regs *ctx, const void *buf, __u3
         }
     }
 
-    // Variable-length event: reserve only header + actual data (aligned to 8 bytes)
-    __u32 header_size = offsetof(struct tls_event, data);
-    __u32 total_size = header_size + read_len;
-    total_size = (total_size + 7) & ~7;
-    e = bpf_ringbuf_reserve(&events, total_size, 0);
+    /* Production Fix: Use constant size for verifier stability.
+     * Some kernels/distros reject dynamic size in ringbuf_reserve even if bounded.
+     * By using sizeof(struct tls_event), we use a compile-time constant.
+     */
+    e = bpf_ringbuf_reserve(&events, sizeof(struct tls_event), 0);
     if (!e) {
         return 0;
     }
@@ -381,12 +380,7 @@ static __always_inline int emit_event(struct pt_regs *ctx, const void *buf, __u3
         }
     }
 
-    /* Re-assert bound for the verifier.  Clamp to MAX_DATA-1 first so that
-     * the edge case read_len==MAX_DATA does not map to 0 via &(MAX_DATA-1).
-     * TLS records are ≤ 16 KiB so this clamp never actually truncates data.
-     */
-    if (read_len >= MAX_DATA)
-        read_len = MAX_DATA - 1;
+    /* Verification already ensured read_len < MAX_DATA. */
     e->data_len = read_len;
     if (read_len > 0)
         bpf_probe_read_user(e->data, read_len & (MAX_DATA - 1), buf);

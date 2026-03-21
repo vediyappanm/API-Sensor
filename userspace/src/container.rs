@@ -234,7 +234,10 @@ fn extract_container_id(segment: &str) -> Option<String> {
             break;
         }
     }
-    if s.len() < 12 { None } else { Some(s) }
+    if s.len() < 12 { return None; }
+    // Reject anything that isn't a valid hex container ID
+    if !s.chars().all(|c| c.is_ascii_hexdigit()) { return None; }
+    Some(s)
 }
 
 fn short_id(full: &str) -> String {
@@ -246,6 +249,18 @@ fn short_id(full: &str) -> String {
 // ---------------------------------------------------------------------------
 
 pub async fn fetch_container_metadata(
+    socket_path: &str,
+    container_id_full: &str,
+) -> Result<ContainerMetadata> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fetch_container_metadata_inner(socket_path, container_id_full),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("CRI lookup timed out after 5s"))?
+}
+
+async fn fetch_container_metadata_inner(
     socket_path: &str,
     container_id_full: &str,
 ) -> Result<ContainerMetadata> {

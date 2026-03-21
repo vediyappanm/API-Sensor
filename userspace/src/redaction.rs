@@ -1,7 +1,9 @@
+use hmac::{Hmac, Mac};
 use regex::Regex;
-use siphasher::sip::SipHasher13;
-use std::hash::{Hash, Hasher};
+use sha2::Sha256;
 use std::sync::OnceLock;
+
+type HmacSha256 = Hmac<Sha256>;
 
 // ---------------------------------------------------------------------------
 // PII Redaction
@@ -30,46 +32,48 @@ pub struct PiiDetection {
 
 static PII_PATTERNS: OnceLock<Vec<(PiiType, Regex)>> = OnceLock::new();
 
-/// Default SipHash key — deterministic across all sensor instances.
-/// Override at runtime by setting `PII_HASH_KEY` env var (32 hex chars).
-const DEFAULT_PII_HASH_KEY: (u64, u64) = (0x6b65795f70617274, 0x315f617069736563);
+/// Default HMAC-SHA256 key — 32 bytes, deterministic across sensor instances.
+/// Override at runtime by setting `PII_HASH_KEY` env var (64 hex chars = 32 bytes).
+const DEFAULT_PII_HASH_KEY: &[u8; 32] = b"apisec_pii_key_part1_apisec_part";
 
-static PII_HASH_KEY: OnceLock<(u64, u64)> = OnceLock::new();
+static PII_HASH_KEY: OnceLock<Vec<u8>> = OnceLock::new();
 
-fn pii_hash_key() -> (u64, u64) {
-    *PII_HASH_KEY.get_or_init(|| {
+fn pii_hash_key() -> &'static [u8] {
+    PII_HASH_KEY.get_or_init(|| {
         if let Ok(hex) = std::env::var("PII_HASH_KEY") {
-            if hex.len() == 32 {
-                if let (Ok(k0), Ok(k1)) = (
-                    u64::from_str_radix(&hex[..16], 16),
-                    u64::from_str_radix(&hex[16..], 16),
-                ) {
-                    return (k0, k1);
+            if hex.len() == 64 {
+                let bytes: Option<Vec<u8>> = (0..32)
+                    .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+                    .collect();
+                if let Some(key) = bytes {
+                    return key;
                 }
             }
-            tracing::warn!("PII_HASH_KEY must be exactly 32 hex chars; using default");
+            tracing::warn!("PII_HASH_KEY must be exactly 64 hex chars (32 bytes); using default");
         }
-        DEFAULT_PII_HASH_KEY
+        DEFAULT_PII_HASH_KEY.to_vec()
     })
 }
 
 pub fn pii_token(pii_type: &PiiType, original: &str) -> String {
     let key = pii_hash_key();
-    let mut h = SipHasher13::new_with_keys(key.0, key.1);
-    original.hash(&mut h);
-    let hash = h.finish() & 0xFFFF_FFFF;
+    let mut mac = HmacSha256::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(original.as_bytes());
+    let result = mac.finalize().into_bytes();
+    let hash = u64::from_le_bytes(result[..8].try_into().unwrap());
     match pii_type {
-        PiiType::Email       => format!("PII_EMAIL_{hash:08x}"),
-        PiiType::CreditCard  => format!("PII_CARD_{hash:08x}"),
-        PiiType::Ssn         => format!("PII_SSN_{hash:08x}"),
-        PiiType::Phone       => format!("PII_PHONE_{hash:08x}"),
-        PiiType::Jwt         => format!("PII_JWT_{hash:08x}"),
-        PiiType::BearerToken => format!("PII_TOKEN_{hash:08x}"),
+        PiiType::Email       => format!("PII_EMAIL_{hash:016x}"),
+        PiiType::CreditCard  => format!("PII_CARD_{hash:016x}"),
+        PiiType::Ssn         => format!("PII_SSN_{hash:016x}"),
+        PiiType::Phone       => format!("PII_PHONE_{hash:016x}"),
+        PiiType::Jwt         => format!("PII_JWT_{hash:016x}"),
+        PiiType::BearerToken => format!("PII_TOKEN_{hash:016x}"),
         PiiType::PrivateKey  => "PII_PRIVATE_KEY_REDACTED".to_string(),
-        PiiType::AwsKey      => format!("PII_AWSKEY_{hash:08x}"),
-        PiiType::GcpToken    => format!("PII_GCPTOKEN_{hash:08x}"),
-        PiiType::IndianPan   => format!("PII_PAN_{hash:08x}"),
-        PiiType::Aadhaar     => format!("PII_AADHAAR_{hash:08x}"),
+        PiiType::AwsKey      => format!("PII_AWSKEY_{hash:016x}"),
+        PiiType::GcpToken    => format!("PII_GCPTOKEN_{hash:016x}"),
+        PiiType::IndianPan   => format!("PII_PAN_{hash:016x}"),
+        PiiType::Aadhaar     => format!("PII_AADHAAR_{hash:016x}"),
     }
 }
 
