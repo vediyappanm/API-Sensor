@@ -5,11 +5,13 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 
 use crate::container::ContainerResolver;
+use crate::dns::{self, DnsResolver};
 use crate::grpc::decode_grpc_fields;
 use crate::http::{HttpMessage, HttpResponseParsed, extract_http_header, split_query};
 use crate::http2::{Http2HpackDecoder, contains_http2_preface, parse_http2_frames};
 use crate::mcp::{is_mcp_response, parse_sse_events};
 use crate::metrics::*;
+use crate::quic;
 use crate::redaction::redact_pii;
 use crate::types::*;
 use crate::websocket::{parse_websocket_frame, ws_opcode_name};
@@ -32,6 +34,7 @@ impl ShardedStreamState {
         max_buffer: usize,
         container_resolver: Arc<ContainerResolver>,
         max_total_buffer_bytes: usize,
+        dns_resolver: Arc<DnsResolver>,
     ) -> Self {
         Self {
             shards: (0..NUM_SHARDS)
@@ -42,6 +45,7 @@ impl ShardedStreamState {
                         max_buffer,
                         container_resolver.clone(),
                         max_total_buffer_bytes,
+                        dns_resolver.clone(),
                     )))
                 })
                 .collect(),
@@ -92,9 +96,11 @@ struct StreamState {
     max_buffer: usize,
     max_total_buffer_bytes: usize,
     container_resolver: Arc<ContainerResolver>,
+    dns_resolver: Arc<DnsResolver>,
     buffers: HashMap<StreamKey, (Vec<u8>, u64)>,
     pending: HashMap<ConnKey, VecDeque<ParsedRequest>>,
     http2_state: HashMap<ConnKey, Http2Conn>,
+    http3_connections: HashSet<ConnKey>,
     ws_connections: HashSet<ConnKey>,
     known_connections: HashSet<ConnKey>,
     /// Maps (pid, ssl_ptr) → first-seen timestamp for born_ms disambiguation.
@@ -126,6 +132,7 @@ impl StreamState {
         max_buffer: usize,
         container_resolver: Arc<ContainerResolver>,
         max_total_buffer_bytes: usize,
+        dns_resolver: Arc<DnsResolver>,
     ) -> Self {
         Self {
             account_id,
@@ -133,9 +140,11 @@ impl StreamState {
             max_buffer,
             max_total_buffer_bytes,
             container_resolver,
+            dns_resolver,
             buffers: HashMap::new(),
             pending: HashMap::new(),
             http2_state: HashMap::new(),
+            http3_connections: HashSet::new(),
             ws_connections: HashSet::new(),
             known_connections: HashSet::new(),
             conn_born_ms: HashMap::new(),
@@ -192,15 +201,17 @@ impl StreamState {
         self.known_connections.retain(|k| {
             let still_active = self.pending.contains_key(k)
                 || self.http2_state.contains_key(k)
-                || self.ws_connections.contains(k);
+                || self.ws_connections.contains(k)
+                || self.http3_connections.contains(k);
             if !still_active {
                 ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
                 self.conn_born_ms.remove(&(k.pid, k.ssl_ptr));
             }
             still_active
         });
-        // Clean up ws_connections for evicted connections
+        // Clean up ws/h3 connections for evicted connections
         self.ws_connections.retain(|k| self.known_connections.contains(k));
+        self.http3_connections.retain(|k| self.known_connections.contains(k));
     }
 
     /// Evict a connection by (pid, ssl_ptr), regardless of born_ms.
@@ -224,6 +235,7 @@ impl StreamState {
             }
         });
         self.ws_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
+        self.http3_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
 
         let before = self.known_connections.len();
         self.known_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
@@ -257,6 +269,18 @@ impl StreamState {
             _ => {}
         }
         ctx.container = self.container_resolver.resolve(ev);
+
+        // Process name from BPF comm field (with /proc fallback)
+        ctx.process_name = dns::read_process_name(ev.pid, &ev.comm);
+
+        // DNS reverse resolution (non-blocking, returns cached or queues lookup)
+        if let Some(ref ip) = ctx.source_ip {
+            ctx.source_hostname = self.dns_resolver.lookup_and_queue(ip);
+        }
+        if let Some(ref ip) = ctx.dest_ip {
+            ctx.dest_hostname = self.dns_resolver.lookup_and_queue(ip);
+        }
+
         ctx
     }
 
@@ -296,6 +320,54 @@ impl StreamState {
         }
 
         if data_len == 0 {
+            return output;
+        }
+
+        // HTTP/3 check — detect QUIC/HTTP3 frames from QUIC library probes
+        let is_known_h3 = self.http3_connections.contains(&conn_key);
+        if is_known_h3 || (!is_known_h2 && quic::looks_like_http3(payload)) {
+            self.http3_connections.insert(conn_key.clone());
+            let header_sets = quic::extract_h3_headers(payload);
+            for headers in header_sets {
+                if is_request_dir {
+                    if let Some(method) = headers.get(":method") {
+                        let path = headers.get(":path").cloned().unwrap_or_else(|| "/".to_string());
+                        let host = headers.get(":authority").cloned();
+                        let net_ctx = self.net_context_from_event(ev);
+                        let queue = self.pending.entry(conn_key.clone()).or_default();
+                        if queue.len() < MAX_PENDING_PER_CONN {
+                            queue.push_back(ParsedRequest {
+                                method: method.clone(),
+                                path,
+                                host,
+                                headers: headers.clone(),
+                                ts_ms,
+                                net_ctx,
+                            });
+                        }
+                    }
+                } else if let Some(status) = headers.get(":status") {
+                    let request = self.pending.entry(conn_key.clone()).or_default()
+                        .pop_front()
+                        .unwrap_or_else(|| ParsedRequest {
+                            method: "UNKNOWN".to_string(),
+                            path: "/".to_string(),
+                            host: None,
+                            headers: HashMap::new(),
+                            ts_ms,
+                            net_ctx: NetContext::default(),
+                        });
+                    let latency_ms = ts_ms.saturating_sub(request.ts_ms);
+                    let resp = HttpResponseParsed {
+                        status_code: status.parse::<i32>().unwrap_or(0),
+                        headers: headers.clone(),
+                    };
+                    let event = build_event(
+                        self.account_id, ts_ms, request, resp, latency_ms, "HTTP/3", "ebpf",
+                    );
+                    output.push(event);
+                }
+            }
             return output;
         }
 
@@ -692,6 +764,9 @@ pub fn build_ws_event(
         netns_ino: net_ctx.netns_ino,
         cgroup_id: net_ctx.cgroup_id,
         container: net_ctx.container,
+        process_name: net_ctx.process_name,
+        source_hostname: net_ctx.source_hostname,
+        dest_hostname: net_ctx.dest_hostname,
         metadata: None,
         anomaly_features: None,
     }
@@ -710,6 +785,7 @@ pub fn build_event(
     match protocol {
         "HTTP/1.1" => PROTO_HTTP1.fetch_add(1, Ordering::Relaxed),
         "HTTP/2"   => PROTO_HTTP2.fetch_add(1, Ordering::Relaxed),
+        "HTTP/3"   => PROTO_HTTP3.fetch_add(1, Ordering::Relaxed),
         "gRPC"     => PROTO_GRPC.fetch_add(1, Ordering::Relaxed),
         "WebSocket"=> PROTO_WEBSOCKET.fetch_add(1, Ordering::Relaxed),
         "MCP"      => PROTO_MCP.fetch_add(1, Ordering::Relaxed),
@@ -767,6 +843,9 @@ pub fn build_event(
         netns_ino: net_ctx.netns_ino,
         cgroup_id: net_ctx.cgroup_id,
         container: net_ctx.container,
+        process_name: net_ctx.process_name,
+        source_hostname: net_ctx.source_hostname,
+        dest_hostname: net_ctx.dest_hostname,
         metadata: None,
         anomaly_features: Some(anomaly),
     }

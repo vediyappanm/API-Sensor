@@ -11,6 +11,7 @@ pub static PROTO_HTTP2:        AtomicU64 = AtomicU64::new(0);
 pub static PROTO_GRPC:         AtomicU64 = AtomicU64::new(0);
 pub static PROTO_WEBSOCKET:    AtomicU64 = AtomicU64::new(0);
 pub static PROTO_MCP:          AtomicU64 = AtomicU64::new(0);
+pub static PROTO_HTTP3:        AtomicU64 = AtomicU64::new(0);
 pub static PROTO_GO_TLS:       AtomicU64 = AtomicU64::new(0);
 pub static ACTIVE_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 pub static START_TIME_SECS:    AtomicU64 = AtomicU64::new(0);
@@ -61,6 +62,7 @@ apisec_protocol_events_total{{protocol=\"http2\"}} {}
 apisec_protocol_events_total{{protocol=\"grpc\"}} {}
 apisec_protocol_events_total{{protocol=\"websocket\"}} {}
 apisec_protocol_events_total{{protocol=\"mcp\"}} {}
+apisec_protocol_events_total{{protocol=\"http3\"}} {}
 apisec_protocol_events_total{{protocol=\"go_tls\"}} {}
 
 # HELP apisec_channel_watermark_pct Channel backpressure watermark
@@ -81,6 +83,7 @@ apisec_uptime_seconds {uptime}
         PROTO_GRPC.load(Ordering::Relaxed),
         PROTO_WEBSOCKET.load(Ordering::Relaxed),
         PROTO_MCP.load(Ordering::Relaxed),
+        PROTO_HTTP3.load(Ordering::Relaxed),
         PROTO_GO_TLS.load(Ordering::Relaxed),
     )
 }
