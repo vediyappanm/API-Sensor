@@ -1,0 +1,179 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: api-sensor
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sensor-config
+  namespace: api-sensor
+data:
+  INGEST_URL: "http://ingest.api-sensor:9999/ingest"
+  METRICS_PORT: "9091"
+  LOG_LEVEL: "info"
+  ENABLE_PII_REDACTION: "true"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sensor-role
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log", "nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sensor-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sensor-role
+subjects:
+- kind: ServiceAccount
+  name: sensor
+  namespace: api-sensor
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sensor
+  namespace: api-sensor
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: api-sentinel-sensor
+  namespace: api-sensor
+  labels:
+    app: api-sentinel
+    component: sensor
+spec:
+  selector:
+    matchLabels:
+      app: api-sentinel
+      component: sensor
+  template:
+    metadata:
+      labels:
+        app: api-sentinel
+        component: sensor
+    spec:
+      serviceAccountName: sensor
+      hostNetwork: true
+      hostPID: true
+      hostIPC: true
+      tolerations:
+      - effect: NoSchedule
+        operator: Exists
+      - effect: NoExecute
+        operator: Exists
+      containers:
+      - name: sensor
+        image: api-sentinel:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+            - SYS_ADMIN
+            - SYS_PTRACE
+            - SYS_RESOURCE
+            - NET_ADMIN
+        envFrom:
+        - configMapRef:
+            name: sensor-config
+        ports:
+        - name: metrics
+          containerPort: 9091
+          protocol: TCP
+        - name: health
+          containerPort: 8080
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 2
+        volumeMounts:
+        - name: sys
+          mountPath: /sys
+          readOnly: true
+        - name: debugfs
+          mountPath: /sys/kernel/debug
+        - name: bpffs
+          mountPath: /sys/fs/bpf
+        - name: proc
+          mountPath: /proc
+          readOnly: true
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+      volumes:
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: debugfs
+        hostPath:
+          path: /sys/kernel/debug
+      - name: bpffs
+        hostPath:
+          path: /sys/fs/bpf
+      - name: proc
+        hostPath:
+          path: /proc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sensor-metrics
+  namespace: api-sensor
+  labels:
+    app: api-sentinel
+spec:
+  type: ClusterIP
+  selector:
+    app: api-sentinel
+    component: sensor
+  ports:
+  - name: metrics
+    port: 9091
+    targetPort: metrics
+    protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sensor-metrics
+  namespace: api-sensor
+  labels:
+    app: api-sentinel
+spec:
+  selector:
+    matchLabels:
+      app: api-sentinel
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics

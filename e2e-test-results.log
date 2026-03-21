@@ -1,0 +1,19 @@
+
+================================================================
+  API-Sentinel eBPF Sensor — End-to-End Test Suite
+================================================================
+
+
+[0;36m── Test 1: BPF Verifier ──[0m
+libbpf: elf: failed to open /sensor/bpf/http_trace.bpf.o: No such file or directory
+Error: failed to open object file
+[0;31m[FAIL][0m BPF verifier rejected programs
+
+[0;36m── Test 2: Start Ingest Stub ──[0m
+Ingest stub listening on :9999
+[0;32m[PASS][0m Ingest stub running (PID=586329)
+
+[0;36m── Test 3: Sensor Startup ──[0m
+scripts/e2e-test.sh: line 115: /sensor/userspace/target/release/api-sec-sensor: No such file or directory
+[0;31m[FAIL][0m Sensor exited immediately — check BPF/libssl
+[1;33m[INFO][0m Cleaning up...
