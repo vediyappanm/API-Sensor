@@ -99,6 +99,9 @@ async fn main() -> Result<()> {
     if args.api_key.is_empty() {
         anyhow::bail!("--api-key or API_KEY env var is required");
     }
+    if !args.ingest.starts_with("http://") && !args.ingest.starts_with("https://") {
+        anyhow::bail!("--ingest must be an http:// or https:// URL, got: {}", args.ingest);
+    }
     let role = match args.role.as_str() {
         "server" => TrafficRole::Server,
         "client" => TrafficRole::Client,
@@ -218,14 +221,18 @@ async fn main() -> Result<()> {
                             batch.push(event);
                             if batch.len() >= batch_size {
                                 let payload = std::mem::take(&mut batch);
-                                let _ = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await;
+                                if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await {
+                                    tracing::error!(error = %e, "batch send failed");
+                                }
                             }
                         }
                         None => {
                             // Channel closed — flush remaining events before exit
                             if !batch.is_empty() {
                                 let payload = std::mem::take(&mut batch);
-                                let _ = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await;
+                                if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await {
+                                    tracing::error!(error = %e, "final flush failed");
+                                }
                             }
                             break;
                         }
@@ -234,7 +241,9 @@ async fn main() -> Result<()> {
                 _ = flush_interval.tick() => {
                     if !batch.is_empty() {
                         let payload = std::mem::take(&mut batch);
-                        let _ = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await;
+                        if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await {
+                            tracing::error!(error = %e, "interval flush failed");
+                        }
                     }
                 }
             }
@@ -271,7 +280,7 @@ async fn main() -> Result<()> {
                 let watermark = (current_len * 100) / channel_capacity;
                 CHANNEL_WATERMARK_PCT.store(watermark, Ordering::Relaxed);
 
-                let events = state_handle.handle_event(header, payload);
+                let events = state_handle.handle_event(&header, payload);
                 for item in events {
                     if sender.try_send(item).is_err() {
                         EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -322,22 +331,34 @@ async fn main() -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     tokio::spawn(async move {
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .expect("failed to register SIGINT handler");
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
-        tokio::select! {
-            _ = sigint.recv() => tracing::info!("received SIGINT, shutting down"),
-            _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
+        let sigint_res = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
+        let sigterm_res = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        if let (Ok(mut sigint), Ok(mut sigterm)) = (sigint_res, sigterm_res) {
+            tokio::select! {
+                _ = sigint.recv() => tracing::info!("received SIGINT, shutting down"),
+                _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
+            }
+        } else {
+            tracing::warn!("failed to register SIGINT/SIGTERM handlers; waiting for ctrl-c");
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("received ctrl-c, shutting down");
         }
         r.store(false, Ordering::Relaxed);
     });
 
-    // Poll loop — log errors instead of crashing
+    // Poll loop with exponential backoff on repeated errors
+    let mut poll_backoff_ms = 0u64;
     while running.load(Ordering::Relaxed) {
-        if let Err(e) = ringbuf.poll(Duration::from_millis(200)) {
-            tracing::warn!(error = %e, "ring buffer poll error");
-            RINGBUF_DROPS.fetch_add(1, Ordering::Relaxed);
+        if poll_backoff_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(poll_backoff_ms)).await;
+        }
+        match ringbuf.poll(Duration::from_millis(200)) {
+            Ok(()) => { poll_backoff_ms = 0; }
+            Err(e) => {
+                poll_backoff_ms = (poll_backoff_ms * 2 + 10).min(1000);
+                tracing::warn!(error = %e, backoff_ms = poll_backoff_ms, "ring buffer poll error");
+                RINGBUF_DROPS.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 

@@ -21,33 +21,34 @@ pub fn attach_tls_uprobes(
         let looks_gnutls  = lib_lower.contains("gnutls");
 
         if provider == "openssl" || (provider == "auto" && looks_openssl) {
-            if attach_symbol(obj, "ssl_write_entry",   lib, "SSL_write",    false, pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "ssl_write_exit",    lib, "SSL_write",    true,  pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "ssl_read_entry",    lib, "SSL_read",     false, pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "ssl_read_exit",     lib, "SSL_read",     true,  pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "ssl_read_ex_entry", lib, "SSL_read_ex",  false, pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "ssl_read_ex_exit",  lib, "SSL_read_ex",  true,  pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "ssl_write_ex_entry",lib, "SSL_write_ex", false, pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "ssl_write_ex_exit", lib, "SSL_write_ex", true,  pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "ssl_free_entry",    lib, "SSL_free",     false, pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "ssl_set_fd_entry",  lib, "SSL_set_fd",   false, pid, links).is_ok() { attached += 1; }
+            if try_attach(obj, "ssl_write_entry",   lib, "SSL_write",    false, pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_write_exit",    lib, "SSL_write",    true,  pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_read_entry",    lib, "SSL_read",     false, pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_read_exit",     lib, "SSL_read",     true,  pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_read_ex_entry", lib, "SSL_read_ex",  false, pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_read_ex_exit",  lib, "SSL_read_ex",  true,  pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_write_ex_entry",lib, "SSL_write_ex", false, pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_write_ex_exit", lib, "SSL_write_ex", true,  pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_free_entry",    lib, "SSL_free",     false, pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_set_fd_entry",  lib, "SSL_set_fd",   false, pid, links) { attached += 1; }
         }
         if provider == "gnutls" || (provider == "auto" && looks_gnutls) {
-            if attach_symbol(obj, "gnutls_send_entry", lib, "gnutls_record_send", false, pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "gnutls_send_exit",  lib, "gnutls_record_send", true,  pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "gnutls_recv_entry", lib, "gnutls_record_recv", false, pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "gnutls_recv_exit",  lib, "gnutls_record_recv", true,  pid, links).is_ok() { attached += 1; }
+            if try_attach(obj, "gnutls_send_entry", lib, "gnutls_record_send", false, pid, links) { attached += 1; }
+            if try_attach(obj, "gnutls_send_exit",  lib, "gnutls_record_send", true,  pid, links) { attached += 1; }
+            if try_attach(obj, "gnutls_recv_entry", lib, "gnutls_record_recv", false, pid, links) { attached += 1; }
+            if try_attach(obj, "gnutls_recv_exit",  lib, "gnutls_record_recv", true,  pid, links) { attached += 1; }
         }
         if provider == "auto" && !looks_openssl && !looks_gnutls {
-            if attach_symbol(obj, "ssl_write_entry", lib, "SSL_write", false, pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "ssl_write_exit",  lib, "SSL_write", true,  pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "ssl_read_entry",  lib, "SSL_read",  false, pid, links).is_ok() { attached += 1; }
-            if attach_symbol(obj, "ssl_read_exit",   lib, "SSL_read",  true,  pid, links).is_ok() { attached += 1; }
+            if try_attach(obj, "ssl_write_entry", lib, "SSL_write", false, pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_write_exit",  lib, "SSL_write", true,  pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_read_entry",  lib, "SSL_read",  false, pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_read_exit",   lib, "SSL_read",  true,  pid, links) { attached += 1; }
         }
     }
     if attached == 0 && !go_tls_enabled {
         anyhow::bail!("no TLS uprobes attached; verify --tls-libs or --discover-libs and symbols");
     }
+    tracing::info!(attached, "TLS uprobes attached");
     Ok(())
 }
 
@@ -71,6 +72,29 @@ pub fn attach_kernel_probes(
     links.push(tcp_close.attach().context("attach kprobe tcp_close")?);
 
     Ok(())
+}
+
+/// Attempt to attach a uprobe, logging success at debug and failure at warn.
+/// Returns true if the attach succeeded, false otherwise.
+fn try_attach(
+    obj: &mut libbpf_rs::Object,
+    prog_name: &str,
+    binary: &str,
+    symbol: &str,
+    retprobe: bool,
+    pid: i32,
+    links: &mut Vec<libbpf_rs::Link>,
+) -> bool {
+    match attach_symbol(obj, prog_name, binary, symbol, retprobe, pid, links) {
+        Ok(()) => {
+            tracing::debug!(prog = prog_name, symbol, binary, retprobe, "uprobe attached");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(prog = prog_name, symbol, binary, error = %e, "uprobe attach failed");
+            false
+        }
+    }
 }
 
 pub fn attach_symbol(

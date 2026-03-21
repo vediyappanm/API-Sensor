@@ -29,7 +29,8 @@ regex = "1"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-siphasher = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
 tonic = { version = "0.11", features = ["transport"] }
 tower = "0.4"

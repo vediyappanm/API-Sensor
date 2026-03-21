@@ -48,10 +48,23 @@ pub struct TlsEventHeader {
 impl TlsEventHeader {
     pub const HEADER_SIZE: usize = std::mem::size_of::<Self>();
 
-    pub fn from_bytes(data: &[u8]) -> Option<(&Self, &[u8])> {
-        if data.len() < Self::HEADER_SIZE { return None; }
-        let header = unsafe { &*(data.as_ptr() as *const Self) };
-        let data_len = (header.data_len as usize).min(data.len() - Self::HEADER_SIZE);
+    /// Safely parse a TlsEventHeader from a raw byte slice from the BPF ring buffer.
+    ///
+    /// Uses `read_unaligned` to handle any pointer alignment from the ring buffer,
+    /// returning an owned copy of the header so no raw reference escapes.
+    /// `data_len` from the kernel is clamped defensively to prevent OOB reads.
+    pub fn from_bytes(data: &[u8]) -> Option<(Self, &[u8])> {
+        if data.len() < Self::HEADER_SIZE {
+            return None;
+        }
+        // SAFETY: data.len() >= HEADER_SIZE guarantees the read is in-bounds.
+        // read_unaligned handles any alignment — ring buffer data may not be
+        // aligned to TlsEventHeader's 8-byte alignment requirement.
+        let header: Self = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Self) };
+        // Clamp kernel-supplied data_len to the actual remaining bytes to prevent
+        // any possibility of out-of-bounds slice indexing.
+        let max_payload = data.len().saturating_sub(Self::HEADER_SIZE);
+        let data_len = (header.data_len as usize).min(max_payload);
         let payload = &data[Self::HEADER_SIZE..Self::HEADER_SIZE + data_len];
         Some((header, payload))
     }
