@@ -97,6 +97,51 @@ fn try_attach(
     }
 }
 
+// ---------------------------------------------------------------------------
+// QUIC library uprobe attachment
+// ---------------------------------------------------------------------------
+
+pub fn attach_quic_uprobes(
+    obj: &mut libbpf_rs::Object,
+    pid: i32,
+    quic_libs: &[String],
+    links: &mut Vec<libbpf_rs::Link>,
+) -> Result<usize> {
+    use crate::quic::{classify_quic_lib, QuicLibType};
+
+    let mut attached = 0;
+    for lib in quic_libs {
+        let lib_type = classify_quic_lib(lib);
+        let (recv_sym, send_sym) = match lib_type {
+            Some(QuicLibType::Quiche) => (
+                "quiche_conn_stream_recv",
+                "quiche_conn_stream_send",
+            ),
+            Some(QuicLibType::Ngtcp2) => (
+                "ngtcp2_conn_read_stream",
+                "ngtcp2_conn_write_stream",
+            ),
+            Some(QuicLibType::Lsquic) => (
+                "lsquic_stream_read",
+                "lsquic_stream_write",
+            ),
+            Some(QuicLibType::Msquic) => (
+                "MsQuicStreamReceive",
+                "MsQuicStreamSend",
+            ),
+            None => continue,
+        };
+        if try_attach(obj, "quic_stream_recv_entry", lib, recv_sym, false, pid, links) { attached += 1; }
+        if try_attach(obj, "quic_stream_recv_exit",  lib, recv_sym, true,  pid, links) { attached += 1; }
+        if try_attach(obj, "quic_stream_send_entry", lib, send_sym, false, pid, links) { attached += 1; }
+        if try_attach(obj, "quic_stream_send_exit",  lib, send_sym, true,  pid, links) { attached += 1; }
+    }
+    if attached > 0 {
+        tracing::info!(attached, "QUIC uprobes attached");
+    }
+    Ok(attached)
+}
+
 pub fn attach_symbol(
     obj: &mut libbpf_rs::Object,
     prog_name: &str,

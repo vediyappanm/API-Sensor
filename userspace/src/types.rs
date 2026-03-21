@@ -130,6 +130,12 @@ pub struct ApiTrafficEvent {
     pub cgroup_id: Option<u64>,
     pub container: Option<ContainerContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dest_hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<EventMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anomaly_features: Option<AnomalyFeatures>,
@@ -167,6 +173,9 @@ pub struct NetContext {
     pub netns_ino: Option<u32>,
     pub cgroup_id: Option<u64>,
     pub container: Option<ContainerContext>,
+    pub process_name: Option<String>,
+    pub source_hostname: Option<String>,
+    pub dest_hostname: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

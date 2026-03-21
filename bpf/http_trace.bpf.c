@@ -807,6 +807,100 @@ int go_tls_read_exit(struct pt_regs *ctx)
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// QUIC library probes (quiche, ngtcp2, lsquic)
+//
+// These capture decrypted HTTP/3 stream data from QUIC libraries.
+// Signature (quiche):
+//   ssize_t quiche_conn_stream_recv(conn, stream_id, buf, buf_len, &fin);
+//   ssize_t quiche_conn_stream_send(conn, stream_id, buf, buf_len,  fin);
+// ngtcp2 application stream data follows a similar pattern.
+// ---------------------------------------------------------------------------
+
+struct quic_stream_args {
+    __u64 conn_ptr;
+    __u64 stream_id;
+    void *buf;
+    __u32 buf_len;
+    __u32 _pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);   // pid_tgid
+    __type(value, struct quic_stream_args);
+} quic_recv_args SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);   // pid_tgid
+    __type(value, struct quic_stream_args);
+} quic_send_args SEC(".maps");
+
+// quiche_conn_stream_recv(conn, stream_id, buf, buf_len, &fin)
+SEC("uprobe/quic_stream_recv")
+int quic_stream_recv_entry(struct pt_regs *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct quic_stream_args args = {};
+    args.conn_ptr  = (__u64)PT_REGS_PARM1(ctx);
+    args.stream_id = (__u64)PT_REGS_PARM2(ctx);
+    args.buf       = (void *)PT_REGS_PARM3(ctx);
+    args.buf_len   = (__u32)PT_REGS_PARM4(ctx);
+    bpf_map_update_elem(&quic_recv_args, &pid_tgid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/quic_stream_recv")
+int quic_stream_recv_exit(struct pt_regs *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct quic_stream_args *args = bpf_map_lookup_elem(&quic_recv_args, &pid_tgid);
+    long ret = (long)PT_REGS_RC(ctx);
+    if (!args) return 0;
+    if (ret > 0) {
+        __u32 len = (__u32)ret;
+        len &= (MAX_DATA - 1);
+        // direction 0 = READ (ingress)
+        emit_event(ctx, args->buf, len, 0, args->conn_ptr);
+    }
+    bpf_map_delete_elem(&quic_recv_args, &pid_tgid);
+    return 0;
+}
+
+// quiche_conn_stream_send(conn, stream_id, buf, buf_len, fin)
+SEC("uprobe/quic_stream_send")
+int quic_stream_send_entry(struct pt_regs *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct quic_stream_args args = {};
+    args.conn_ptr  = (__u64)PT_REGS_PARM1(ctx);
+    args.stream_id = (__u64)PT_REGS_PARM2(ctx);
+    args.buf       = (void *)PT_REGS_PARM3(ctx);
+    args.buf_len   = (__u32)PT_REGS_PARM4(ctx);
+    bpf_map_update_elem(&quic_send_args, &pid_tgid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/quic_stream_send")
+int quic_stream_send_exit(struct pt_regs *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct quic_stream_args *args = bpf_map_lookup_elem(&quic_send_args, &pid_tgid);
+    long ret = (long)PT_REGS_RC(ctx);
+    if (!args) return 0;
+    if (ret > 0) {
+        __u32 len = (__u32)ret;
+        len &= (MAX_DATA - 1);
+        // direction 1 = WRITE (egress)
+        emit_event(ctx, args->buf, len, 1, args->conn_ptr);
+    }
+    bpf_map_delete_elem(&quic_send_args, &pid_tgid);
+    return 0;
+}
+
 SEC("kprobe/tcp_close")
 int tcp_close_entry(struct pt_regs *ctx)
 {
