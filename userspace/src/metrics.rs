@@ -73,7 +73,6 @@ apisec_channel_watermark_pct {}
 # TYPE apisec_uptime_seconds gauge
 apisec_uptime_seconds {uptime}
 ",
-        CHANNEL_WATERMARK_PCT.load(Ordering::Relaxed),
         EVENTS_SENT.load(Ordering::Relaxed),
         SEND_ERRORS.load(Ordering::Relaxed),
         ACTIVE_CONNECTIONS.load(Ordering::Relaxed),
@@ -85,6 +84,7 @@ apisec_uptime_seconds {uptime}
         PROTO_MCP.load(Ordering::Relaxed),
         PROTO_HTTP3.load(Ordering::Relaxed),
         PROTO_GO_TLS.load(Ordering::Relaxed),
+        CHANNEL_WATERMARK_PCT.load(Ordering::Relaxed),
     )
 }
 
