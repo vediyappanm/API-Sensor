@@ -1,6 +1,6 @@
 [package]
 name = "api-sec-sensor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [[bin]]
@@ -10,6 +10,10 @@ path = "src/main.rs"
 [lib]
 name = "api_sec_sensor"
 path = "src/lib.rs"
+
+[features]
+default = []
+otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 
 [dependencies]
 anyhow = "1"
@@ -32,11 +36,18 @@ serde_json = "1"
 hmac = "0.12"
 libc = "0.2"
 sha2 = "0.10"
+toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
 tonic = { version = "0.11", features = ["transport"] }
 tower = "0.4"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
+
+# OpenTelemetry (opt-in via --features otel)
+opentelemetry = { version = "0.22", optional = true }
+opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.15", features = ["tonic"], optional = true }
+tracing-opentelemetry = { version = "0.23", optional = true }
 
 [build-dependencies]
 tonic-build = "0.11"

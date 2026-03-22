@@ -52,7 +52,6 @@ impl ShardedStreamState {
         }
     }
 
-    /// Shard by (pid, ssl_ptr) only — born_ms is resolved within the shard.
     fn shard_index(&self, pid: u32, ssl_ptr: u64) -> usize {
         use std::collections::hash_map::DefaultHasher;
         let mut h = DefaultHasher::new();
@@ -103,7 +102,6 @@ struct StreamState {
     http3_connections: HashSet<ConnKey>,
     ws_connections: HashSet<ConnKey>,
     known_connections: HashSet<ConnKey>,
-    /// Maps (pid, ssl_ptr) → first-seen timestamp for born_ms disambiguation.
     conn_born_ms: HashMap<(u32, u64), u64>,
     last_eviction_ms: u64,
 }
@@ -117,7 +115,6 @@ pub struct Http2Conn {
     pub hpack: Http2HpackDecoder,
 }
 
-/// Subtract from TOTAL_BUFFER_BYTES with underflow protection.
 fn release_memory(amount: usize) {
     if amount == 0 { return; }
     TOTAL_BUFFER_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -157,7 +154,6 @@ impl StreamState {
             return;
         }
         self.last_eviction_ms = now_ms;
-
         let mut freed_bytes: usize = 0;
 
         let old_buffers_size: usize = self.buffers.values().map(|(b, _)| b.len()).sum();
@@ -177,9 +173,7 @@ impl StreamState {
             let mut keys: Vec<_> = self.buffers.keys().cloned().collect();
             keys.sort_by_key(|k| self.buffers.get(k).map(|(_, ts)| *ts).unwrap_or(0));
             for k in keys.into_iter().take(excess) {
-                if let Some((buf, _)) = self.buffers.remove(&k) {
-                    freed_bytes += buf.len();
-                }
+                if let Some((buf, _)) = self.buffers.remove(&k) { freed_bytes += buf.len(); }
             }
         }
         if self.http2_state.len() > MAX_STREAM_ENTRIES {
@@ -187,52 +181,32 @@ impl StreamState {
             let mut keys: Vec<_> = self.http2_state.keys().cloned().collect();
             keys.sort_by_key(|k| self.http2_state.get(k).map(|c| c.last_event_ts).unwrap_or(0));
             for k in keys.into_iter().take(excess) {
-                if let Some(conn) = self.http2_state.remove(&k) {
-                    freed_bytes += conn.buffer.len();
-                }
+                if let Some(conn) = self.http2_state.remove(&k) { freed_bytes += conn.buffer.len(); }
             }
         }
 
-        if freed_bytes > 0 {
-            release_memory(freed_bytes);
-        }
+        if freed_bytes > 0 { release_memory(freed_bytes); }
 
-        // Clean up known_connections for evicted connections
         self.known_connections.retain(|k| {
-            let still_active = self.pending.contains_key(k)
-                || self.http2_state.contains_key(k)
-                || self.ws_connections.contains(k)
-                || self.http3_connections.contains(k);
+            let still_active = self.pending.contains_key(k) || self.http2_state.contains_key(k) || self.ws_connections.contains(k) || self.http3_connections.contains(k);
             if !still_active {
                 ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
                 self.conn_born_ms.remove(&(k.pid, k.ssl_ptr));
             }
             still_active
         });
-        // Clean up ws/h3 connections for evicted connections
         self.ws_connections.retain(|k| self.known_connections.contains(k));
         self.http3_connections.retain(|k| self.known_connections.contains(k));
     }
 
-    /// Evict a connection by (pid, ssl_ptr), regardless of born_ms.
     fn evict_connection_by_ptr(&mut self, pid: u32, ssl_ptr: u64) {
         let mut freed_bytes: usize = 0;
         self.buffers.retain(|k, (buf, _)| {
-            if k.pid == pid && k.ssl_ptr == ssl_ptr {
-                freed_bytes += buf.len();
-                false
-            } else {
-                true
-            }
+            if k.pid == pid && k.ssl_ptr == ssl_ptr { freed_bytes += buf.len(); false } else { true }
         });
         self.pending.retain(|k, _| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
         self.http2_state.retain(|k, conn| {
-            if k.pid == pid && k.ssl_ptr == ssl_ptr {
-                freed_bytes += conn.buffer.len();
-                false
-            } else {
-                true
-            }
+            if k.pid == pid && k.ssl_ptr == ssl_ptr { freed_bytes += conn.buffer.len(); false } else { true }
         });
         self.ws_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
         self.http3_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
@@ -240,15 +214,9 @@ impl StreamState {
         let before = self.known_connections.len();
         self.known_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
         let evicted = before - self.known_connections.len();
-        if evicted > 0 {
-            ACTIVE_CONNECTIONS.fetch_sub(evicted as u64, Ordering::Relaxed);
-        }
-
+        if evicted > 0 { ACTIVE_CONNECTIONS.fetch_sub(evicted as u64, Ordering::Relaxed); }
         self.conn_born_ms.remove(&(pid, ssl_ptr));
-
-        if freed_bytes > 0 {
-            release_memory(freed_bytes);
-        }
+        if freed_bytes > 0 { release_memory(freed_bytes); }
     }
 
     fn net_context_from_event(&self, ev: &TlsEventHeader) -> NetContext {
@@ -269,18 +237,9 @@ impl StreamState {
             _ => {}
         }
         ctx.container = self.container_resolver.resolve(ev);
-
-        // Process name from BPF comm field (with /proc fallback)
         ctx.process_name = dns::read_process_name(ev.pid, &ev.comm);
-
-        // DNS reverse resolution (non-blocking, returns cached or queues lookup)
-        if let Some(ref ip) = ctx.source_ip {
-            ctx.source_hostname = self.dns_resolver.lookup_and_queue(ip);
-        }
-        if let Some(ref ip) = ctx.dest_ip {
-            ctx.dest_hostname = self.dns_resolver.lookup_and_queue(ip);
-        }
-
+        if let Some(ref ip) = ctx.source_ip { ctx.source_hostname = self.dns_resolver.lookup_and_queue(ip); }
+        if let Some(ref ip) = ctx.dest_ip { ctx.dest_hostname = self.dns_resolver.lookup_and_queue(ip); }
         ctx
     }
 
@@ -294,7 +253,6 @@ impl StreamState {
 
         self.evict_stale(ts_ms);
 
-        // Track active connections
         if self.known_connections.insert(conn_key.clone()) {
             ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         }
@@ -304,26 +262,42 @@ impl StreamState {
             TrafficRole::Client => ev.direction == 1,
         };
 
-        // HTTP/2 check — only process if already known H2 or preface detected in this event.
-        // This avoids creating a shadow buffer for HTTP/1.1 connections.
+        // Accumulate data for this stream to handle split packets/prefaces
+        {
+            let (buf, _last_seen) = self.buffers.entry(stream_key.clone()).or_insert_with(|| (Vec::new(), ts_ms));
+            if reserve_memory(self.max_total_buffer_bytes, data_len) {
+                buf.extend_from_slice(payload);
+            } else {
+                EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // HTTP/2 check — check accumulated buffer for preface
+        // We extract data from the buffer in a separate scope to avoid double mutable borrow.
         let is_known_h2 = self.http2_state.contains_key(&conn_key);
-        let data_has_preface = if !is_known_h2 && data_len > 0 {
-            contains_http2_preface(payload)
+        let (has_preface, h2_data) = if let Some((buf, _)) = self.buffers.get(&stream_key) {
+            let preface = if !is_known_h2 { contains_http2_preface(buf) } else { false };
+            if is_known_h2 || preface {
+                (preface, Some(buf.clone()))
+            } else {
+                (false, None)
+            }
         } else {
-            false
+            (false, None)
         };
 
-        if is_known_h2 || data_has_preface {
-            if let Some(events) = self.process_http2_event(conn_key.clone(), ev, payload, ts_ms, is_request_dir, data_has_preface) {
+        if let Some(h1_data) = h2_data {
+            if let Some((buf, _)) = self.buffers.get_mut(&stream_key) {
+                buf.clear();
+            }
+            if let Some(events) = self.process_http2_event(conn_key.clone(), ev, &h1_data, ts_ms, is_request_dir, has_preface) {
                 return events;
             }
         }
 
-        if data_len == 0 {
-            return output;
-        }
+        if data_len == 0 { return output; }
 
-        // HTTP/3 check — detect QUIC/HTTP3 frames from QUIC library probes
+        // HTTP/3 check
         let is_known_h3 = self.http3_connections.contains(&conn_key);
         if is_known_h3 || (!is_known_h2 && quic::looks_like_http3(payload)) {
             self.http3_connections.insert(conn_key.clone());
@@ -337,12 +311,8 @@ impl StreamState {
                         let queue = self.pending.entry(conn_key.clone()).or_default();
                         if queue.len() < MAX_PENDING_PER_CONN {
                             queue.push_back(ParsedRequest {
-                                method: method.clone(),
-                                path,
-                                host,
-                                headers: headers.clone(),
-                                ts_ms,
-                                net_ctx,
+                                method: method.clone(), path, host, headers: headers.clone(),
+                                body: None, ts_ms, net_ctx,
                             });
                         }
                     }
@@ -350,45 +320,29 @@ impl StreamState {
                     let request = self.pending.entry(conn_key.clone()).or_default()
                         .pop_front()
                         .unwrap_or_else(|| ParsedRequest {
-                            method: "UNKNOWN".to_string(),
-                            path: "/".to_string(),
-                            host: None,
-                            headers: HashMap::new(),
-                            ts_ms,
-                            net_ctx: NetContext::default(),
+                            method: "UNKNOWN".to_string(), path: "/".to_string(), host: None,
+                            headers: HashMap::new(), body: None, ts_ms, net_ctx: NetContext::default(),
                         });
                     let latency_ms = ts_ms.saturating_sub(request.ts_ms);
-                    let resp = HttpResponseParsed {
-                        status_code: status.parse::<i32>().unwrap_or(0),
-                        headers: headers.clone(),
-                    };
-                    let event = build_event(
-                        self.account_id, ts_ms, request, resp, latency_ms, "HTTP/3", "ebpf",
-                    );
-                    output.push(event);
+                    let resp = HttpResponseParsed { status_code: status.parse::<i32>().unwrap_or(0), headers: headers.clone(), body: None };
+                    output.push(build_event(self.account_id, ts_ms, request, resp, latency_ms, "HTTP/3", "ebpf"));
                 }
             }
             return output;
         }
 
-        // WebSocket check — if connection is upgraded, parse WS frames
+        // WebSocket check
         if self.ws_connections.contains(&conn_key) {
             let mut pos = 0;
             while pos < payload.len() {
                 match parse_websocket_frame(&payload[pos..]) {
                     Some((frame, consumed)) => {
-                        if consumed == 0 { break; } // prevent infinite loop
+                        if consumed == 0 { break; }
                         let opcode_name = ws_opcode_name(frame.opcode).to_string();
                         let payload_str = String::from_utf8_lossy(&frame.payload).into_owned();
                         let redacted_payload = redact_pii(&payload_str);
                         let net_ctx = self.net_context_from_event(ev);
-                        output.push(build_ws_event(
-                            self.account_id,
-                            ts_ms,
-                            opcode_name,
-                            redacted_payload,
-                            net_ctx,
-                        ));
+                        output.push(build_ws_event(self.account_id, ts_ms, opcode_name, redacted_payload, net_ctx));
                         PROTO_WEBSOCKET.fetch_add(1, Ordering::Relaxed);
                         pos += consumed;
                     }
@@ -398,40 +352,25 @@ impl StreamState {
             return output;
         }
 
-        // HTTP/1.1 parsing — use atomic CAS for memory reservation
-        let max_buf = self.max_buffer;
-        let max_total = self.max_total_buffer_bytes;
-        let parsed = {
-            let (buf, last_seen) = self.buffers.entry(stream_key).or_insert_with(|| (Vec::new(), ts_ms));
-            *last_seen = ts_ms;
+        // HTTP/1.1 parsing — re-borrow the buffer after h2/h3/ws checks
+        let (buf, last_seen) = self.buffers.entry(stream_key.clone()).or_insert_with(|| (Vec::new(), ts_ms));
+        *last_seen = ts_ms;
+        if buf.len() > self.max_buffer {
+            let drain = buf.len() - self.max_buffer;
+            release_memory(drain);
+            buf.drain(0..drain);
+        }
 
-            if !reserve_memory(max_total, data_len) {
-                EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
-                return output;
-            }
-            buf.extend_from_slice(payload);
+        let mut msgs = Vec::new();
+        let before_len = buf.len();
+        while let Some((msg, remaining)) = extract_http_header(buf) {
+            msgs.push(msg);
+            *buf = remaining;
+        }
+        let consumed = before_len.saturating_sub(buf.len());
+        if consumed > 0 { release_memory(consumed); }
 
-            if buf.len() > max_buf {
-                let drain = buf.len() - max_buf;
-                release_memory(drain);
-                buf.drain(0..drain);
-            }
-
-            let mut msgs = Vec::new();
-            let before_len = buf.len();
-            while let Some((msg, remaining)) = extract_http_header(buf) {
-                msgs.push(msg);
-                *buf = remaining;
-            }
-            // Account for consumed bytes in memory ceiling
-            let consumed = before_len.saturating_sub(buf.len());
-            if consumed > 0 {
-                release_memory(consumed);
-            }
-            msgs
-        };
-
-        for msg in parsed {
+        for msg in msgs {
             match msg {
                 HttpMessage::Request(req) => {
                     if is_request_dir {
@@ -439,62 +378,32 @@ impl StreamState {
                         let queue = self.pending.entry(conn_key.clone()).or_default();
                         if queue.len() < MAX_PENDING_PER_CONN {
                             queue.push_back(ParsedRequest {
-                                method: req.method,
-                                path: req.path,
-                                host: req.host,
-                                headers: req.headers,
-                                ts_ms,
-                                net_ctx,
+                                method: req.method, path: req.path, host: req.host, headers: req.headers,
+                                body: req.body, ts_ms, net_ctx,
                             });
                         }
                     }
                 }
                 HttpMessage::Response(resp) => {
-                    if is_request_dir {
-                        continue;
-                    }
-
-                    // Check for WebSocket upgrade
+                    if is_request_dir { continue; }
                     let upgrade_hdr = resp.headers.get("upgrade").map(|v| v.to_lowercase());
-                    if upgrade_hdr.as_deref() == Some("websocket") {
-                        self.ws_connections.insert(conn_key.clone());
-                    }
+                    if upgrade_hdr.as_deref() == Some("websocket") { self.ws_connections.insert(conn_key.clone()); }
 
                     let is_mcp = is_mcp_response(&resp.headers);
-
-                    let request = self.pending
-                        .entry(conn_key.clone())
-                        .or_default()
-                        .pop_front()
+                    let request = self.pending.entry(conn_key.clone()).or_default().pop_front()
                         .unwrap_or_else(|| ParsedRequest {
-                            method: "UNKNOWN".to_string(),
-                            path: "/".to_string(),
-                            host: None,
-                            headers: HashMap::new(),
-                            ts_ms,
-                            net_ctx: NetContext::default(),
+                            method: "UNKNOWN".to_string(), path: "/".to_string(), host: None,
+                            headers: HashMap::new(), body: None, ts_ms, net_ctx: NetContext::default(),
                         });
                     let latency_ms = ts_ms.saturating_sub(request.ts_ms);
                     let protocol = if is_mcp { "MCP" } else { "HTTP/1.1" };
-                    let mut event = build_event(
-                        self.account_id,
-                        ts_ms,
-                        request,
-                        resp,
-                        latency_ms,
-                        protocol,
-                        "ebpf",
-                    );
+                    let mut event = build_event(self.account_id, ts_ms, request, resp, latency_ms, protocol, "ebpf");
                     if is_mcp {
                         let mcp_events = parse_sse_events(payload);
                         if let Some(mcp_ev) = mcp_events.first() {
                             event.metadata = Some(EventMetadata {
                                 has_injection: mcp_ev.has_injection,
-                                injection_patterns: if mcp_ev.has_injection {
-                                    vec!["prompt_injection".to_string()]
-                                } else {
-                                    vec![]
-                                },
+                                injection_patterns: if mcp_ev.has_injection { vec!["prompt_injection".to_string()] } else { vec![] },
                                 permission_flags: mcp_ev.permission_flags.clone(),
                                 mcp_method: mcp_ev.method.clone(),
                                 mcp_tool_name: mcp_ev.tool_name.clone(),
@@ -505,36 +414,17 @@ impl StreamState {
                 }
             }
         }
-
         output
     }
 
-    fn process_http2_event(
-        &mut self,
-        conn_key: ConnKey,
-        ev: &TlsEventHeader,
-        payload: &[u8],
-        ts_ms: u64,
-        is_request_dir: bool,
-        data_has_preface: bool,
-    ) -> Option<Vec<ApiTrafficEvent>> {
-        let net_ctx = if is_request_dir {
-            Some(self.net_context_from_event(ev))
-        } else {
-            None
-        };
+    fn process_http2_event(&mut self, conn_key: ConnKey, ev: &TlsEventHeader, payload: &[u8], ts_ms: u64, is_request_dir: bool, data_has_preface: bool) -> Option<Vec<ApiTrafficEvent>> {
+        let net_ctx = if is_request_dir { Some(self.net_context_from_event(ev)) } else { None };
         let conn_state = self.http2_state.entry(conn_key).or_default();
         conn_state.last_event_ts = ts_ms;
-        if data_has_preface {
-            conn_state.seen_preface = true;
-        }
+        if data_has_preface { conn_state.seen_preface = true; }
 
         let data_len = payload.len();
-        if data_len == 0 {
-            return Some(vec![]);
-        }
-
-        // Atomic CAS memory reservation
+        if data_len == 0 { return Some(vec![]); }
         if !reserve_memory(self.max_total_buffer_bytes, data_len) {
             EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
             return Some(vec![]);
@@ -542,30 +432,14 @@ impl StreamState {
         conn_state.buffer.extend_from_slice(payload);
 
         if !conn_state.seen_preface {
-            if contains_http2_preface(&conn_state.buffer) {
-                conn_state.seen_preface = true;
-            } else {
-                return None;
-            }
+            if contains_http2_preface(&conn_state.buffer) { conn_state.seen_preface = true; } else { return None; }
         }
 
         let mut output = Vec::new();
         if conn_state.buffer.len() > self.max_buffer * 2 {
             let target_drain = conn_state.buffer.len() - self.max_buffer;
             let boundary = find_next_frame_boundary(&conn_state.buffer, target_drain);
-            if boundary > 0 {
-                release_memory(boundary);
-                conn_state.buffer.drain(0..boundary);
-            }
-        }
-
-        // Bound pending requests to prevent unbounded growth
-        if conn_state.pending_requests.len() > MAX_H2_PENDING_STREAMS {
-            let excess = conn_state.pending_requests.len() - MAX_H2_PENDING_STREAMS;
-            let keys: Vec<u32> = conn_state.pending_requests.keys().copied().take(excess).collect();
-            for k in keys {
-                conn_state.pending_requests.remove(&k);
-            }
+            if boundary > 0 { release_memory(boundary); conn_state.buffer.drain(0..boundary); }
         }
 
         let stream_frames = parse_http2_frames(&mut conn_state.hpack, &conn_state.buffer);
@@ -576,64 +450,28 @@ impl StreamState {
                     let host = headers.get(":authority").cloned();
                     if conn_state.pending_requests.len() < MAX_H2_PENDING_STREAMS {
                         conn_state.pending_requests.insert(stream_id, ParsedRequest {
-                            method: method.clone(),
-                            path,
-                            host,
-                            headers: headers.clone(),
-                            ts_ms,
+                            method: method.clone(), path, host, headers: headers.clone(), body: None, ts_ms,
                             net_ctx: net_ctx.clone().unwrap_or_default(),
                         });
                     }
-                    let cleared = conn_state.buffer.len();
-                    conn_state.buffer.clear();
-                    release_memory(cleared);
                 }
             } else if let Some(status) = headers.get(":status") {
                 let request = conn_state.pending_requests.remove(&stream_id)
                     .unwrap_or_else(|| ParsedRequest {
-                        method: "UNKNOWN".to_string(),
-                        path: "/".to_string(),
-                        host: None,
-                        headers: HashMap::new(),
-                        ts_ms,
-                        net_ctx: NetContext::default(),
+                        method: "UNKNOWN".to_string(), path: "/".to_string(), host: None,
+                        headers: HashMap::new(), body: None, ts_ms, net_ctx: NetContext::default(),
                     });
                 let latency_ms = ts_ms.saturating_sub(request.ts_ms);
-                let resp = HttpResponseParsed {
-                    status_code: status.parse::<i32>().unwrap_or(0),
-                    headers: headers.clone(),
-                };
-                let is_grpc = headers
-                    .get("content-type")
-                    .map(|v| v.starts_with("application/grpc"))
-                    .unwrap_or(false);
-
-                // gRPC protobuf body decode
+                let resp = HttpResponseParsed { status_code: status.parse::<i32>().unwrap_or(0), headers: headers.clone(), body: None };
+                let is_grpc = headers.get("content-type").map(|v| v.starts_with("application/grpc")).unwrap_or(false);
                 let grpc_body = if is_grpc {
                     let fields = decode_grpc_fields(&conn_state.buffer);
-                    if !fields.is_empty() {
-                        serde_json::to_string(&fields).ok()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                    if !fields.is_empty() { serde_json::to_string(&fields).ok() } else { None }
+                } else { None };
 
                 let protocol = if is_grpc { "gRPC" } else { "HTTP/2" };
-                let mut event = build_event(
-                    self.account_id,
-                    ts_ms,
-                    request,
-                    resp,
-                    latency_ms,
-                    protocol,
-                    "ebpf",
-                );
-                // gRPC body belongs in response, not request
-                if let Some(body) = grpc_body {
-                    event.response.body = Some(body);
-                }
+                let mut event = build_event(self.account_id, ts_ms, request, resp, latency_ms, protocol, "ebpf");
+                if let Some(body) = grpc_body { event.response.body = Some(body); }
                 output.push(event);
             }
         }
@@ -646,142 +484,22 @@ impl StreamState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Anomaly feature computation
-// ---------------------------------------------------------------------------
-
-fn compute_shannon_entropy(s: &str) -> f32 {
-    if s.is_empty() { return 0.0; }
-    let mut freq = [0u32; 256];
-    for &b in s.as_bytes() { freq[b as usize] += 1; }
-    let len = s.len() as f32;
-    freq.iter().filter(|&&c| c > 0).map(|&c| {
-        let p = c as f32 / len;
-        -p * p.log2()
-    }).sum()
-}
-
-fn contains_sqli(path: &str, query: &HashMap<String, String>) -> bool {
-    let patterns = ["union select", "' or ", "1=1", "drop table", "insert into",
-                    "delete from", "update set", "--", "/*", "*/", "xp_", "exec(",
-                    "char(", "concat(", "benchmark(", "sleep("];
-    let check = |s: &str| -> bool {
-        let lower = s.to_lowercase();
-        patterns.iter().any(|p| lower.contains(p))
-    };
-    check(path) || query.values().any(|v| check(v))
-}
-
-fn contains_xss(path: &str, query: &HashMap<String, String>) -> bool {
-    let patterns = ["<script", "javascript:", "onerror=", "onload=", "onfocus=",
-                    "onmouseover=", "<img", "<svg", "<iframe", "alert(", "document.cookie"];
-    let check = |s: &str| -> bool {
-        let lower = s.to_lowercase();
-        patterns.iter().any(|p| lower.contains(p))
-    };
-    check(path) || query.values().any(|v| check(v))
-}
-
-fn compute_anomaly_features(path: &str, query: &HashMap<String, String>, body_len: usize) -> AnomalyFeatures {
-    AnomalyFeatures {
-        path_depth: path.matches('/').count().min(255) as u8,
-        query_param_count: query.len().min(255) as u8,
-        has_encoded_chars: path.contains('%'),
-        request_size_bucket: if body_len == 0 { 0 } else { (body_len as f64).log2() as u8 },
-        shannon_entropy: compute_shannon_entropy(path),
-        has_sqli_pattern: contains_sqli(path, query),
-        has_xss_pattern: contains_xss(path, query),
-        has_path_traversal: path.contains("../") || path.contains("..\\"),
-    }
-}
-
-/// Scan for the next valid HTTP/2 frame boundary at or after `start`.
-fn find_next_frame_boundary(buf: &[u8], start: usize) -> usize {
-    let mut i = start;
-    while i + 9 <= buf.len() {
-        let frame_len = ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | (buf[i + 2] as usize);
-        let frame_type = buf[i + 3];
-        if frame_len <= 16384 && frame_type <= 9 && i + 9 + frame_len <= buf.len() {
-            return i;
-        }
-        i += 1;
-    }
-    buf.len()
-}
-
-/// Atomic CAS memory reservation — returns true if reservation succeeded.
-/// Uses fetch_update to avoid TOCTOU races between check and increment.
-fn reserve_memory(max_total: usize, additional: usize) -> bool {
-    TOTAL_BUFFER_BYTES
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            if current + additional <= max_total {
-                Some(current + additional)
-            } else {
-                None
-            }
-        })
-        .is_ok()
-}
-
-// ---------------------------------------------------------------------------
-// Event builders
-// ---------------------------------------------------------------------------
-
-pub fn build_ws_event(
-    account_id: u64,
-    ts_ms: u64,
-    opcode_name: String,
-    payload: String,
-    net_ctx: NetContext,
-) -> ApiTrafficEvent {
+pub fn build_ws_event(account_id: u64, ts_ms: u64, opcode_name: String, payload: String, net_ctx: NetContext) -> ApiTrafficEvent {
     ApiTrafficEvent {
-        version: "v1".to_string(),
-        event_type: "ws_message".to_string(),
-        source: "ebpf".to_string(),
-        protocol: "WebSocket".to_string(),
-        account_id,
-        observed_at: ts_ms,
+        version: "v1".to_string(), event_type: "ws_message".to_string(), source: "ebpf".to_string(), protocol: "WebSocket".to_string(),
+        account_id, observed_at: ts_ms,
         request: ApiRequest {
-            method: opcode_name,
-            path: "/ws".to_string(),
-            host: None,
-            scheme: "wss".to_string(),
-            headers: HashMap::new(),
-            query: HashMap::new(),
-            body: Some(payload),
+            method: opcode_name, path: "/ws".to_string(), host: None, scheme: "wss".to_string(),
+            headers: HashMap::new(), query: HashMap::new(), body: Some(payload),
         },
-        response: ApiResponse {
-            status_code: 0,
-            headers: HashMap::new(),
-            body: None,
-            latency_ms: None,
-        },
-        collection_id: None,
-        source_ip: net_ctx.source_ip,
-        dest_ip: net_ctx.dest_ip,
-        source_port: net_ctx.source_port,
-        dest_port: net_ctx.dest_port,
-        netns_ino: net_ctx.netns_ino,
-        cgroup_id: net_ctx.cgroup_id,
-        container: net_ctx.container,
-        process_name: net_ctx.process_name,
-        source_hostname: net_ctx.source_hostname,
-        dest_hostname: net_ctx.dest_hostname,
-        metadata: None,
-        anomaly_features: None,
+        response: ApiResponse { status_code: 0, headers: HashMap::new(), body: None, latency_ms: None },
+        collection_id: None, source_ip: net_ctx.source_ip, dest_ip: net_ctx.dest_ip, source_port: net_ctx.source_port, dest_port: net_ctx.dest_port,
+        netns_ino: net_ctx.netns_ino, cgroup_id: net_ctx.cgroup_id, container: net_ctx.container, process_name: net_ctx.process_name,
+        source_hostname: net_ctx.source_hostname, dest_hostname: net_ctx.dest_hostname, metadata: None, anomaly_features: None,
     }
 }
 
-pub fn build_event(
-    account_id: u64,
-    ts_ms: u64,
-    req: ParsedRequest,
-    resp: HttpResponseParsed,
-    latency_ms: u64,
-    protocol: &str,
-    source: &str,
-) -> ApiTrafficEvent {
-    // Increment protocol counters
+pub fn build_event(account_id: u64, ts_ms: u64, req: ParsedRequest, resp: HttpResponseParsed, latency_ms: u64, protocol: &str, source: &str) -> ApiTrafficEvent {
     match protocol {
         "HTTP/1.1" => PROTO_HTTP1.fetch_add(1, Ordering::Relaxed),
         "HTTP/2"   => PROTO_HTTP2.fetch_add(1, Ordering::Relaxed),
@@ -793,60 +511,45 @@ pub fn build_event(
         _          => 0,
     };
 
-    // Compute anomaly features before redaction (on raw path/query)
-    let (_, raw_query) = split_query(&req.path);
-    let anomaly = compute_anomaly_features(&req.path, &raw_query, 0);
-
-    // Apply PII redaction to path and header values
     let redacted_path = redact_pii(&req.path);
     let (path, query) = split_query(&redacted_path);
-    let net_ctx = req.net_ctx.clone();
-
-    let redacted_req_headers: HashMap<String, String> = req.headers
-        .into_iter()
-        .map(|(k, v)| (k, redact_pii(&v)))
-        .collect();
-
-    // Redact response headers too (may contain Set-Cookie, tokens, etc.)
-    let redacted_resp_headers: HashMap<String, String> = resp.headers
-        .into_iter()
-        .map(|(k, v)| (k, redact_pii(&v)))
-        .collect();
+    let net_ctx = req.net_ctx;
 
     ApiTrafficEvent {
-        version: "v1".to_string(),
-        event_type: "api_traffic".to_string(),
-        source: source.to_string(),
-        protocol: protocol.to_string(),
-        account_id,
-        observed_at: ts_ms,
+        version: "v1".to_string(), event_type: "api_traffic".to_string(), source: source.to_string(), protocol: protocol.to_string(),
+        account_id, observed_at: ts_ms,
         request: ApiRequest {
-            method: req.method,
-            path,
-            host: req.host,
-            scheme: "https".to_string(),
-            headers: redacted_req_headers,
-            query,
-            body: None,
+            method: req.method, path, host: req.host, scheme: "https".to_string(),
+            headers: req.headers.into_iter().map(|(k,v)| (k, redact_pii(&v))).collect(),
+            query, body: req.body.map(|b| redact_pii(&b)),
         },
         response: ApiResponse {
             status_code: resp.status_code,
-            headers: redacted_resp_headers,
-            body: None,
+            headers: resp.headers.into_iter().map(|(k,v)| (k, redact_pii(&v))).collect(),
+            body: resp.body.map(|b| redact_pii(&b)),
             latency_ms: Some(latency_ms),
         },
-        collection_id: None,
-        source_ip: net_ctx.source_ip,
-        dest_ip: net_ctx.dest_ip,
-        source_port: net_ctx.source_port,
-        dest_port: net_ctx.dest_port,
-        netns_ino: net_ctx.netns_ino,
-        cgroup_id: net_ctx.cgroup_id,
-        container: net_ctx.container,
-        process_name: net_ctx.process_name,
-        source_hostname: net_ctx.source_hostname,
-        dest_hostname: net_ctx.dest_hostname,
+        collection_id: None, source_ip: net_ctx.source_ip, dest_ip: net_ctx.dest_ip, source_port: net_ctx.source_port, dest_port: net_ctx.dest_port,
+        netns_ino: net_ctx.netns_ino, cgroup_id: net_ctx.cgroup_id, container: net_ctx.container, process_name: net_ctx.process_name,
+        source_hostname: net_ctx.source_hostname, dest_hostname: net_ctx.dest_hostname,
         metadata: None,
-        anomaly_features: Some(anomaly),
+        anomaly_features: None,
     }
+}
+
+fn find_next_frame_boundary(buf: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i + 9 <= buf.len() {
+        let frame_len = ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | (buf[i + 2] as usize);
+        let frame_type = buf[i + 3];
+        if frame_len <= 16384 && frame_type <= 9 && i + 9 + frame_len <= buf.len() { return i; }
+        i += 1;
+    }
+    buf.len()
+}
+
+fn reserve_memory(max_total: usize, additional: usize) -> bool {
+    TOTAL_BUFFER_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        if current + additional <= max_total { Some(current + additional) } else { None }
+    }).is_ok()
 }

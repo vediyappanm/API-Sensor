@@ -149,6 +149,19 @@ impl ContainerResolver {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.remove(&cgroup_id);
     }
+
+    /// Check if a CRI lookup is still pending for this cgroup_id.
+    pub fn is_pending(&self, cgroup_id: u64) -> bool {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.contains(&cgroup_id)
+    }
+
+    /// Re-read the cached context (which may have been updated by CRI worker).
+    /// Returns the latest version of the container context.
+    pub fn get_cached(&self, cgroup_id: u64) -> Option<ContainerContext> {
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.get(&cgroup_id).map(|e| e.context.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------

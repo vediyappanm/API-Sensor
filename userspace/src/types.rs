@@ -204,6 +204,7 @@ pub struct ParsedRequest {
     pub path: String,
     pub host: Option<String>,
     pub headers: HashMap<String, String>,
+    pub body: Option<String>,
     pub ts_ms: u64,
     pub net_ctx: NetContext,
 }
@@ -215,6 +216,32 @@ pub struct EventBatch {
 }
 
 // ---------------------------------------------------------------------------
+// Mount namespace helpers
+// ---------------------------------------------------------------------------
+
+/// Translate a container-internal path to a host-accessible path via procfs.
+///
+/// When the sensor runs in a different mount namespace than the target process
+/// (e.g. sensor container observing a Node.js container), paths extracted from
+/// `/proc/<pid>/maps` refer to the *target's* filesystem.  The sensor cannot
+/// open those paths directly because its own root filesystem is different.
+///
+/// `/proc/<pid>/root/<path>` is a kernel-provided symlink that lets any process
+/// with `CAP_SYS_PTRACE` read files through another process's mount namespace.
+/// This works for both `fs::read` *and* libbpf uprobe attachment (the kernel
+/// resolves the correct inode through procfs).
+///
+/// When `pid <= 0` (meaning "all processes" / no specific target), the path is
+/// returned unchanged — the sensor and target share the same namespace.
+pub fn proc_root_path(pid: i32, path: &str) -> String {
+    if pid > 0 {
+        format!("/proc/{}/root{}", pid, path)
+    } else {
+        path.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
@@ -222,3 +249,49 @@ pub const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0";
 pub const MAX_STREAM_ENTRIES: usize = 10_000;
 pub const STREAM_TTL_MS: u64 = 60_000;
 pub const NUM_SHARDS: usize = 16;
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_root_path_positive_pid() {
+        assert_eq!(
+            proc_root_path(12345, "/usr/lib/libssl.so.3"),
+            "/proc/12345/root/usr/lib/libssl.so.3"
+        );
+    }
+
+    #[test]
+    fn proc_root_path_with_go_binary() {
+        assert_eq!(
+            proc_root_path(99, "/usr/local/bin/node"),
+            "/proc/99/root/usr/local/bin/node"
+        );
+    }
+
+    #[test]
+    fn proc_root_path_no_pid_passthrough() {
+        // pid <= 0 means "all processes" — no namespace translation
+        assert_eq!(
+            proc_root_path(-1, "/usr/lib/libssl.so.3"),
+            "/usr/lib/libssl.so.3"
+        );
+        assert_eq!(
+            proc_root_path(0, "/usr/lib/libssl.so.3"),
+            "/usr/lib/libssl.so.3"
+        );
+    }
+
+    #[test]
+    fn proc_root_path_preserves_deep_paths() {
+        assert_eq!(
+            proc_root_path(1, "/app/vendor/lib/x86_64-linux-gnu/libssl.so.3"),
+            "/proc/1/root/app/vendor/lib/x86_64-linux-gnu/libssl.so.3"
+        );
+    }
+}

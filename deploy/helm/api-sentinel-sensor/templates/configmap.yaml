@@ -6,12 +6,16 @@ metadata:
     app.kubernetes.io/name: api-sentinel-sensor
     app.kubernetes.io/instance: {{ .Release.Name }}
 data:
-  INGEST_URL: {{ .Values.sensor.ingestUrl | quote }}
-  ACCOUNT_ID: {{ .Values.sensor.accountId | quote }}
-  BATCH_SIZE: {{ .Values.sensor.batchSize | quote }}
-  ROLE: {{ .Values.sensor.role | quote }}
-  MAX_BUFFER_BYTES: {{ .Values.sensor.maxBufferBytes | quote }}
-  MAX_TOTAL_BUFFER_BYTES: {{ .Values.sensor.maxTotalBufferBytes | quote }}
-  METRICS_PORT: {{ .Values.sensor.metricsPort | quote }}
-  SAMPLE_DEFAULT: {{ .Values.sensor.sampleDefault | quote }}
-  SAMPLE_HEALTH: {{ .Values.sensor.sampleHealth | quote }}
+  config.toml: |
+    [sensor]
+    bpf = {{ .Values.sensor.bpfObjectPath | quote }}
+    ingest = {{ .Values.sensor.ingestUrl | quote }}
+    account_id = {{ .Values.sensor.accountId }}
+    batch_size = {{ .Values.sensor.batchSize }}
+    role = {{ .Values.sensor.role | quote }}
+    max_buffer_bytes = {{ .Values.sensor.maxBufferBytes }}
+    max_total_buffer_bytes = {{ .Values.sensor.maxTotalBufferBytes }}
+    metrics_port = {{ .Values.sensor.metricsPort }}
+    sample_default = {{ .Values.sensor.sampleDefault }}
+    sample_health = {{ .Values.sensor.sampleHealth }}
+    discover_libs = true

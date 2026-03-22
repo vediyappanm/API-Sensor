@@ -208,36 +208,59 @@ fn goid_offset_for_version(version: &str) -> u64 {
 /// Maximum file size to read when scanning for Go binaries (200 MB).
 const MAX_GO_SCAN_SIZE: u64 = 200 * 1024 * 1024;
 
-pub fn detect_go_binary(pid: i32) -> Option<String> {
-    if pid <= 0 { return None; }
-    let maps_path = format!("/proc/{}/maps", pid);
-    let maps = match fs::read_to_string(&maps_path) {
-        Ok(m) => m,
-        Err(e) => { tracing::warn!(path = %maps_path, error = %e, "Go TLS: cannot read maps"); return None; }
+/// Detect Go binaries. When pid > 0, scans that single process.
+/// When pid <= 0, scans all running processes (global bootstrap).
+/// Returns a list of (host_path, pid) tuples for each detected Go binary.
+pub fn detect_go_binaries(pid: i32) -> Vec<(String, i32)> {
+    let pids = if pid > 0 {
+        vec![pid]
+    } else {
+        crate::http::enumerate_pids()
     };
-    for line in maps.lines() {
-        if !line.contains("r-xp") { continue; }
-        let path = match line.split_whitespace().last() {
-            Some(p) => p,
-            None => continue,
+
+    let mut results = Vec::new();
+    let mut seen_binaries = std::collections::HashSet::new();
+
+    for p in &pids {
+        let maps_path = format!("/proc/{}/maps", p);
+        let maps = match fs::read_to_string(&maps_path) {
+            Ok(m) => m,
+            Err(_) => continue,
         };
-        if path.starts_with('/') {
-            // Skip shared libraries — Go binaries are statically linked
-            if path.contains(".so") { continue; }
-            // Skip files that are too large to scan safely
-            if let Ok(meta) = fs::metadata(path) {
-                if meta.len() > MAX_GO_SCAN_SIZE { continue; }
-            }
-            let data = match fs::read(path) {
-                Ok(d) => d,
-                Err(_) => continue,
+        for line in maps.lines() {
+            if !line.contains("r-xp") { continue; }
+            let path = match line.split_whitespace().last() {
+                Some(p) => p,
+                None => continue,
             };
-            if parse_go_version_from_binary(&data).is_some() {
-                return Some(path.to_string());
+            if path.starts_with('/') {
+                if path.contains(".so") { continue; }
+                // Dedup by container-internal path + pid namespace to avoid
+                // re-scanning the same binary from multiple r-xp mappings.
+                let dedup_key = format!("{}:{}", p, path);
+                if !seen_binaries.insert(dedup_key) { continue; }
+
+                let host_path = crate::types::proc_root_path(*p, path);
+                if let Ok(meta) = fs::metadata(&host_path) {
+                    if meta.len() > MAX_GO_SCAN_SIZE { continue; }
+                }
+                let data = match fs::read(&host_path) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                if parse_go_version_from_binary(&data).is_some() {
+                    tracing::debug!(original = %path, resolved = %host_path, pid = p, "Go binary detected");
+                    results.push((host_path, *p));
+                }
             }
         }
     }
-    None
+    results
+}
+
+/// Backward-compatible single-result wrapper.
+pub fn detect_go_binary(pid: i32) -> Option<String> {
+    detect_go_binaries(pid).into_iter().next().map(|(path, _)| path)
 }
 
 pub fn attach_go_tls_probes(

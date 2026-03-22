@@ -2,20 +2,36 @@ use std::fs;
 
 use crate::go_tls::{find_elf_symbol, find_elf_symbol_dyn, attach_at_offset, va_to_file_offset};
 
-pub fn attach_boring_ssl_static(
+/// Scan a binary for statically-linked TLS (OpenSSL or BoringSSL) and attach uprobes.
+///
+/// Works for any binary that has `SSL_read`/`SSL_write` symbols embedded —
+/// covers Node.js (static OpenSSL), Go with CGO, Nginx static builds,
+/// and Chrome/Electron (BoringSSL).
+pub fn attach_static_tls(
     obj: &mut libbpf_rs::Object,
     binary_path: &str,
     pid: i32,
     links: &mut Vec<libbpf_rs::Link>,
 ) -> bool {
-    let data = match fs::read(binary_path) { Ok(d) => d, Err(_) => return false };
+    let data = match fs::read(binary_path) {
+        Ok(d) => {
+            tracing::debug!(path = %binary_path, size = d.len(), "static TLS: read binary");
+            d
+        }
+        Err(e) => {
+            tracing::debug!(path = %binary_path, error = %e, "static TLS: cannot read binary");
+            return false;
+        }
+    };
     let elf_file = match elf::ElfBytes::<elf::endian::AnyEndian>::minimal_parse(&data) {
-        Ok(e) => e, Err(_) => return false,
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(path = %binary_path, error = %e, "static TLS: not a valid ELF");
+            return false;
+        }
     };
 
-    if !is_boring_ssl(&elf_file, &data) { return false; }
-
-    // Resolve symbol VA → file offset for PIE binary correctness
+    // Resolve symbol VA -> file offset for PIE binary correctness
     let resolve = |name: &str| -> Option<usize> {
         let va = find_elf_symbol(&elf_file, name)
             .or_else(|| find_elf_symbol_dyn(&elf_file, name))?;
@@ -24,7 +40,24 @@ pub fn attach_boring_ssl_static(
 
     let write_off = resolve("SSL_write");
     let read_off  = resolve("SSL_read");
+
+    // If the binary has neither SSL_read nor SSL_write, skip it entirely.
+    if write_off.is_none() && read_off.is_none() {
+        tracing::debug!(path = %binary_path, "static TLS: no SSL_read/SSL_write symbols");
+        return false;
+    }
+
     let free_off  = resolve("SSL_free");
+    let tls_type = detect_tls_type(&elf_file, &data);
+
+    tracing::info!(
+        path = %binary_path,
+        tls_type = %tls_type,
+        ssl_write = ?write_off,
+        ssl_read = ?read_off,
+        ssl_free = ?free_off,
+        "static TLS: symbols found, attaching probes"
+    );
 
     let mut attached = false;
     if let Some(off) = write_off {
@@ -38,35 +71,64 @@ pub fn attach_boring_ssl_static(
     if let Some(off) = free_off {
         let _ = attach_at_offset(obj, "ssl_free_entry", binary_path, off, false, pid, links);
     }
+
+    // Also try _ex variants (OpenSSL 1.1.1+)
+    if let Some(off) = resolve("SSL_read_ex") {
+        let _ = attach_at_offset(obj, "ssl_read_ex_entry", binary_path, off, false, pid, links);
+        let _ = attach_at_offset(obj, "ssl_read_ex_exit", binary_path, off, true, pid, links);
+    }
+    if let Some(off) = resolve("SSL_write_ex") {
+        let _ = attach_at_offset(obj, "ssl_write_ex_entry", binary_path, off, false, pid, links);
+        let _ = attach_at_offset(obj, "ssl_write_ex_exit", binary_path, off, true, pid, links);
+    }
+    if let Some(off) = resolve("SSL_set_fd") {
+        let _ = attach_at_offset(obj, "ssl_set_fd_entry", binary_path, off, false, pid, links);
+    }
+
     if attached {
-        tracing::info!(binary = %binary_path, "BoringSSL static link found");
+        tracing::info!(binary = %binary_path, tls_type = %tls_type, "static TLS probes attached");
     }
     attached
 }
 
-fn is_boring_ssl(elf_file: &elf::ElfBytes<elf::endian::AnyEndian>, data: &[u8]) -> bool {
-    let boring_only = [
+/// Keep the old name as an alias for backward compatibility.
+pub fn attach_boring_ssl_static(
+    obj: &mut libbpf_rs::Object,
+    binary_path: &str,
+    pid: i32,
+    links: &mut Vec<libbpf_rs::Link>,
+) -> bool {
+    attach_static_tls(obj, binary_path, pid, links)
+}
+
+/// Detect which TLS library is embedded in the binary (for logging only).
+fn detect_tls_type(elf_file: &elf::ElfBytes<elf::endian::AnyEndian>, data: &[u8]) -> &'static str {
+    // Check for BoringSSL-specific symbols
+    let boring_syms = [
         "BORINGSSL_bcm_power_on_self_test",
         "CRYPTO_is_confidential_build",
         "SSL_CTX_set_grease_enabled",
     ];
-    let check_sym = |symtab: elf::symbol::SymbolTable<'_, _>,
-                      strtab: elf::string_table::StringTable<'_>| -> bool {
+    let has_boring_sym = |symtab: &elf::symbol::SymbolTable<'_, _>,
+                           strtab: &elf::string_table::StringTable<'_>| -> bool {
         for sym in symtab.iter() {
             if let Ok(name) = strtab.get(sym.st_name as usize) {
-                if boring_only.contains(&name) { return true; }
+                if boring_syms.contains(&name) { return true; }
             }
         }
         false
     };
-    if let Ok(Some((st, sr))) = elf_file.symbol_table() {
-        if check_sym(st, sr) { return true; }
+    if let Ok(Some((ref st, ref sr))) = elf_file.symbol_table() {
+        if has_boring_sym(st, sr) { return "BoringSSL"; }
     }
-    if let Ok(Some((st, sr))) = elf_file.dynamic_symbol_table() {
-        if check_sym(st, sr) { return true; }
+    if let Ok(Some((ref st, ref sr))) = elf_file.dynamic_symbol_table() {
+        if has_boring_sym(st, sr) { return "BoringSSL"; }
     }
-    // Byte-pattern fallback
-    let has_version_str = data.windows(9).any(|w| w == b"BoringSSL");
-    let has_bcm_marker  = data.windows(13).any(|w| w == b"BORINGSSL_bcm");
-    has_version_str && has_bcm_marker
+    // Byte-pattern fallback for BoringSSL
+    let has_boring_str = data.windows(9).any(|w| w == b"BoringSSL");
+    let has_bcm = data.windows(13).any(|w| w == b"BORINGSSL_bcm");
+    if has_boring_str && has_bcm { return "BoringSSL"; }
+
+    // If it has SSL_read/SSL_write but not BoringSSL markers, it's OpenSSL
+    "OpenSSL"
 }

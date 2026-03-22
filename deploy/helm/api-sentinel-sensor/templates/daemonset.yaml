@@ -6,6 +6,10 @@ metadata:
     app.kubernetes.io/name: api-sentinel-sensor
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: api-sentinel-sensor
@@ -18,29 +22,17 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.sensor.metricsPort | quote }}
         prometheus.io/path: "/metrics"
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
       hostPID: true
+      terminationGracePeriodSeconds: 10
       containers:
         - name: sensor
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
-            - --bpf={{ .Values.sensor.bpfObjectPath }}
-            - --ingest=$(INGEST_URL)
-            - --api-key=$(API_KEY)
-            - --account-id=$(ACCOUNT_ID)
-            - --batch-size=$(BATCH_SIZE)
-            - --role=$(ROLE)
-            - --max-buffer-bytes=$(MAX_BUFFER_BYTES)
-            - --max-total-buffer-bytes=$(MAX_TOTAL_BUFFER_BYTES)
-            - --metrics-port=$(METRICS_PORT)
-            - --sample-default=$(SAMPLE_DEFAULT)
-            - --sample-health=$(SAMPLE_HEALTH)
-            - --discover-libs
-          envFrom:
-            - configMapRef:
-                name: api-sentinel-sensor
+            - --config=/etc/api-sentinel/config.toml
           env:
             - name: API_KEY
               valueFrom:
@@ -80,6 +72,9 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
+            - name: config
+              mountPath: /etc/api-sentinel
+              readOnly: true
             - name: debugfs
               mountPath: /sys/kernel/debug
               readOnly: true
@@ -89,6 +84,9 @@ spec:
               mountPath: /sys/fs/cgroup
               readOnly: true
       volumes:
+        - name: config
+          configMap:
+            name: api-sentinel-sensor
         - name: debugfs
           hostPath:
             path: /sys/kernel/debug

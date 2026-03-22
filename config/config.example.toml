@@ -1,0 +1,54 @@
+# API Sentinel Sensor — Configuration File
+#
+# Place at /etc/api-sentinel/config.toml (default) or specify via --config <path>.
+# CLI flags override values in this file.
+# Environment variable API_KEY overrides sensor.api_key.
+
+[sensor]
+# Path to compiled BPF object (required)
+bpf = "/opt/sensor/http_trace.bpf.o"
+
+# Ingest endpoint URL (required)
+ingest = "https://ingest.example.com/v1/events"
+
+# API authentication token (prefer API_KEY env var for secrets)
+# api_key = ""
+
+# Account ID sent in event metadata
+account_id = 1000000
+
+# Events per batch before flushing to ingest
+batch_size = 200
+
+# Traffic role: "server" or "client"
+role = "server"
+
+# TLS library paths (auto-detected with discover_libs = true)
+# tls_libs = ["/usr/lib/x86_64-linux-gnu/libssl.so.3"]
+
+# Force TLS provider: "openssl", "gnutls", or "auto"
+tls_provider = "auto"
+
+# Target PID (-1 = all processes)
+pid = -1
+
+# Auto-detect TLS libraries from /proc/<pid>/maps
+discover_libs = true
+
+# Enable Go crypto/tls interception
+go_tls = false
+
+# Per-connection buffer size (bytes)
+max_buffer_bytes = 65536
+
+# Global memory ceiling (bytes, default 100MB)
+max_total_buffer_bytes = 104857600
+
+# Prometheus metrics port
+metrics_port = 9090
+
+# Sampling rate for normal traffic (0-100, 100 = capture all)
+sample_default = 100
+
+# Sampling rate for health/metrics endpoints (0-100)
+sample_health = 5

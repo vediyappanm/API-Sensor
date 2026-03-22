@@ -1,1 +1,12 @@
 userspace/target
+.git
+.github
+deploy
+tests
+scripts
+*.md
+*.py
+*.swp
+*.tmp
+.dockerignore
+# Keep config/ — Dockerfile copies config.example.toml into the image

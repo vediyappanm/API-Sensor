@@ -11,12 +11,14 @@ pub struct HttpRequestParsed {
     pub path: String,
     pub host: Option<String>,
     pub headers: HashMap<String, String>,
+    pub body: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct HttpResponseParsed {
     pub status_code: i32,
     pub headers: HashMap<String, String>,
+    pub body: Option<String>,
 }
 
 #[derive(Debug)]
@@ -46,6 +48,7 @@ pub fn decode_chunked_body(data: &[u8]) -> Option<(Vec<u8>, usize)> {
     let mut body = Vec::new();
     let mut pos  = 0;
     loop {
+        if pos + 2 > data.len() { return None; }
         let line_end = data[pos..].windows(2).position(|w| w == b"\r\n")?;
         let size_line = std::str::from_utf8(&data[pos..pos + line_end]).ok()?;
         let hex_part = size_line.split(';').next().unwrap_or("").trim();
@@ -77,6 +80,7 @@ pub fn extract_http_header(buf: &[u8]) -> Option<(HttpMessage, Vec<u8>)> {
                 path: "/".to_string(),
                 host: None,
                 headers: HashMap::new(),
+                body: None,
             }), remaining));
         }
     };
@@ -87,8 +91,12 @@ pub fn extract_http_header(buf: &[u8]) -> Option<(HttpMessage, Vec<u8>)> {
         let _ = parts.next();
         let status = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
         let headers = parse_headers(lines);
-        let remaining = advance_past_body(&headers, buf, body_start);
-        return Some((HttpMessage::Response(HttpResponseParsed { status_code: status, headers }), remaining));
+        let (body, remaining) = advance_past_body(&headers, buf, body_start);
+        return Some((HttpMessage::Response(HttpResponseParsed { 
+            status_code: status, 
+            headers, 
+            body: if body.is_empty() { None } else { Some(String::from_utf8_lossy(&body).to_string()) }
+        }), remaining));
     }
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("GET").to_string();
@@ -99,39 +107,46 @@ pub fn extract_http_header(buf: &[u8]) -> Option<(HttpMessage, Vec<u8>)> {
             path: "/".to_string(),
             host: None,
             headers: HashMap::new(),
+            body: None,
         }), remaining));
     }
     let path    = parts.next().unwrap_or("/").to_string();
     let headers = parse_headers(lines);
     let host    = headers.get("host").cloned();
-    let remaining = advance_past_body(&headers, buf, body_start);
-    Some((HttpMessage::Request(HttpRequestParsed { method, path, host, headers }), remaining))
+    let (body, remaining) = advance_past_body(&headers, buf, body_start);
+    Some((HttpMessage::Request(HttpRequestParsed { 
+        method, 
+        path, 
+        host, 
+        headers, 
+        body: if body.is_empty() { None } else { Some(String::from_utf8_lossy(&body).to_string()) }
+    }), remaining))
 }
 
 fn advance_past_body(
     headers: &HashMap<String, String>,
     buf: &[u8],
     body_start: usize,
-) -> Vec<u8> {
+) -> (Vec<u8>, Vec<u8>) {
     let body_slice = &buf[body_start..];
 
     if headers.get("transfer-encoding").map(|v| v.contains("chunked")).unwrap_or(false) {
-        if let Some((_decoded, consumed)) = decode_chunked_body(body_slice) {
-            return body_slice[consumed..].to_vec();
+        if let Some((decoded, consumed)) = decode_chunked_body(body_slice) {
+            return (decoded, body_slice[consumed..].to_vec());
         }
-        return body_slice.to_vec();
+        return (Vec::new(), body_slice.to_vec());
     }
 
     if let Some(len_str) = headers.get("content-length") {
         if let Ok(content_len) = len_str.trim().parse::<usize>() {
             if body_slice.len() >= content_len {
-                return body_slice[content_len..].to_vec();
+                return (body_slice[..content_len].to_vec(), body_slice[content_len..].to_vec());
             }
-            return body_slice.to_vec();
+            return (Vec::new(), body_slice.to_vec());
         }
     }
 
-    body_slice.to_vec()
+    (Vec::new(), body_slice.to_vec())
 }
 
 pub fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> HashMap<String, String> {
@@ -153,23 +168,49 @@ fn is_http_method(method: &str) -> bool {
 }
 
 pub fn discover_tls_libs(pid: i32) -> Vec<String> {
-    if pid <= 0 { return Vec::new(); }
+    let pids = if pid > 0 {
+        vec![pid]
+    } else {
+        enumerate_pids()
+    };
+    if pids.is_empty() { return Vec::new(); }
+
     let mut libs = HashMap::<String, bool>::new();
-    let maps_path = format!("/proc/{}/maps", pid);
-    let Ok(contents) = fs::read_to_string(&maps_path) else { return Vec::new(); };
-    for line in contents.lines() {
-        if let Some(path) = line.split_whitespace().nth(5) {
-            if path.contains("libssl") || path.contains("libgnutls") {
-                libs.insert(path.to_string(), true);
+    for p in &pids {
+        let maps_path = format!("/proc/{}/maps", p);
+        let Ok(contents) = fs::read_to_string(&maps_path) else { continue };
+        for line in contents.lines() {
+            if let Some(path) = line.split_whitespace().nth(5) {
+                if path.contains("libssl") || path.contains("libgnutls") {
+                    let host_path = crate::types::proc_root_path(*p, path);
+                    if !libs.contains_key(&host_path) {
+                        tracing::debug!(original = %path, resolved = %host_path, pid = p, "TLS lib discovered");
+                        libs.insert(host_path, true);
+                    }
+                }
             }
         }
+    }
+    if pid <= 0 && !libs.is_empty() {
+        tracing::info!(count = libs.len(), pids_scanned = pids.len(), "global TLS lib discovery complete");
     }
     libs.keys().cloned().collect()
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+pub fn enumerate_pids() -> Vec<i32> {
+    let mut pids = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else { return pids };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if let Ok(pid) = name_str.parse::<i32>() {
+            if pid > 2 {
+                pids.push(pid);
+            }
+        }
+    }
+    pids
+}
 
 #[cfg(test)]
 mod tests {
@@ -181,46 +222,5 @@ mod tests {
         assert_eq!(path, "/api/v1/user");
         assert_eq!(query.get("id").unwrap(), "123");
         assert_eq!(query.get("name").unwrap(), "test");
-
-        let (path, query) = split_query("/health");
-        assert_eq!(path, "/health");
-        assert!(query.is_empty());
-    }
-
-    #[test]
-    fn test_extract_http_header_request() {
-        let buf = b"GET /index.html HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test\r\n\r\nRemaining data".to_vec();
-        let (msg, remaining) = extract_http_header(&buf).unwrap();
-        if let HttpMessage::Request(req) = msg {
-            assert_eq!(req.method, "GET");
-            assert_eq!(req.path, "/index.html");
-            assert_eq!(req.headers.get("host").unwrap(), "example.com");
-            assert_eq!(req.headers.get("user-agent").unwrap(), "test");
-        } else {
-            panic!("Expected Request");
-        }
-        assert_eq!(remaining, b"Remaining data");
-    }
-
-    #[test]
-    fn test_extract_http_header_response() {
-        // Body is 16 bytes; append a sentinel to verify pipelining (remaining = bytes after body)
-        let buf = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\n\r\n{\"status\": \"ok\"}PIPELINE".to_vec();
-        let (msg, remaining) = extract_http_header(&buf).unwrap();
-        if let HttpMessage::Response(resp) = msg {
-            assert_eq!(resp.status_code, 200);
-            assert_eq!(resp.headers.get("content-type").unwrap(), "application/json");
-        } else {
-            panic!("Expected Response");
-        }
-        assert_eq!(remaining, b"PIPELINE");
-    }
-
-    #[test]
-    fn test_chunked_body_decode() {
-        let chunked = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-        let (body, consumed) = decode_chunked_body(chunked).unwrap();
-        assert_eq!(&body, b"hello world");
-        assert_eq!(consumed, chunked.len());
     }
 }

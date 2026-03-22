@@ -17,10 +17,10 @@ RUN clang -O2 -g -target bpf \
     -o bpf/http_trace.bpf.o
 
 # ---- Stage 2: Build Rust binary ----
-FROM rust:1.82-bookworm AS rust-builder
+FROM rust:1.85-bookworm AS rust-builder
 
 RUN apt-get update && apt-get install -y \
-    pkg-config libssl-dev libelf-dev zlib1g-dev libzstd-dev clang \
+    pkg-config libssl-dev libelf-dev zlib1g-dev libzstd-dev clang protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -33,18 +33,28 @@ RUN cargo build --release
 # ---- Stage 3: Minimal runtime image ----
 FROM ubuntu:24.04
 
-RUN apt-get update && apt-get install -y \
-    libssl3 libelf1 ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 libelf1 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -r -s /bin/false sensor
+# NOTE: Sensor runs as root — CAP_BPF, CAP_SYS_ADMIN, CAP_SYS_PTRACE require it.
+# Kubernetes DaemonSet restricts capabilities via securityContext (not USER).
 
 COPY --from=bpf-builder /build/bpf/http_trace.bpf.o /opt/sensor/http_trace.bpf.o
 COPY --from=rust-builder /build/userspace/target/release/api-sec-sensor /opt/sensor/api-sec-sensor
 
+# Default config directory — mount a ConfigMap here in K8s
+RUN mkdir -p /etc/api-sentinel
+COPY config/config.example.toml /etc/api-sentinel/config.toml
+
 WORKDIR /opt/sensor
+
+ENV RUST_LOG=info
 
 EXPOSE 9090
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -sf http://localhost:9090/healthz || exit 1
+
 ENTRYPOINT ["/opt/sensor/api-sec-sensor"]
-CMD ["--bpf", "/opt/sensor/http_trace.bpf.o", "--discover-libs", "--metrics-port", "9090"]
+CMD ["--config", "/etc/api-sentinel/config.toml"]

@@ -108,7 +108,35 @@ class MCPHandler(BaseHTTPRequestHandler):
         self._json(200, {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
 
 
+def make_self_signed_cert():
+    """Generate a self-signed cert for TLS testing."""
+    import subprocess, tempfile, os
+    cert_file = tempfile.NamedTemporaryFile(suffix=".crt", delete=False)
+    key_file  = tempfile.NamedTemporaryFile(suffix=".key", delete=False)
+    cert_file.close()
+    key_file.close()
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", key_file.name, "-out", cert_file.name,
+        "-days", "1", "-nodes", "-subj", "/CN=localhost"
+    ], check=True, capture_output=True)
+    return cert_file.name, key_file.name
+
+
 if __name__ == "__main__":
-    server = HTTPServer(("0.0.0.0", 7777), MCPHandler)
+    import ssl as _ssl
+    import threading
+
+    # Start plaintext HTTP on 7777 (backward compat)
+    http_server = HTTPServer(("0.0.0.0", 7777), MCPHandler)
+    threading.Thread(target=http_server.serve_forever, daemon=True).start()
     print("MCP/SSE server on http://0.0.0.0:7777")
-    server.serve_forever()
+
+    # Start HTTPS on 7778 (for sensor TLS capture testing)
+    cert_path, key_path = make_self_signed_cert()
+    https_server = HTTPServer(("0.0.0.0", 7778), MCPHandler)
+    ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.load_cert_chain(cert_path, key_path)
+    https_server.socket = ssl_ctx.wrap_socket(https_server.socket, server_side=True)
+    print("MCP/SSE server on https://0.0.0.0:7778")
+    https_server.serve_forever()

@@ -1,8 +1,3 @@
-version: "3.8"
-
-# APISentinel Sensor — Integration Test Harness
-# Usage: docker-compose up -d && cargo test --test integration
-
 services:
 
   # HTTP/1.1 + HTTP/2 target
@@ -15,7 +10,7 @@ services:
       timeout: 3s
       retries: 5
 
-  # Go HTTPS service — tests Go crypto/tls capture
+  # Go HTTPS service — tests Go crypto/tls + HTTP/2 (Go serves h2 by default over TLS)
   go-api:
     build: ./test-servers/go
     ports: ["18443:8443"]
@@ -25,7 +20,7 @@ services:
       timeout: 3s
       retries: 10
 
-  # Node.js HTTPS — OpenSSL dynamic link (standard path)
+  # Node.js HTTPS — static OpenSSL
   node-api:
     build: ./test-servers/node
     ports: ["18444:8444"]
@@ -40,10 +35,17 @@ services:
     build: ./test-servers/websocket
     ports: ["18445:8445"]
 
-  # MCP/SSE server — JSON-RPC 2.0 over SSE
+  # MCP/SSE server — JSON-RPC 2.0 (HTTP on 7777, HTTPS on 7778)
   mcp-server:
     build: ./test-servers/mcp
-    ports: ["17777:7777"]
+    ports:
+      - "17777:7777"
+      - "17778:7778"
+
+  # gRPC test server — TLS on 50051
+  grpc-server:
+    build: ./test-servers/grpc
+    ports: ["19000:50051"]
 
   # Ingest validator — collects and validates captured events
   ingest-validator:

@@ -369,23 +369,33 @@ pub fn extract_h3_headers(buf: &[u8]) -> Vec<HashMap<String, String>> {
 // ---------------------------------------------------------------------------
 
 /// Scan /proc/<pid>/maps for known QUIC libraries.
+/// Paths are resolved through /proc/<pid>/root/ to cross mount namespace boundaries.
+/// When pid <= 0, scans ALL running processes (global bootstrap).
 pub fn discover_quic_libs(pid: i32) -> Vec<String> {
-    if pid <= 0 {
-        return Vec::new();
-    }
-    let maps_path = format!("/proc/{}/maps", pid);
-    let Ok(contents) = std::fs::read_to_string(&maps_path) else {
-        return Vec::new();
+    let pids = if pid > 0 {
+        vec![pid]
+    } else {
+        crate::http::enumerate_pids()
     };
+    if pids.is_empty() { return Vec::new(); }
+
     let mut libs = std::collections::HashMap::<String, bool>::new();
-    for line in contents.lines() {
-        if let Some(path) = line.split_whitespace().nth(5) {
-            if path.contains("libquiche")
-                || path.contains("libngtcp2")
-                || path.contains("libmsquic")
-                || path.contains("liblsquic")
-            {
-                libs.insert(path.to_string(), true);
+    for p in &pids {
+        let maps_path = format!("/proc/{}/maps", p);
+        let Ok(contents) = std::fs::read_to_string(&maps_path) else { continue };
+        for line in contents.lines() {
+            if let Some(path) = line.split_whitespace().nth(5) {
+                if path.contains("libquiche")
+                    || path.contains("libngtcp2")
+                    || path.contains("libmsquic")
+                    || path.contains("liblsquic")
+                {
+                    let host_path = crate::types::proc_root_path(*p, path);
+                    if !libs.contains_key(&host_path) {
+                        tracing::debug!(original = %path, resolved = %host_path, pid = p, "QUIC lib discovered");
+                        libs.insert(host_path, true);
+                    }
+                }
             }
         }
     }
