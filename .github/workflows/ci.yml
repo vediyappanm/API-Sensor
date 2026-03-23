@@ -15,7 +15,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libelf-dev zlib1g-dev clang llvm
+          sudo apt-get install -y pkg-config libelf-dev zlib1g-dev clang llvm protobuf-compiler
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -47,7 +47,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libelf-dev zlib1g-dev clang llvm
+          sudo apt-get install -y pkg-config libelf-dev zlib1g-dev clang llvm protobuf-compiler
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -78,34 +78,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev \
-            build-essential pkg-config libelf-dev zlib1g-dev \
-            linux-tools-common linux-tools-$(uname -r) || true
+            build-essential pkg-config libelf-dev zlib1g-dev
 
-      - name: Generate vmlinux.h
+      - name: Generate vmlinux.h from kernel BTF
         run: |
-          if [ -f /sys/kernel/btf/vmlinux ]; then
+          # Install bpftool matching the runner's kernel
+          KERNEL_VER=$(uname -r)
+          sudo apt-get install -y "linux-tools-${KERNEL_VER}" 2>/dev/null \
+            || sudo apt-get install -y linux-tools-generic 2>/dev/null \
+            || true
+
+          if command -v bpftool &>/dev/null && [ -f /sys/kernel/btf/vmlinux ]; then
             bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
+            echo "Generated vmlinux.h ($(wc -l < bpf/vmlinux.h) lines)"
           else
-            echo "BTF not available, using fallback vmlinux.h generation"
-            # Use kernel headers as fallback — extract minimal BTF types
-            # The Dockerfile build always generates its own vmlinux.h, so this
-            # CI step only needs to validate that the BPF C code compiles.
-            sudo apt-get install -y linux-headers-$(uname -r) || true
-            if command -v bpftool &>/dev/null && [ -f /sys/kernel/btf/vmlinux ]; then
-              bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
-            else
-              echo "WARNING: Cannot generate vmlinux.h — skipping BPF compilation check"
-              echo "Docker build will still generate vmlinux.h correctly"
-              exit 0
-            fi
+            echo "::warning::bpftool or BTF not available — skipping BPF compile check"
+            echo "SKIP_BPF=true" >> "$GITHUB_ENV"
           fi
 
       - name: Compile BPF program
+        if: env.SKIP_BPF != 'true'
         run: |
-          if [ ! -f bpf/vmlinux.h ]; then
-            echo "vmlinux.h not available, skipping BPF compilation (Docker build validates this)"
-            exit 0
-          fi
           clang -O2 -g -Wall -target bpf \
             -D__TARGET_ARCH_x86 \
             -I/usr/include/x86_64-linux-gnu \
