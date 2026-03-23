@@ -43,7 +43,8 @@ fn http_extremely_long_header_line() {
 
 #[test]
 fn http_smuggling_cl_te_conflict() {
-    let buf = b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    let buf =
+        b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
     let result = extract_http_header(buf);
     assert!(result.is_some());
 }
