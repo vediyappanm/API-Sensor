@@ -344,6 +344,17 @@ async fn main() -> Result<()> {
     let sample_default = args.sample_default.min(100);
     let sample_health = args.sample_health.min(100);
 
+    // Pre-flight validation: BPF filesystem write access
+    if !std::path::Path::new("/sys/fs/bpf").exists() {
+        anyhow::bail!("FATAL: /sys/fs/bpf not mounted — BPF maps unavailable. Kernel may lack BPF support.");
+    }
+    match std::fs::write("/sys/fs/bpf/.probe-writable-check", "test") {
+        Ok(_) => { let _ = std::fs::remove_file("/sys/fs/bpf/.probe-writable-check"); },
+        Err(e) => {
+            anyhow::bail!("FATAL: Cannot write to /sys/fs/bpf: {} — Check kernel security policies (SELinux/AppArmor). Enable CAP_BPF or run privileged.", e);
+        }
+    }
+
     tracing::info!(bpf = %args.bpf, ingest = %args.ingest, "starting sensor");
 
     // Start metrics server
@@ -360,6 +371,15 @@ async fn main() -> Result<()> {
             tls_libs = discovered;
         }
     }
+
+    // Warn if no TLS libraries are configured — this will result in zero events captured
+    if tls_libs.is_empty() && !args.go_tls {
+        tracing::warn!("⚠️  No TLS libraries configured and --go-tls not enabled");
+        tracing::warn!("    Configure --tls-libs or enable --discover-libs to capture encrypted traffic");
+        tracing::warn!("    Sensor will run but likely capture zero events");
+        tracing::warn!("    To suppress this warning, set --tls-libs with at least one library path");
+    }
+
     attach_tls_uprobes(&mut obj, &args.tls_provider, args.pid, args.go_tls, &tls_libs, &mut links)?;
     attach_kernel_probes(&mut obj, &mut links)?;
 
