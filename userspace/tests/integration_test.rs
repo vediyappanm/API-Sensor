@@ -278,5 +278,8 @@ async fn test_health_endpoints_sampled() {
     let events = validator_events().await;
     // With default_rate=100, all should be captured unless sampling is configured lower
     // This test mainly verifies the sensor doesn't crash under load
-    assert!(events.len() <= 100, "more events than requests sent (duplicate)");
+    assert!(
+        events.len() <= 100,
+        "more events than requests sent (duplicate)"
+    );
 }
