@@ -300,6 +300,79 @@ fn decode_prefix_int(buf: &[u8], prefix_bits: u8) -> Option<(u64, usize)> {
     }
 }
 
+/// Decode HPACK/QPACK Huffman-encoded bytes (RFC 7541 Appendix B).
+/// Uses a simple bit-by-bit decoder with the static Huffman table.
+fn decode_huffman(data: &[u8]) -> Option<String> {
+    // HPACK Huffman table: (code, bit_length) indexed by symbol 0..=127 + EOS
+    // Covers symbols 0–127 and the printable ASCII range used in HTTP headers.
+    // Symbols 128–255 are rare in HTTP headers and omitted for size.
+    static HUFFMAN_TABLE: &[(u32, u8)] = &[
+        (0x1ff8, 13), (0x7fffd8, 23), (0xfffffe2, 28), (0xfffffe3, 28),
+        (0xfffffe4, 28), (0xfffffe5, 28), (0xfffffe6, 28), (0xfffffe7, 28),
+        (0xfffffe8, 28), (0xffffea, 24), (0x3ffffffc, 30), (0xfffffe9, 28),
+        (0xfffffea, 28), (0x3ffffffd, 30), (0xfffffeb, 28), (0xfffffec, 28),
+        (0xfffffed, 28), (0xfffffee, 28), (0xfffffef, 28), (0xffffff0, 28),
+        (0xffffff1, 28), (0xffffff2, 28), (0x3ffffffe, 30), (0xffffff3, 28),
+        (0xffffff4, 28), (0xffffff5, 28), (0xffffff6, 28), (0xffffff7, 28),
+        (0xffffff8, 28), (0xffffff9, 28), (0xffffffa, 28), (0xffffffb, 28),
+        (0x14, 6), // ' ' (32)
+        (0x3f8, 10), (0x3f9, 10), (0xffa, 12), (0x1ff9, 13),
+        (0x15, 6), (0xf8, 8), (0x7fa, 11), (0x3fa, 10),
+        (0x3fb, 10), (0xf9, 8), (0x7fb, 11), (0xfa, 8),
+        (0x16, 6), (0x17, 6), (0x18, 6), (0x0, 5),
+        (0x1, 5), (0x2, 5), (0x19, 6), (0x1a, 6),
+        (0x1b, 6), (0x1c, 6), (0x1d, 6), (0x1e, 6),
+        (0x1f, 6), (0x5c, 7), (0xfb, 8), (0x7ffc, 15),
+        (0x20, 6), (0xffb, 12), (0x3fc, 10), (0x1ffa, 13),
+        (0x21, 6), (0x5d, 7), (0x5e, 7), (0x5f, 7),
+        (0x60, 7), (0x61, 7), (0x62, 7), (0x63, 7),
+        (0x64, 7), (0x65, 7), (0x66, 7), (0x67, 7),
+        (0x68, 7), (0x69, 7), (0x6a, 7), (0x6b, 7),
+        (0x6c, 7), (0x6d, 7), (0x6e, 7), (0x6f, 7),
+        (0x70, 7), (0x71, 7), (0x72, 7), (0xfc, 8),
+        (0x73, 7), (0xfd, 8), (0x1ffb, 13), (0x7fff0, 19),
+        (0x1ffc, 13), (0x3ffc, 14), (0x22, 6), (0x7ffd, 15),
+        (0x3, 5), (0x23, 6), (0x4, 5), (0x24, 6),
+        (0x5, 5), (0x25, 6), (0x26, 6), (0x27, 6),
+        (0x6, 5), (0x74, 7), (0x75, 7), (0x28, 6),
+        (0x29, 6), (0x2a, 6), (0x7, 5), (0x2b, 6),
+        (0x76, 7), (0x2c, 6), (0x8, 5), (0x9, 5),
+        (0x2d, 6), (0x77, 7), (0x78, 7), (0x79, 7),
+        (0x7a, 7), (0x7b, 7), (0x7fffe, 19), (0x7fc, 11),
+        (0x3ffd, 14), (0x1ffd, 13), (0xffffffc, 28),
+    ];
+
+    let mut result = Vec::new();
+    let mut bits: u32 = 0;
+    let mut bits_left: u8 = 0;
+
+    for &byte in data {
+        bits = (bits << 8) | byte as u32;
+        bits_left += 8;
+
+        while bits_left >= 5 {
+            let mut found = false;
+            for (sym, &(code, len)) in HUFFMAN_TABLE.iter().enumerate() {
+                if len > bits_left { continue; }
+                let shift = bits_left - len;
+                let mask = (1u32 << len) - 1;
+                if (bits >> shift) & mask == code {
+                    if sym < 256 {
+                        result.push(sym as u8);
+                    }
+                    bits_left -= len;
+                    bits &= (1u32 << bits_left) - 1;
+                    found = true;
+                    break;
+                }
+            }
+            if !found { break; }
+        }
+    }
+
+    String::from_utf8(result).ok()
+}
+
 /// Decode a QPACK string literal.
 fn decode_string(buf: &[u8], prefix_bits: u8) -> Option<(String, usize)> {
     if buf.is_empty() {
@@ -314,9 +387,7 @@ fn decode_string(buf: &[u8], prefix_bits: u8) -> Option<(String, usize)> {
     }
     let raw = &buf[start..start + len];
     let s = if huffman {
-        // Simplified Huffman: just lossily decode — full Huffman tables are large.
-        // In practice most API headers are ASCII and only small savings from Huffman.
-        String::from_utf8_lossy(raw).into_owned()
+        decode_huffman(raw).unwrap_or_else(|| String::from_utf8_lossy(raw).into_owned())
     } else {
         String::from_utf8_lossy(raw).into_owned()
     };
@@ -536,5 +607,13 @@ mod tests {
         assert_eq!(decode_prefix_int(&[0x1f, 0x00], 5), Some((31, 2)));
         // Value 1337 in 5-bit prefix: 0x1f, 0x9a, 0x0a
         assert_eq!(decode_prefix_int(&[0x1f, 0x9a, 0x0a], 5), Some((1337, 3)));
+    }
+
+    #[test]
+    fn test_huffman_decode_basic() {
+        // "www.example.com" Huffman-encoded (from RFC 7541 example)
+        let encoded = [0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff];
+        let decoded = super::decode_huffman(&encoded);
+        assert_eq!(decoded, Some("www.example.com".to_string()));
     }
 }

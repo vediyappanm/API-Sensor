@@ -49,7 +49,9 @@ fn pii_hash_key() -> &'static [u8] {
                     return key;
                 }
             }
-            tracing::warn!("PII_HASH_KEY must be exactly 64 hex chars (32 bytes); using default");
+            eprintln!("WARNING: PII_HASH_KEY must be 64 hex chars (32 bytes). Using default key.");
+        } else {
+            eprintln!("WARNING: PII_HASH_KEY not set. Using default HMAC key — PII tokens are correlatable across deployments. Set PII_HASH_KEY env var (64 hex chars) for production.");
         }
         DEFAULT_PII_HASH_KEY.to_vec()
     })

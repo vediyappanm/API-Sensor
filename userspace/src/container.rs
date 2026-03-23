@@ -118,11 +118,12 @@ impl ContainerResolver {
         if let Some(full_id) = container_id_full {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             if !pending.contains(&ev.cgroup_id) {
-                pending.insert(ev.cgroup_id);
-                let _ = self.lookup_tx.try_send(ContainerLookupRequest {
+                if self.lookup_tx.try_send(ContainerLookupRequest {
                     cgroup_id: ev.cgroup_id,
                     container_id_full: full_id,
-                });
+                }).is_ok() {
+                    pending.insert(ev.cgroup_id);
+                }
             }
         }
 

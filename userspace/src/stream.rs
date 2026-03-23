@@ -528,7 +528,9 @@ impl StreamState {
                 output.push(event);
             }
         }
-        if !output.is_empty() {
+        // Only clear buffer when it grows too large or all frames have been consumed.
+        // This preserves in-flight data for other multiplexed HTTP/2 streams.
+        if conn_state.buffer.len() > self.max_buffer {
             let cleared = conn_state.buffer.len();
             conn_state.buffer.clear();
             release_memory(cleared);

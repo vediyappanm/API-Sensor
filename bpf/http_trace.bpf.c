@@ -229,6 +229,14 @@ struct {
     __type(value, __u64);
 } event_counter SEC(".maps");
 
+// Ring buffer drop counter — incremented when bpf_ringbuf_reserve fails
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} ringbuf_drop_counter SEC(".maps");
+
 static __always_inline void fill_conn_info(struct conn_info *out, struct sock *sk)
 {
     __u16 family = 0;
@@ -327,6 +335,9 @@ static __always_inline int emit_event(struct pt_regs *ctx, const void *buf, __u3
      */
     e = bpf_ringbuf_reserve(&events, sizeof(struct tls_event), 0);
     if (!e) {
+        __u32 drop_key = 0;
+        __u64 *drop_cnt = bpf_map_lookup_elem(&ringbuf_drop_counter, &drop_key);
+        if (drop_cnt) __sync_fetch_and_add(drop_cnt, 1);
         return 0;
     }
     e->ts_ns = bpf_ktime_get_ns();
@@ -531,7 +542,7 @@ int ssl_set_fd_entry(struct pt_regs *ctx)
 {
     __u64 ssl_ptr = (__u64)PT_REGS_PARM1(ctx);
     int fd = (int)PT_REGS_PARM2(ctx);
-    if (fd < 0) {
+    if (fd < 0 || fd >= 1024*1024) {
         return 0;
     }
 

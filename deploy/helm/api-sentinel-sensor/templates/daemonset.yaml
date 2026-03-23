@@ -25,6 +25,7 @@ spec:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
+      priorityClassName: {{ .Values.priorityClassName }}
       hostPID: true
       terminationGracePeriodSeconds: 10
       containers:
@@ -83,6 +84,9 @@ spec:
             - name: cgroup
               mountPath: /sys/fs/cgroup
               readOnly: true
+            - name: cri-socket
+              mountPath: /run/containerd/containerd.sock
+              readOnly: true
       volumes:
         - name: config
           configMap:
@@ -96,6 +100,10 @@ spec:
         - name: cgroup
           hostPath:
             path: /sys/fs/cgroup
+        - name: cri-socket
+          hostPath:
+            path: /run/containerd/containerd.sock
+            type: Socket
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

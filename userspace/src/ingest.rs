@@ -1,11 +1,21 @@
 use anyhow::Result;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::metrics::{EVENTS_SENT, SEND_ERRORS};
 use crate::types::{ApiTrafficEvent, EventBatch};
+
+static CONSECUTIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static CIRCUIT_OPEN_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 const MAX_RETRIES: u32 = 3;
 
@@ -16,6 +26,18 @@ pub async fn send_batch_with_client(
     events: Vec<ApiTrafficEvent>,
 ) -> Result<()> {
     use std::io::Write as IoWrite;
+
+    // Circuit breaker: skip if circuit is open
+    let now = now_epoch_ms();
+    let open_until = CIRCUIT_OPEN_UNTIL.load(Ordering::Relaxed);
+    if now < open_until {
+        EVENTS_SENT.fetch_add(0, Ordering::Relaxed); // no-op, just for clarity
+        tracing::debug!(
+            reopen_in_ms = open_until - now,
+            "circuit breaker open, skipping batch"
+        );
+        return Err(anyhow::anyhow!("circuit breaker open, {} events deferred", events.len()));
+    }
 
     let event_count = events.len() as u64;
     let body_struct = EventBatch { version: "v1".to_string(), events };
@@ -46,6 +68,7 @@ pub async fn send_batch_with_client(
                 let status = resp.status();
                 if status.is_success() {
                     EVENTS_SENT.fetch_add(event_count, Ordering::Relaxed);
+                    CONSECUTIVE_FAILURES.store(0, Ordering::Relaxed);
                     return Ok(());
                 }
                 // Client errors are not retryable — bad key, bad payload, etc.
@@ -74,10 +97,24 @@ pub async fn send_batch_with_client(
                 }
                 // Final failure — count the error
                 SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
+                let failures = CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                if failures >= 5 {
+                    // Open circuit for exponential backoff: 5s, 10s, 20s, 40s... max 300s
+                    let backoff_ms = (5000u64 * (1 << (failures - 5).min(6))).min(300_000);
+                    CIRCUIT_OPEN_UNTIL.store(now_epoch_ms() + backoff_ms, Ordering::Relaxed);
+                    tracing::warn!(failures, backoff_ms, "circuit breaker opened");
+                }
                 return Err(e.into());
             }
         }
     }
     SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
+    let failures = CONSECUTIVE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if failures >= 5 {
+        // Open circuit for exponential backoff: 5s, 10s, 20s, 40s... max 300s
+        let backoff_ms = (5000u64 * (1 << (failures - 5).min(6))).min(300_000);
+        CIRCUIT_OPEN_UNTIL.store(now_epoch_ms() + backoff_ms, Ordering::Relaxed);
+        tracing::warn!(failures, backoff_ms, "circuit breaker opened");
+    }
     Err(anyhow::anyhow!("ingest failed after {} retries: {:?}", MAX_RETRIES, last_err))
 }

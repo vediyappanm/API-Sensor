@@ -560,23 +560,20 @@ async fn main() -> Result<()> {
 
     // Background worker: dynamic TLS discovery for new processes
     let discover_libs_enabled = args.discover_libs;
+    let (dyn_lib_tx, mut dyn_lib_rx) = mpsc::channel::<(String, i32)>(64);
     tokio::spawn(async move {
         let mut seen_pids = std::collections::HashSet::new();
         while let Some(pid) = new_pid_rx.recv().await {
             let pid = pid as i32;
             if pid <= 2 || !seen_pids.insert(pid) { continue; }
-            // Bound the set to prevent unbounded growth
             if seen_pids.len() > 100_000 { seen_pids.clear(); }
-
             tokio::time::sleep(Duration::from_millis(500)).await;
-
             let maps_path = format!("/proc/{}/maps", pid);
             if std::fs::read_to_string(&maps_path).is_err() { continue; }
-
             if discover_libs_enabled {
                 let libs = crate::http::discover_tls_libs(pid);
-                if !libs.is_empty() {
-                    tracing::info!(pid, libs = ?libs, "dynamic discovery: new TLS libs found");
+                for lib in libs {
+                    let _ = dyn_lib_tx.try_send((lib, pid));
                 }
             }
             tracing::debug!(pid, "dynamic discovery: checked new process");
@@ -660,6 +657,14 @@ async fn main() -> Result<()> {
     // Main poll loop with exponential backoff on repeated errors
     let mut poll_backoff_ms = 0u64;
     while running.load(Ordering::Relaxed) {
+        // Attach dynamically discovered TLS libraries (from background worker)
+        while let Ok((lib_path, pid)) = dyn_lib_rx.try_recv() {
+            tracing::info!(path = %lib_path, pid, "dynamic discovery: attaching probes");
+            if attach_boring_ssl_static(&mut obj, &lib_path, pid, &mut links) {
+                tracing::info!(path = %lib_path, pid, "dynamic discovery: probes attached");
+            }
+        }
+
         if poll_backoff_ms > 0 {
             tokio::time::sleep(Duration::from_millis(poll_backoff_ms)).await;
         }
