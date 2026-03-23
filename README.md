@@ -54,6 +54,38 @@ A production-grade **eBPF-based TLS traffic capture sensor** for the API Sentine
 - Rust stable (`cargo`)
 - `bpftool` (from `linux-tools-common`)
 
+### ⚠️ Critical: Kernel BPF Support Requirements
+
+The sensor's **parsing and redaction logic is production-ready**, but kernel-side eBPF probe attachment **requires specific kernel features**:
+
+**Before deploying to production, verify your target kernel supports:**
+
+```bash
+# Check kernel version (need 5.8+)
+uname -r
+
+# Verify BPF JIT is enabled
+cat /proc/sys/kernel/unprivileged_bpf_disabled
+
+# Verify CONFIG_UPROBE_EVENTS enabled
+cat /boot/config-$(uname -r) | grep CONFIG_UPROBE_EVENTS=y
+
+# Check BTF (BPF Type Format) available
+[ -f /sys/kernel/btf/vmlinux ] && echo "BTF: present" || echo "BTF: missing"
+```
+
+If kernel doesn't support BPF, the sensor will:
+- Start successfully (no crash)
+- Report 0 events captured
+- Have empty `/sys/fs/bpf` directory
+- Show no uprobes in `/sys/kernel/debug/tracing/uprobe_events`
+
+**What to do if BPF attachment fails:**
+1. Check kernel config for `CONFIG_BPF`, `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_JIT`, `CONFIG_DEBUG_INFO_BTF`
+2. Upgrade to a newer kernel with full BPF support (5.15+ LTS recommended)
+3. Check `dmesg` for BPF verifier errors
+4. Verify CAP_BPF/CAP_PERFMON capabilities or full root access
+
 ---
 
 ## Build
