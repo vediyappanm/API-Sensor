@@ -8,7 +8,7 @@ use crate::types::HTTP2_PREFACE;
 // ---------------------------------------------------------------------------
 
 pub struct Http2HpackDecoder {
-    inner:       Decoder<'static>,
+    inner: Decoder<'static>,
     pub error_count: u32,
 }
 
@@ -18,7 +18,10 @@ impl Http2HpackDecoder {
     pub fn new() -> Self {
         let mut d = Decoder::new();
         d.set_max_table_size(8192);
-        Self { inner: d, error_count: 0 }
+        Self {
+            inner: d,
+            error_count: 0,
+        }
     }
 
     pub fn decode(&mut self, block: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ()> {
@@ -54,7 +57,9 @@ impl Http2HpackDecoder {
     /// calls `.unwrap()` on `decode_integer()` which returns None on truncated
     /// input. This walks all entries validating varints and string lengths.
     fn validate_hpack_block(block: &[u8]) -> bool {
-        if block.is_empty() { return true; }
+        if block.is_empty() {
+            return true;
+        }
         let mut i = 0;
         while i < block.len() {
             let byte = block[i];
@@ -67,18 +72,21 @@ impl Http2HpackDecoder {
             } else if byte & 0xC0 == 0x40 {
                 // Literal with incremental indexing (prefix = 6 bits)
                 let (index, consumed) = match Self::read_hpack_int(block, i, 6) {
-                    Some(v) => v, None => return false,
+                    Some(v) => v,
+                    None => return false,
                 };
                 i += consumed;
                 if index == 0 {
                     // New name: validate name string
                     match Self::skip_hpack_string(block, i) {
-                        Some(n) => i += n, None => return false,
+                        Some(n) => i += n,
+                        None => return false,
                     }
                 }
                 // Validate value string
                 match Self::skip_hpack_string(block, i) {
-                    Some(n) => i += n, None => return false,
+                    Some(n) => i += n,
+                    None => return false,
                 }
             } else if byte & 0xE0 == 0x20 {
                 // Dynamic table size update (prefix = 5 bits)
@@ -89,16 +97,19 @@ impl Http2HpackDecoder {
             } else {
                 // Literal without indexing / never indexed (prefix = 4 bits)
                 let (index, consumed) = match Self::read_hpack_int(block, i, 4) {
-                    Some(v) => v, None => return false,
+                    Some(v) => v,
+                    None => return false,
                 };
                 i += consumed;
                 if index == 0 {
                     match Self::skip_hpack_string(block, i) {
-                        Some(n) => i += n, None => return false,
+                        Some(n) => i += n,
+                        None => return false,
                     }
                 }
                 match Self::skip_hpack_string(block, i) {
-                    Some(n) => i += n, None => return false,
+                    Some(n) => i += n,
+                    None => return false,
                 }
             }
         }
@@ -110,7 +121,9 @@ impl Http2HpackDecoder {
     /// Matches the hpack crate's octet_limit of 5 total bytes to avoid
     /// triggering panics from TooManyOctets errors.
     fn read_hpack_int(block: &[u8], pos: usize, prefix_bits: u8) -> Option<(u64, usize)> {
-        if pos >= block.len() { return None; }
+        if pos >= block.len() {
+            return None;
+        }
         let mask = (1u16 << prefix_bits) - 1;
         let val = (block[pos] as u64) & (mask as u64);
         if val < mask as u64 {
@@ -122,15 +135,21 @@ impl Http2HpackDecoder {
         let mut result = mask as u64;
         let mut shift = 0u32;
         loop {
-            if i >= block.len() { return None; }
+            if i >= block.len() {
+                return None;
+            }
             let b = block[i] as u64;
             result += (b & 0x7F) << shift;
             total += 1;
             i += 1;
-            if b & 0x80 == 0 { break; }
+            if b & 0x80 == 0 {
+                break;
+            }
             shift += 7;
             // Match hpack crate's octet_limit = 5
-            if total >= 5 { return None; }
+            if total >= 5 {
+                return None;
+            }
         }
         Some((result, i - pos))
     }
@@ -139,7 +158,9 @@ impl Http2HpackDecoder {
     fn skip_hpack_string(block: &[u8], pos: usize) -> Option<usize> {
         let (str_len, int_consumed) = Self::read_hpack_int(block, pos, 7)?;
         let total = int_consumed + str_len as usize;
-        if pos + total > block.len() { return None; }
+        if pos + total > block.len() {
+            return None;
+        }
         Some(total)
     }
 }
@@ -155,7 +176,9 @@ impl Default for Http2HpackDecoder {
 // ---------------------------------------------------------------------------
 
 pub fn contains_http2_preface(buffer: &[u8]) -> bool {
-    buffer.windows(HTTP2_PREFACE.len()).any(|w| w == HTTP2_PREFACE)
+    buffer
+        .windows(HTTP2_PREFACE.len())
+        .any(|w| w == HTTP2_PREFACE)
 }
 
 /// Returns per-stream decoded headers: Vec<(stream_id, headers)>.
@@ -185,7 +208,7 @@ pub fn parse_http2_frames(
         if let Ok(decoded) = decoder.decode(&header_block) {
             let mut map = HashMap::new();
             for (name, value) in decoded {
-                let name  = String::from_utf8_lossy(&name).to_ascii_lowercase();
+                let name = String::from_utf8_lossy(&name).to_ascii_lowercase();
                 let value = String::from_utf8_lossy(&value).to_string();
                 if !name.is_empty() && !value.is_empty() {
                     map.insert(name, value);
@@ -201,10 +224,7 @@ pub fn parse_http2_frames(
 
 /// Backward-compat wrapper used by tests.
 #[cfg(test)]
-fn parse_http2_metadata(
-    decoder: &mut Http2HpackDecoder,
-    buffer: &[u8],
-) -> HashMap<String, String> {
+fn parse_http2_metadata(decoder: &mut Http2HpackDecoder, buffer: &[u8]) -> HashMap<String, String> {
     parse_http2_frames(decoder, buffer)
         .into_iter()
         .next()
@@ -214,12 +234,12 @@ fn parse_http2_metadata(
 
 fn hpack_static_scan(buffer: &[u8], map: &mut HashMap<String, String>) {
     const STATIC_TABLE: &[(u8, &str, &str)] = &[
-        (2,  ":method", "GET"),
-        (3,  ":method", "POST"),
-        (4,  ":path",   "/"),
-        (5,  ":path",   "/index.html"),
-        (8,  ":status", "200"),
-        (9,  ":status", "204"),
+        (2, ":method", "GET"),
+        (3, ":method", "POST"),
+        (4, ":path", "/"),
+        (5, ":path", "/index.html"),
+        (8, ":status", "200"),
+        (9, ":status", "204"),
         (10, ":status", "206"),
         (11, ":status", "304"),
         (12, ":status", "400"),
@@ -228,7 +248,8 @@ fn hpack_static_scan(buffer: &[u8], map: &mut HashMap<String, String>) {
     ];
 
     let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    let start = buffer.windows(preface.len())
+    let start = buffer
+        .windows(preface.len())
         .position(|w| w == preface)
         .map(|p| p + preface.len())
         .unwrap_or(0);
@@ -254,7 +275,8 @@ fn hpack_static_scan(buffer: &[u8], map: &mut HashMap<String, String>) {
                     let index = byte & 0x7F;
                     for &(idx, name, value) in STATIC_TABLE {
                         if index == idx {
-                            map.entry(name.to_string()).or_insert_with(|| value.to_string());
+                            map.entry(name.to_string())
+                                .or_insert_with(|| value.to_string());
                         }
                     }
                 }
@@ -262,15 +284,22 @@ fn hpack_static_scan(buffer: &[u8], map: &mut HashMap<String, String>) {
             }
         }
 
-        if frame_len == 0 { i += 9; } else { i += 9 + frame_len; }
-        if i > 65536 { break; }
+        if frame_len == 0 {
+            i += 9;
+        } else {
+            i += 9 + frame_len;
+        }
+        if i > 65536 {
+            break;
+        }
     }
 }
 
 fn extract_hpack_blocks(buffer: &[u8]) -> Vec<(u32, Vec<u8>)> {
     let mut blocks = Vec::new();
     let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    let start = buffer.windows(preface.len())
+    let start = buffer
+        .windows(preface.len())
         .position(|w| w == preface)
         .map(|p| p + preface.len())
         .unwrap_or(0);
@@ -281,9 +310,9 @@ fn extract_hpack_blocks(buffer: &[u8]) -> Vec<(u32, Vec<u8>)> {
             | (buffer[i + 2] as usize);
         let frame_type = buffer[i + 3];
         let flags = buffer[i + 4];
-        let stream_id = u32::from_be_bytes([
-            buffer[i + 5], buffer[i + 6], buffer[i + 7], buffer[i + 8],
-        ]) & 0x7fffffff;
+        let stream_id =
+            u32::from_be_bytes([buffer[i + 5], buffer[i + 6], buffer[i + 7], buffer[i + 8]])
+                & 0x7fffffff;
 
         if frame_len > 16384 || i + 9 + frame_len > buffer.len() {
             i += 1;
@@ -293,7 +322,9 @@ fn extract_hpack_blocks(buffer: &[u8]) -> Vec<(u32, Vec<u8>)> {
         if frame_type == 0x01 && frame_len > 0 {
             let mut payload = &buffer[i + 9..i + 9 + frame_len];
             if flags & 0x08 != 0 {
-                if payload.is_empty() { break; }
+                if payload.is_empty() {
+                    break;
+                }
                 let pad_len = payload[0] as usize;
                 payload = &payload[1..];
                 if pad_len <= payload.len() {
@@ -303,7 +334,9 @@ fn extract_hpack_blocks(buffer: &[u8]) -> Vec<(u32, Vec<u8>)> {
                 }
             }
             if flags & 0x20 != 0 {
-                if payload.len() < 5 { break; }
+                if payload.len() < 5 {
+                    break;
+                }
                 payload = &payload[5..];
             }
 
@@ -314,10 +347,13 @@ fn extract_hpack_blocks(buffer: &[u8]) -> Vec<(u32, Vec<u8>)> {
                 let len2 = ((buffer[j] as usize) << 16)
                     | ((buffer[j + 1] as usize) << 8)
                     | (buffer[j + 2] as usize);
-                let type2  = buffer[j + 3];
+                let type2 = buffer[j + 3];
                 let flags2 = buffer[j + 4];
                 let stream2 = u32::from_be_bytes([
-                    buffer[j + 5], buffer[j + 6], buffer[j + 7], buffer[j + 8],
+                    buffer[j + 5],
+                    buffer[j + 6],
+                    buffer[j + 7],
+                    buffer[j + 8],
                 ]) & 0x7fffffff;
 
                 if type2 != 0x09 || stream2 != stream_id || j + 9 + len2 > buffer.len() {
@@ -333,7 +369,9 @@ fn extract_hpack_blocks(buffer: &[u8]) -> Vec<(u32, Vec<u8>)> {
             i += 9 + frame_len;
         }
 
-        if i > 65536 { break; }
+        if i > 65536 {
+            break;
+        }
     }
     blocks
 }
@@ -356,8 +394,12 @@ pub fn find_token_value(buffer: &[u8], key: &str) -> Option<String> {
                 idx += 1;
             }
             if start < idx {
-                let value = String::from_utf8_lossy(&buffer[start..idx]).trim().to_string();
-                if !value.is_empty() { return Some(value); }
+                let value = String::from_utf8_lossy(&buffer[start..idx])
+                    .trim()
+                    .to_string();
+                if !value.is_empty() {
+                    return Some(value);
+                }
             }
         }
     }
@@ -365,8 +407,12 @@ pub fn find_token_value(buffer: &[u8], key: &str) -> Option<String> {
 }
 
 pub fn equals_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() { return false; }
-    a.iter().zip(b.iter()).all(|(x, y)| x.eq_ignore_ascii_case(y))
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 // ---------------------------------------------------------------------------

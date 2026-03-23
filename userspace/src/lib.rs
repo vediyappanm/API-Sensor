@@ -1,10 +1,10 @@
 pub mod config;
 pub mod dns;
+pub mod grpc;
 pub mod http;
 pub mod http2;
-pub mod quic;
-pub mod websocket;
-pub mod grpc;
 pub mod mcp;
+pub mod quic;
 pub mod redaction;
 pub mod types;
+pub mod websocket;

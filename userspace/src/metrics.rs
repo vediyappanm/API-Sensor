@@ -1,20 +1,20 @@
-use axum::{Router, routing::get, response::IntoResponse};
+use axum::{response::IntoResponse, routing::get, Router};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub static EVENTS_CAPTURED:    AtomicU64 = AtomicU64::new(0);
-pub static EVENTS_DROPPED:     AtomicU64 = AtomicU64::new(0);
-pub static EVENTS_SENT:        AtomicU64 = AtomicU64::new(0);
-pub static SEND_ERRORS:        AtomicU64 = AtomicU64::new(0);
-pub static RINGBUF_DROPS:      AtomicU64 = AtomicU64::new(0);
-pub static PROTO_HTTP1:        AtomicU64 = AtomicU64::new(0);
-pub static PROTO_HTTP2:        AtomicU64 = AtomicU64::new(0);
-pub static PROTO_GRPC:         AtomicU64 = AtomicU64::new(0);
-pub static PROTO_WEBSOCKET:    AtomicU64 = AtomicU64::new(0);
-pub static PROTO_MCP:          AtomicU64 = AtomicU64::new(0);
-pub static PROTO_HTTP3:        AtomicU64 = AtomicU64::new(0);
-pub static PROTO_GO_TLS:       AtomicU64 = AtomicU64::new(0);
+pub static EVENTS_CAPTURED: AtomicU64 = AtomicU64::new(0);
+pub static EVENTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+pub static EVENTS_SENT: AtomicU64 = AtomicU64::new(0);
+pub static SEND_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static RINGBUF_DROPS: AtomicU64 = AtomicU64::new(0);
+pub static PROTO_HTTP1: AtomicU64 = AtomicU64::new(0);
+pub static PROTO_HTTP2: AtomicU64 = AtomicU64::new(0);
+pub static PROTO_GRPC: AtomicU64 = AtomicU64::new(0);
+pub static PROTO_WEBSOCKET: AtomicU64 = AtomicU64::new(0);
+pub static PROTO_MCP: AtomicU64 = AtomicU64::new(0);
+pub static PROTO_HTTP3: AtomicU64 = AtomicU64::new(0);
+pub static PROTO_GO_TLS: AtomicU64 = AtomicU64::new(0);
 pub static ACTIVE_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
-pub static START_TIME_SECS:    AtomicU64 = AtomicU64::new(0);
+pub static START_TIME_SECS: AtomicU64 = AtomicU64::new(0);
 pub static CHANNEL_WATERMARK_PCT: AtomicU64 = AtomicU64::new(0);
 
 /// Startup grace period — /readyz returns 200 during this window even without events.
@@ -22,13 +22,21 @@ const READYZ_GRACE_SECS: u64 = 30;
 
 async fn metrics_handler() -> impl IntoResponse {
     let captured = EVENTS_CAPTURED.load(Ordering::Relaxed);
-    let dropped  = EVENTS_DROPPED.load(Ordering::Relaxed);
-    let drop_rate = if captured > 0 { dropped * 10000 / captured } else { 0 };
-    let drop_ratio = if captured > 0 { (dropped as f64) / (captured as f64) } else { 0.0 };
+    let dropped = EVENTS_DROPPED.load(Ordering::Relaxed);
+    let drop_rate = if captured > 0 {
+        dropped * 10000 / captured
+    } else {
+        0
+    };
+    let drop_ratio = if captured > 0 {
+        (dropped as f64) / (captured as f64)
+    } else {
+        0.0
+    };
     let uptime = now_secs().saturating_sub(START_TIME_SECS.load(Ordering::Relaxed));
 
     format!(
-"# HELP apisec_events_captured_total TLS events captured
+        "# HELP apisec_events_captured_total TLS events captured
 # TYPE apisec_events_captured_total counter
 apisec_events_captured_total {captured}
 
@@ -94,12 +102,16 @@ apisec_uptime_seconds {uptime}
 }
 
 async fn health_handler() -> impl IntoResponse {
-    let dropped     = EVENTS_DROPPED.load(Ordering::Relaxed);
-    let captured    = EVENTS_CAPTURED.load(Ordering::Relaxed);
-    let sent        = EVENTS_SENT.load(Ordering::Relaxed);
+    let dropped = EVENTS_DROPPED.load(Ordering::Relaxed);
+    let captured = EVENTS_CAPTURED.load(Ordering::Relaxed);
+    let sent = EVENTS_SENT.load(Ordering::Relaxed);
     let send_errors = SEND_ERRORS.load(Ordering::Relaxed);
     let ringbuf_drops = RINGBUF_DROPS.load(Ordering::Relaxed);
-    let drop_pct = if captured > 0 { dropped * 100 / captured } else { 0 };
+    let drop_pct = if captured > 0 {
+        dropped * 100 / captured
+    } else {
+        0
+    };
 
     // Degraded if: high drop rate, all sends failing, or excessive ringbuf drops
     let all_sends_failing = send_errors > 0 && sent == 0;
@@ -124,7 +136,10 @@ async fn ready_handler() -> impl IntoResponse {
     if uptime < READYZ_GRACE_SECS {
         (axum::http::StatusCode::OK, "{\"ready\":true}")
     } else {
-        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "{\"ready\":false}")
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{\"ready\":false}",
+        )
     }
 }
 
@@ -139,7 +154,7 @@ pub async fn start_metrics_server(port: u16) {
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(health_handler))
-        .route("/readyz",  get(ready_handler));
+        .route("/readyz", get(ready_handler));
     let addr = format!("0.0.0.0:{port}");
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {

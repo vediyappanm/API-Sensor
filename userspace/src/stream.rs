@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use crate::container::ContainerResolver;
 use crate::dns::{self, DnsResolver};
 use crate::grpc::decode_grpc_fields;
-use crate::http::{HttpMessage, HttpResponseParsed, extract_http_header, split_query};
-use crate::http2::{Http2HpackDecoder, contains_http2_preface, parse_http2_frames};
-use crate::mcp::{is_mcp_response, is_mcp_jsonrpc, parse_sse_events, parse_jsonrpc_mcp};
+use crate::http::{extract_http_header, split_query, HttpMessage, HttpResponseParsed};
+use crate::http2::{contains_http2_preface, parse_http2_frames, Http2HpackDecoder};
+use crate::mcp::{is_mcp_jsonrpc, is_mcp_response, parse_jsonrpc_mcp, parse_sse_events};
 use crate::metrics::*;
 use crate::quic;
 use crate::redaction::redact_pii;
@@ -79,7 +79,8 @@ impl ShardedStreamState {
             Ok(mut guard) => guard.evict_connection_by_ptr(conn_key.pid, conn_key.ssl_ptr),
             Err(e) => {
                 tracing::warn!("shard mutex poisoned, recovering");
-                e.into_inner().evict_connection_by_ptr(conn_key.pid, conn_key.ssl_ptr);
+                e.into_inner()
+                    .evict_connection_by_ptr(conn_key.pid, conn_key.ssl_ptr);
             }
         }
     }
@@ -116,10 +117,14 @@ pub struct Http2Conn {
 }
 
 fn release_memory(amount: usize) {
-    if amount == 0 { return; }
-    TOTAL_BUFFER_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_sub(amount))
-    }).ok();
+    if amount == 0 {
+        return;
+    }
+    TOTAL_BUFFER_BYTES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(amount))
+        })
+        .ok();
 }
 
 impl StreamState {
@@ -157,12 +162,14 @@ impl StreamState {
         let mut freed_bytes: usize = 0;
 
         let old_buffers_size: usize = self.buffers.values().map(|(b, _)| b.len()).sum();
-        self.buffers.retain(|_, (_, last_seen)| now_ms.saturating_sub(*last_seen) < STREAM_TTL_MS);
+        self.buffers
+            .retain(|_, (_, last_seen)| now_ms.saturating_sub(*last_seen) < STREAM_TTL_MS);
         let new_buffers_size: usize = self.buffers.values().map(|(b, _)| b.len()).sum();
         freed_bytes += old_buffers_size.saturating_sub(new_buffers_size);
 
         let old_h2_size: usize = self.http2_state.values().map(|c| c.buffer.len()).sum();
-        self.http2_state.retain(|_, conn| now_ms.saturating_sub(conn.last_event_ts) < STREAM_TTL_MS);
+        self.http2_state
+            .retain(|_, conn| now_ms.saturating_sub(conn.last_event_ts) < STREAM_TTL_MS);
         let new_h2_size: usize = self.http2_state.values().map(|c| c.buffer.len()).sum();
         freed_bytes += old_h2_size.saturating_sub(new_h2_size);
 
@@ -173,82 +180,139 @@ impl StreamState {
             let mut keys: Vec<_> = self.buffers.keys().cloned().collect();
             keys.sort_by_key(|k| self.buffers.get(k).map(|(_, ts)| *ts).unwrap_or(0));
             for k in keys.into_iter().take(excess) {
-                if let Some((buf, _)) = self.buffers.remove(&k) { freed_bytes += buf.len(); }
+                if let Some((buf, _)) = self.buffers.remove(&k) {
+                    freed_bytes += buf.len();
+                }
             }
         }
         if self.http2_state.len() > MAX_STREAM_ENTRIES {
             let excess = self.http2_state.len() - MAX_STREAM_ENTRIES;
             let mut keys: Vec<_> = self.http2_state.keys().cloned().collect();
-            keys.sort_by_key(|k| self.http2_state.get(k).map(|c| c.last_event_ts).unwrap_or(0));
+            keys.sort_by_key(|k| {
+                self.http2_state
+                    .get(k)
+                    .map(|c| c.last_event_ts)
+                    .unwrap_or(0)
+            });
             for k in keys.into_iter().take(excess) {
-                if let Some(conn) = self.http2_state.remove(&k) { freed_bytes += conn.buffer.len(); }
+                if let Some(conn) = self.http2_state.remove(&k) {
+                    freed_bytes += conn.buffer.len();
+                }
             }
         }
 
-        if freed_bytes > 0 { release_memory(freed_bytes); }
+        if freed_bytes > 0 {
+            release_memory(freed_bytes);
+        }
 
         self.known_connections.retain(|k| {
-            let still_active = self.pending.contains_key(k) || self.http2_state.contains_key(k) || self.ws_connections.contains(k) || self.http3_connections.contains(k);
+            let still_active = self.pending.contains_key(k)
+                || self.http2_state.contains_key(k)
+                || self.ws_connections.contains(k)
+                || self.http3_connections.contains(k);
             if !still_active {
                 ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
                 self.conn_born_ms.remove(&(k.pid, k.ssl_ptr));
             }
             still_active
         });
-        self.ws_connections.retain(|k| self.known_connections.contains(k));
-        self.http3_connections.retain(|k| self.known_connections.contains(k));
+        self.ws_connections
+            .retain(|k| self.known_connections.contains(k));
+        self.http3_connections
+            .retain(|k| self.known_connections.contains(k));
     }
 
     fn evict_connection_by_ptr(&mut self, pid: u32, ssl_ptr: u64) {
         let mut freed_bytes: usize = 0;
         self.buffers.retain(|k, (buf, _)| {
-            if k.pid == pid && k.ssl_ptr == ssl_ptr { freed_bytes += buf.len(); false } else { true }
+            if k.pid == pid && k.ssl_ptr == ssl_ptr {
+                freed_bytes += buf.len();
+                false
+            } else {
+                true
+            }
         });
-        self.pending.retain(|k, _| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
+        self.pending
+            .retain(|k, _| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
         self.http2_state.retain(|k, conn| {
-            if k.pid == pid && k.ssl_ptr == ssl_ptr { freed_bytes += conn.buffer.len(); false } else { true }
+            if k.pid == pid && k.ssl_ptr == ssl_ptr {
+                freed_bytes += conn.buffer.len();
+                false
+            } else {
+                true
+            }
         });
-        self.ws_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
-        self.http3_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
+        self.ws_connections
+            .retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
+        self.http3_connections
+            .retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
 
         let before = self.known_connections.len();
-        self.known_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
+        self.known_connections
+            .retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
         let evicted = before - self.known_connections.len();
-        if evicted > 0 { ACTIVE_CONNECTIONS.fetch_sub(evicted as u64, Ordering::Relaxed); }
+        if evicted > 0 {
+            ACTIVE_CONNECTIONS.fetch_sub(evicted as u64, Ordering::Relaxed);
+        }
         self.conn_born_ms.remove(&(pid, ssl_ptr));
-        if freed_bytes > 0 { release_memory(freed_bytes); }
+        if freed_bytes > 0 {
+            release_memory(freed_bytes);
+        }
     }
 
     fn net_context_from_event(&self, ev: &TlsEventHeader) -> NetContext {
         let mut ctx = NetContext::default();
-        if ev.cgroup_id != 0 { ctx.cgroup_id = Some(ev.cgroup_id); }
-        if ev.netns_ino != 0 { ctx.netns_ino = Some(ev.netns_ino); }
-        if ev.src_port != 0  { ctx.source_port = Some(ev.src_port); }
-        if ev.dst_port != 0  { ctx.dest_port = Some(ev.dst_port); }
+        if ev.cgroup_id != 0 {
+            ctx.cgroup_id = Some(ev.cgroup_id);
+        }
+        if ev.netns_ino != 0 {
+            ctx.netns_ino = Some(ev.netns_ino);
+        }
+        if ev.src_port != 0 {
+            ctx.source_port = Some(ev.src_port);
+        }
+        if ev.dst_port != 0 {
+            ctx.dest_port = Some(ev.dst_port);
+        }
         match ev.ip_family {
             4 => {
                 ctx.source_ip = Some(Ipv4Addr::from(u32::from_be(ev.src_ip4)).to_string());
-                ctx.dest_ip   = Some(Ipv4Addr::from(u32::from_be(ev.dst_ip4)).to_string());
+                ctx.dest_ip = Some(Ipv4Addr::from(u32::from_be(ev.dst_ip4)).to_string());
             }
             6 => {
                 ctx.source_ip = Some(Ipv6Addr::from(ev.src_ip6).to_string());
-                ctx.dest_ip   = Some(Ipv6Addr::from(ev.dst_ip6).to_string());
+                ctx.dest_ip = Some(Ipv6Addr::from(ev.dst_ip6).to_string());
             }
             _ => {}
         }
         ctx.container = self.container_resolver.resolve(ev);
         ctx.process_name = dns::read_process_name(ev.pid, &ev.comm);
-        if let Some(ref ip) = ctx.source_ip { ctx.source_hostname = self.dns_resolver.lookup_and_queue(ip); }
-        if let Some(ref ip) = ctx.dest_ip { ctx.dest_hostname = self.dns_resolver.lookup_and_queue(ip); }
+        if let Some(ref ip) = ctx.source_ip {
+            ctx.source_hostname = self.dns_resolver.lookup_and_queue(ip);
+        }
+        if let Some(ref ip) = ctx.dest_ip {
+            ctx.dest_hostname = self.dns_resolver.lookup_and_queue(ip);
+        }
         ctx
     }
 
     fn handle_event(&mut self, ev: &TlsEventHeader, payload: &[u8]) -> Vec<ApiTrafficEvent> {
         let mut output = Vec::new();
         let ts_ms = ev.ts_ns / 1_000_000;
-        let born_ms = *self.conn_born_ms.entry((ev.pid, ev.ssl_ptr)).or_insert(ts_ms);
-        let conn_key = ConnKey { pid: ev.pid, ssl_ptr: ev.ssl_ptr, born_ms };
-        let stream_key = StreamKey { pid: ev.pid, ssl_ptr: ev.ssl_ptr, direction: ev.direction };
+        let born_ms = *self
+            .conn_born_ms
+            .entry((ev.pid, ev.ssl_ptr))
+            .or_insert(ts_ms);
+        let conn_key = ConnKey {
+            pid: ev.pid,
+            ssl_ptr: ev.ssl_ptr,
+            born_ms,
+        };
+        let stream_key = StreamKey {
+            pid: ev.pid,
+            ssl_ptr: ev.ssl_ptr,
+            direction: ev.direction,
+        };
         let data_len = payload.len();
 
         self.evict_stale(ts_ms);
@@ -274,27 +338,55 @@ impl StreamState {
                 let queue = self.pending.entry(conn_key.clone()).or_default();
                 if queue.len() < MAX_PENDING_PER_CONN {
                     queue.push_back(ParsedRequest {
-                        method: "GET".to_string(), path: "/".to_string(), host: None,
-                        headers: HashMap::new(), body: Some(body_str), ts_ms, net_ctx,
+                        method: "GET".to_string(),
+                        path: "/".to_string(),
+                        host: None,
+                        headers: HashMap::new(),
+                        body: Some(body_str),
+                        ts_ms,
+                        net_ctx,
                     });
                 }
             } else {
-                let request = self.pending.entry(conn_key.clone()).or_default()
+                let request = self
+                    .pending
+                    .entry(conn_key.clone())
+                    .or_default()
                     .pop_front()
                     .unwrap_or_else(|| ParsedRequest {
-                        method: "GET".to_string(), path: "/".to_string(), host: None,
-                        headers: HashMap::new(), body: None, ts_ms, net_ctx: NetContext::default(),
+                        method: "GET".to_string(),
+                        path: "/".to_string(),
+                        host: None,
+                        headers: HashMap::new(),
+                        body: None,
+                        ts_ms,
+                        net_ctx: NetContext::default(),
                     });
                 let latency_ms = ts_ms.saturating_sub(request.ts_ms);
-                let resp = HttpResponseParsed { status_code: 200, headers: HashMap::new(), body: Some(body_str) };
-                output.push(build_event(self.account_id, ts_ms, request, resp, latency_ms, "HTTP/3", "ebpf"));
+                let resp = HttpResponseParsed {
+                    status_code: 200,
+                    headers: HashMap::new(),
+                    body: Some(body_str),
+                };
+                output.push(build_event(
+                    self.account_id,
+                    ts_ms,
+                    request,
+                    resp,
+                    latency_ms,
+                    "HTTP/3",
+                    "ebpf",
+                ));
             }
             return output;
         }
 
         // Accumulate data for this stream to handle split packets/prefaces
         {
-            let (buf, _last_seen) = self.buffers.entry(stream_key.clone()).or_insert_with(|| (Vec::new(), ts_ms));
+            let (buf, _last_seen) = self
+                .buffers
+                .entry(stream_key.clone())
+                .or_insert_with(|| (Vec::new(), ts_ms));
             if reserve_memory(self.max_total_buffer_bytes, data_len) {
                 buf.extend_from_slice(payload);
             } else {
@@ -306,7 +398,11 @@ impl StreamState {
         // We extract data from the buffer in a separate scope to avoid double mutable borrow.
         let is_known_h2 = self.http2_state.contains_key(&conn_key);
         let (has_preface, h2_data) = if let Some((buf, _)) = self.buffers.get(&stream_key) {
-            let preface = if !is_known_h2 { contains_http2_preface(buf) } else { false };
+            let preface = if !is_known_h2 {
+                contains_http2_preface(buf)
+            } else {
+                false
+            };
             if is_known_h2 || preface {
                 (preface, Some(buf.clone()))
             } else {
@@ -320,12 +416,21 @@ impl StreamState {
             if let Some((buf, _)) = self.buffers.get_mut(&stream_key) {
                 buf.clear();
             }
-            if let Some(events) = self.process_http2_event(conn_key.clone(), ev, &h1_data, ts_ms, is_request_dir, has_preface) {
+            if let Some(events) = self.process_http2_event(
+                conn_key.clone(),
+                ev,
+                &h1_data,
+                ts_ms,
+                is_request_dir,
+                has_preface,
+            ) {
                 return events;
             }
         }
 
-        if data_len == 0 { return output; }
+        if data_len == 0 {
+            return output;
+        }
 
         // HTTP/3 check
         let is_known_h3 = self.http3_connections.contains(&conn_key);
@@ -335,27 +440,55 @@ impl StreamState {
             for headers in header_sets {
                 if is_request_dir {
                     if let Some(method) = headers.get(":method") {
-                        let path = headers.get(":path").cloned().unwrap_or_else(|| "/".to_string());
+                        let path = headers
+                            .get(":path")
+                            .cloned()
+                            .unwrap_or_else(|| "/".to_string());
                         let host = headers.get(":authority").cloned();
                         let net_ctx = self.net_context_from_event(ev);
                         let queue = self.pending.entry(conn_key.clone()).or_default();
                         if queue.len() < MAX_PENDING_PER_CONN {
                             queue.push_back(ParsedRequest {
-                                method: method.clone(), path, host, headers: headers.clone(),
-                                body: None, ts_ms, net_ctx,
+                                method: method.clone(),
+                                path,
+                                host,
+                                headers: headers.clone(),
+                                body: None,
+                                ts_ms,
+                                net_ctx,
                             });
                         }
                     }
                 } else if let Some(status) = headers.get(":status") {
-                    let request = self.pending.entry(conn_key.clone()).or_default()
+                    let request = self
+                        .pending
+                        .entry(conn_key.clone())
+                        .or_default()
                         .pop_front()
                         .unwrap_or_else(|| ParsedRequest {
-                            method: "UNKNOWN".to_string(), path: "/".to_string(), host: None,
-                            headers: HashMap::new(), body: None, ts_ms, net_ctx: NetContext::default(),
+                            method: "UNKNOWN".to_string(),
+                            path: "/".to_string(),
+                            host: None,
+                            headers: HashMap::new(),
+                            body: None,
+                            ts_ms,
+                            net_ctx: NetContext::default(),
                         });
                     let latency_ms = ts_ms.saturating_sub(request.ts_ms);
-                    let resp = HttpResponseParsed { status_code: status.parse::<i32>().unwrap_or(0), headers: headers.clone(), body: None };
-                    output.push(build_event(self.account_id, ts_ms, request, resp, latency_ms, "HTTP/3", "ebpf"));
+                    let resp = HttpResponseParsed {
+                        status_code: status.parse::<i32>().unwrap_or(0),
+                        headers: headers.clone(),
+                        body: None,
+                    };
+                    output.push(build_event(
+                        self.account_id,
+                        ts_ms,
+                        request,
+                        resp,
+                        latency_ms,
+                        "HTTP/3",
+                        "ebpf",
+                    ));
                 }
             }
             return output;
@@ -367,12 +500,20 @@ impl StreamState {
             while pos < payload.len() {
                 match parse_websocket_frame(&payload[pos..]) {
                     Some((frame, consumed)) => {
-                        if consumed == 0 { break; }
+                        if consumed == 0 {
+                            break;
+                        }
                         let opcode_name = ws_opcode_name(frame.opcode).to_string();
                         let payload_str = String::from_utf8_lossy(&frame.payload).into_owned();
                         let redacted_payload = redact_pii(&payload_str);
                         let net_ctx = self.net_context_from_event(ev);
-                        output.push(build_ws_event(self.account_id, ts_ms, opcode_name, redacted_payload, net_ctx));
+                        output.push(build_ws_event(
+                            self.account_id,
+                            ts_ms,
+                            opcode_name,
+                            redacted_payload,
+                            net_ctx,
+                        ));
                         PROTO_WEBSOCKET.fetch_add(1, Ordering::Relaxed);
                         pos += consumed;
                     }
@@ -383,7 +524,10 @@ impl StreamState {
         }
 
         // HTTP/1.1 parsing — re-borrow the buffer after h2/h3/ws checks
-        let (buf, last_seen) = self.buffers.entry(stream_key.clone()).or_insert_with(|| (Vec::new(), ts_ms));
+        let (buf, last_seen) = self
+            .buffers
+            .entry(stream_key.clone())
+            .or_insert_with(|| (Vec::new(), ts_ms));
         *last_seen = ts_ms;
         if buf.len() > self.max_buffer {
             let drain = buf.len() - self.max_buffer;
@@ -398,7 +542,9 @@ impl StreamState {
             *buf = remaining;
         }
         let consumed = before_len.saturating_sub(buf.len());
-        if consumed > 0 { release_memory(consumed); }
+        if consumed > 0 {
+            release_memory(consumed);
+        }
 
         for msg in msgs {
             match msg {
@@ -408,43 +554,79 @@ impl StreamState {
                         let queue = self.pending.entry(conn_key.clone()).or_default();
                         if queue.len() < MAX_PENDING_PER_CONN {
                             queue.push_back(ParsedRequest {
-                                method: req.method, path: req.path, host: req.host, headers: req.headers,
-                                body: req.body, ts_ms, net_ctx,
+                                method: req.method,
+                                path: req.path,
+                                host: req.host,
+                                headers: req.headers,
+                                body: req.body,
+                                ts_ms,
+                                net_ctx,
                             });
                         }
                     }
                 }
                 HttpMessage::Response(resp) => {
-                    if is_request_dir { continue; }
+                    if is_request_dir {
+                        continue;
+                    }
                     let upgrade_hdr = resp.headers.get("upgrade").map(|v| v.to_lowercase());
-                    if upgrade_hdr.as_deref() == Some("websocket") { self.ws_connections.insert(conn_key.clone()); }
+                    if upgrade_hdr.as_deref() == Some("websocket") {
+                        self.ws_connections.insert(conn_key.clone());
+                    }
 
                     let is_mcp_sse = is_mcp_response(&resp.headers);
-                    let request = self.pending.entry(conn_key.clone()).or_default().pop_front()
+                    let request = self
+                        .pending
+                        .entry(conn_key.clone())
+                        .or_default()
+                        .pop_front()
                         .unwrap_or_else(|| ParsedRequest {
-                            method: "UNKNOWN".to_string(), path: "/".to_string(), host: None,
-                            headers: HashMap::new(), body: None, ts_ms, net_ctx: NetContext::default(),
+                            method: "UNKNOWN".to_string(),
+                            path: "/".to_string(),
+                            host: None,
+                            headers: HashMap::new(),
+                            body: None,
+                            ts_ms,
+                            net_ctx: NetContext::default(),
                         });
                     // Also detect MCP from JSON-RPC 2.0 request body with MCP methods
-                    let is_mcp_json = !is_mcp_sse &&
-                        request.body.as_deref().map(|b| is_mcp_jsonrpc(b)).unwrap_or(false);
+                    let is_mcp_json = !is_mcp_sse
+                        && request
+                            .body
+                            .as_deref()
+                            .map(|b| is_mcp_jsonrpc(b))
+                            .unwrap_or(false);
                     let is_mcp = is_mcp_sse || is_mcp_json;
 
                     // Extract response body for MCP analysis before build_event consumes it
                     let mcp_resp_body = if is_mcp_json {
                         resp.body.clone().or_else(|| request.body.clone())
-                    } else { None };
+                    } else {
+                        None
+                    };
 
                     let latency_ms = ts_ms.saturating_sub(request.ts_ms);
                     let protocol = if is_mcp { "MCP" } else { "HTTP/1.1" };
-                    let mut event = build_event(self.account_id, ts_ms, request, resp, latency_ms, protocol, "ebpf");
+                    let mut event = build_event(
+                        self.account_id,
+                        ts_ms,
+                        request,
+                        resp,
+                        latency_ms,
+                        protocol,
+                        "ebpf",
+                    );
                     if is_mcp {
                         if is_mcp_sse {
                             let mcp_events = parse_sse_events(payload);
                             if let Some(mcp_ev) = mcp_events.first() {
                                 event.metadata = Some(EventMetadata {
                                     has_injection: mcp_ev.has_injection,
-                                    injection_patterns: if mcp_ev.has_injection { vec!["prompt_injection".to_string()] } else { vec![] },
+                                    injection_patterns: if mcp_ev.has_injection {
+                                        vec!["prompt_injection".to_string()]
+                                    } else {
+                                        vec![]
+                                    },
                                     permission_flags: mcp_ev.permission_flags.clone(),
                                     mcp_method: mcp_ev.method.clone(),
                                     mcp_tool_name: mcp_ev.tool_name.clone(),
@@ -454,7 +636,11 @@ impl StreamState {
                             if let Some(mcp_ev) = parse_jsonrpc_mcp(&body) {
                                 event.metadata = Some(EventMetadata {
                                     has_injection: mcp_ev.has_injection,
-                                    injection_patterns: if mcp_ev.has_injection { vec!["prompt_injection".to_string()] } else { vec![] },
+                                    injection_patterns: if mcp_ev.has_injection {
+                                        vec!["prompt_injection".to_string()]
+                                    } else {
+                                        vec![]
+                                    },
                                     permission_flags: mcp_ev.permission_flags.clone(),
                                     mcp_method: mcp_ev.method.clone(),
                                     mcp_tool_name: mcp_ev.tool_name.clone(),
@@ -469,14 +655,30 @@ impl StreamState {
         output
     }
 
-    fn process_http2_event(&mut self, conn_key: ConnKey, ev: &TlsEventHeader, payload: &[u8], ts_ms: u64, is_request_dir: bool, data_has_preface: bool) -> Option<Vec<ApiTrafficEvent>> {
-        let net_ctx = if is_request_dir { Some(self.net_context_from_event(ev)) } else { None };
+    fn process_http2_event(
+        &mut self,
+        conn_key: ConnKey,
+        ev: &TlsEventHeader,
+        payload: &[u8],
+        ts_ms: u64,
+        is_request_dir: bool,
+        data_has_preface: bool,
+    ) -> Option<Vec<ApiTrafficEvent>> {
+        let net_ctx = if is_request_dir {
+            Some(self.net_context_from_event(ev))
+        } else {
+            None
+        };
         let conn_state = self.http2_state.entry(conn_key).or_default();
         conn_state.last_event_ts = ts_ms;
-        if data_has_preface { conn_state.seen_preface = true; }
+        if data_has_preface {
+            conn_state.seen_preface = true;
+        }
 
         let data_len = payload.len();
-        if data_len == 0 { return Some(vec![]); }
+        if data_len == 0 {
+            return Some(vec![]);
+        }
         if !reserve_memory(self.max_total_buffer_bytes, data_len) {
             EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
             return Some(vec![]);
@@ -484,47 +686,99 @@ impl StreamState {
         conn_state.buffer.extend_from_slice(payload);
 
         if !conn_state.seen_preface {
-            if contains_http2_preface(&conn_state.buffer) { conn_state.seen_preface = true; } else { return None; }
+            if contains_http2_preface(&conn_state.buffer) {
+                conn_state.seen_preface = true;
+            } else {
+                return None;
+            }
         }
 
         let mut output = Vec::new();
         if conn_state.buffer.len() > self.max_buffer * 2 {
             let target_drain = conn_state.buffer.len() - self.max_buffer;
             let boundary = find_next_frame_boundary(&conn_state.buffer, target_drain);
-            if boundary > 0 { release_memory(boundary); conn_state.buffer.drain(0..boundary); }
+            if boundary > 0 {
+                release_memory(boundary);
+                conn_state.buffer.drain(0..boundary);
+            }
         }
 
         let stream_frames = parse_http2_frames(&mut conn_state.hpack, &conn_state.buffer);
         for (stream_id, headers) in stream_frames {
             if is_request_dir {
                 if let Some(method) = headers.get(":method") {
-                    let path = headers.get(":path").cloned().unwrap_or_else(|| "/".to_string());
+                    let path = headers
+                        .get(":path")
+                        .cloned()
+                        .unwrap_or_else(|| "/".to_string());
                     let host = headers.get(":authority").cloned();
                     if conn_state.pending_requests.len() < MAX_H2_PENDING_STREAMS {
-                        conn_state.pending_requests.insert(stream_id, ParsedRequest {
-                            method: method.clone(), path, host, headers: headers.clone(), body: None, ts_ms,
-                            net_ctx: net_ctx.clone().unwrap_or_default(),
-                        });
+                        conn_state.pending_requests.insert(
+                            stream_id,
+                            ParsedRequest {
+                                method: method.clone(),
+                                path,
+                                host,
+                                headers: headers.clone(),
+                                body: None,
+                                ts_ms,
+                                net_ctx: net_ctx.clone().unwrap_or_default(),
+                            },
+                        );
                     }
                 }
             } else if let Some(status) = headers.get(":status") {
-                let request = conn_state.pending_requests.remove(&stream_id)
+                let request = conn_state
+                    .pending_requests
+                    .remove(&stream_id)
                     .unwrap_or_else(|| ParsedRequest {
-                        method: "UNKNOWN".to_string(), path: "/".to_string(), host: None,
-                        headers: HashMap::new(), body: None, ts_ms, net_ctx: NetContext::default(),
+                        method: "UNKNOWN".to_string(),
+                        path: "/".to_string(),
+                        host: None,
+                        headers: HashMap::new(),
+                        body: None,
+                        ts_ms,
+                        net_ctx: NetContext::default(),
                     });
                 let latency_ms = ts_ms.saturating_sub(request.ts_ms);
-                let resp = HttpResponseParsed { status_code: status.parse::<i32>().unwrap_or(0), headers: headers.clone(), body: None };
-                let is_grpc = headers.get("content-type").map(|v| v.starts_with("application/grpc")).unwrap_or(false)
-                    || request.headers.get("content-type").map(|v| v.starts_with("application/grpc")).unwrap_or(false);
+                let resp = HttpResponseParsed {
+                    status_code: status.parse::<i32>().unwrap_or(0),
+                    headers: headers.clone(),
+                    body: None,
+                };
+                let is_grpc = headers
+                    .get("content-type")
+                    .map(|v| v.starts_with("application/grpc"))
+                    .unwrap_or(false)
+                    || request
+                        .headers
+                        .get("content-type")
+                        .map(|v| v.starts_with("application/grpc"))
+                        .unwrap_or(false);
                 let grpc_body = if is_grpc {
                     let fields = decode_grpc_fields(&conn_state.buffer);
-                    if !fields.is_empty() { serde_json::to_string(&fields).ok() } else { None }
-                } else { None };
+                    if !fields.is_empty() {
+                        serde_json::to_string(&fields).ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
                 let protocol = if is_grpc { "gRPC" } else { "HTTP/2" };
-                let mut event = build_event(self.account_id, ts_ms, request, resp, latency_ms, protocol, "ebpf");
-                if let Some(body) = grpc_body { event.response.body = Some(body); }
+                let mut event = build_event(
+                    self.account_id,
+                    ts_ms,
+                    request,
+                    resp,
+                    latency_ms,
+                    protocol,
+                    "ebpf",
+                );
+                if let Some(body) = grpc_body {
+                    event.response.body = Some(body);
+                }
                 output.push(event);
             }
         }
@@ -539,31 +793,69 @@ impl StreamState {
     }
 }
 
-pub fn build_ws_event(account_id: u64, ts_ms: u64, opcode_name: String, payload: String, net_ctx: NetContext) -> ApiTrafficEvent {
+pub fn build_ws_event(
+    account_id: u64,
+    ts_ms: u64,
+    opcode_name: String,
+    payload: String,
+    net_ctx: NetContext,
+) -> ApiTrafficEvent {
     ApiTrafficEvent {
-        version: "v1".to_string(), event_type: "ws_message".to_string(), source: "ebpf".to_string(), protocol: "WebSocket".to_string(),
-        account_id, observed_at: ts_ms,
+        version: "v1".to_string(),
+        event_type: "ws_message".to_string(),
+        source: "ebpf".to_string(),
+        protocol: "WebSocket".to_string(),
+        account_id,
+        observed_at: ts_ms,
         request: ApiRequest {
-            method: opcode_name, path: "/ws".to_string(), host: None, scheme: "wss".to_string(),
-            headers: HashMap::new(), query: HashMap::new(), body: Some(payload),
+            method: opcode_name,
+            path: "/ws".to_string(),
+            host: None,
+            scheme: "wss".to_string(),
+            headers: HashMap::new(),
+            query: HashMap::new(),
+            body: Some(payload),
         },
-        response: ApiResponse { status_code: 0, headers: HashMap::new(), body: None, latency_ms: None },
-        collection_id: None, source_ip: net_ctx.source_ip, dest_ip: net_ctx.dest_ip, source_port: net_ctx.source_port, dest_port: net_ctx.dest_port,
-        netns_ino: net_ctx.netns_ino, cgroup_id: net_ctx.cgroup_id, container: net_ctx.container, process_name: net_ctx.process_name,
-        source_hostname: net_ctx.source_hostname, dest_hostname: net_ctx.dest_hostname, metadata: None, anomaly_features: None,
+        response: ApiResponse {
+            status_code: 0,
+            headers: HashMap::new(),
+            body: None,
+            latency_ms: None,
+        },
+        collection_id: None,
+        source_ip: net_ctx.source_ip,
+        dest_ip: net_ctx.dest_ip,
+        source_port: net_ctx.source_port,
+        dest_port: net_ctx.dest_port,
+        netns_ino: net_ctx.netns_ino,
+        cgroup_id: net_ctx.cgroup_id,
+        container: net_ctx.container,
+        process_name: net_ctx.process_name,
+        source_hostname: net_ctx.source_hostname,
+        dest_hostname: net_ctx.dest_hostname,
+        metadata: None,
+        anomaly_features: None,
     }
 }
 
-pub fn build_event(account_id: u64, ts_ms: u64, req: ParsedRequest, resp: HttpResponseParsed, latency_ms: u64, protocol: &str, source: &str) -> ApiTrafficEvent {
+pub fn build_event(
+    account_id: u64,
+    ts_ms: u64,
+    req: ParsedRequest,
+    resp: HttpResponseParsed,
+    latency_ms: u64,
+    protocol: &str,
+    source: &str,
+) -> ApiTrafficEvent {
     match protocol {
         "HTTP/1.1" => PROTO_HTTP1.fetch_add(1, Ordering::Relaxed),
-        "HTTP/2"   => PROTO_HTTP2.fetch_add(1, Ordering::Relaxed),
-        "HTTP/3"   => PROTO_HTTP3.fetch_add(1, Ordering::Relaxed),
-        "gRPC"     => PROTO_GRPC.fetch_add(1, Ordering::Relaxed),
-        "WebSocket"=> PROTO_WEBSOCKET.fetch_add(1, Ordering::Relaxed),
-        "MCP"      => PROTO_MCP.fetch_add(1, Ordering::Relaxed),
-        "Go-TLS"   => PROTO_GO_TLS.fetch_add(1, Ordering::Relaxed),
-        _          => 0,
+        "HTTP/2" => PROTO_HTTP2.fetch_add(1, Ordering::Relaxed),
+        "HTTP/3" => PROTO_HTTP3.fetch_add(1, Ordering::Relaxed),
+        "gRPC" => PROTO_GRPC.fetch_add(1, Ordering::Relaxed),
+        "WebSocket" => PROTO_WEBSOCKET.fetch_add(1, Ordering::Relaxed),
+        "MCP" => PROTO_MCP.fetch_add(1, Ordering::Relaxed),
+        "Go-TLS" => PROTO_GO_TLS.fetch_add(1, Ordering::Relaxed),
+        _ => 0,
     };
 
     let redacted_path = redact_pii(&req.path);
@@ -571,22 +863,46 @@ pub fn build_event(account_id: u64, ts_ms: u64, req: ParsedRequest, resp: HttpRe
     let net_ctx = req.net_ctx;
 
     ApiTrafficEvent {
-        version: "v1".to_string(), event_type: "api_traffic".to_string(), source: source.to_string(), protocol: protocol.to_string(),
-        account_id, observed_at: ts_ms,
+        version: "v1".to_string(),
+        event_type: "api_traffic".to_string(),
+        source: source.to_string(),
+        protocol: protocol.to_string(),
+        account_id,
+        observed_at: ts_ms,
         request: ApiRequest {
-            method: req.method, path, host: req.host, scheme: "https".to_string(),
-            headers: req.headers.into_iter().map(|(k,v)| (k, redact_pii(&v))).collect(),
-            query, body: req.body.map(|b| redact_pii(&b)),
+            method: req.method,
+            path,
+            host: req.host,
+            scheme: "https".to_string(),
+            headers: req
+                .headers
+                .into_iter()
+                .map(|(k, v)| (k, redact_pii(&v)))
+                .collect(),
+            query,
+            body: req.body.map(|b| redact_pii(&b)),
         },
         response: ApiResponse {
             status_code: resp.status_code,
-            headers: resp.headers.into_iter().map(|(k,v)| (k, redact_pii(&v))).collect(),
+            headers: resp
+                .headers
+                .into_iter()
+                .map(|(k, v)| (k, redact_pii(&v)))
+                .collect(),
             body: resp.body.map(|b| redact_pii(&b)),
             latency_ms: Some(latency_ms),
         },
-        collection_id: None, source_ip: net_ctx.source_ip, dest_ip: net_ctx.dest_ip, source_port: net_ctx.source_port, dest_port: net_ctx.dest_port,
-        netns_ino: net_ctx.netns_ino, cgroup_id: net_ctx.cgroup_id, container: net_ctx.container, process_name: net_ctx.process_name,
-        source_hostname: net_ctx.source_hostname, dest_hostname: net_ctx.dest_hostname,
+        collection_id: None,
+        source_ip: net_ctx.source_ip,
+        dest_ip: net_ctx.dest_ip,
+        source_port: net_ctx.source_port,
+        dest_port: net_ctx.dest_port,
+        netns_ino: net_ctx.netns_ino,
+        cgroup_id: net_ctx.cgroup_id,
+        container: net_ctx.container,
+        process_name: net_ctx.process_name,
+        source_hostname: net_ctx.source_hostname,
+        dest_hostname: net_ctx.dest_hostname,
         metadata: None,
         anomaly_features: None,
     }
@@ -595,18 +911,27 @@ pub fn build_event(account_id: u64, ts_ms: u64, req: ParsedRequest, resp: HttpRe
 fn find_next_frame_boundary(buf: &[u8], start: usize) -> usize {
     let mut i = start;
     while i + 9 <= buf.len() {
-        let frame_len = ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | (buf[i + 2] as usize);
+        let frame_len =
+            ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | (buf[i + 2] as usize);
         let frame_type = buf[i + 3];
-        if frame_len <= 16384 && frame_type <= 9 && i + 9 + frame_len <= buf.len() { return i; }
+        if frame_len <= 16384 && frame_type <= 9 && i + 9 + frame_len <= buf.len() {
+            return i;
+        }
         i += 1;
     }
     buf.len()
 }
 
 fn reserve_memory(max_total: usize, additional: usize) -> bool {
-    TOTAL_BUFFER_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        if current + additional <= max_total { Some(current + additional) } else { None }
-    }).is_ok()
+    TOTAL_BUFFER_BYTES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            if current + additional <= max_total {
+                Some(current + additional)
+            } else {
+                None
+            }
+        })
+        .is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -616,8 +941,8 @@ fn reserve_memory(max_total: usize, additional: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
 
     /// Reset global atomic counters to avoid cross-test interference.
     fn reset_metrics() {
@@ -632,20 +957,27 @@ mod tests {
 
     fn make_sharded(max_total_buffer_bytes: usize) -> ShardedStreamState {
         let (lookup_tx, _lookup_rx) = tokio::sync::mpsc::channel(1);
-        let container_resolver = Arc::new(ContainerResolver::new(lookup_tx, "test-node".to_string()));
+        let container_resolver =
+            Arc::new(ContainerResolver::new(lookup_tx, "test-node".to_string()));
         let (dns_tx, _dns_rx) = tokio::sync::mpsc::channel(1);
         let dns_resolver = Arc::new(DnsResolver::new(dns_tx));
         ShardedStreamState::new(
-            42,                       // account_id
-            TrafficRole::Server,      // role
-            64 * 1024,                // max_buffer
+            42,                  // account_id
+            TrafficRole::Server, // role
+            64 * 1024,           // max_buffer
             container_resolver,
-            max_total_buffer_bytes,   // max_total_buffer_bytes
+            max_total_buffer_bytes, // max_total_buffer_bytes
             dns_resolver,
         )
     }
 
-    fn make_event(pid: u32, ssl_ptr: u64, direction: u8, data_len: u32, ts_ns: u64) -> TlsEventHeader {
+    fn make_event(
+        pid: u32,
+        ssl_ptr: u64,
+        direction: u8,
+        data_len: u32,
+        ts_ns: u64,
+    ) -> TlsEventHeader {
         TlsEventHeader {
             ts_ns,
             pid,
@@ -794,7 +1126,10 @@ mod tests {
 
         // Verify the connection is active
         let active_before = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
-        assert!(active_before >= 1, "should have at least one active connection");
+        assert!(
+            active_before >= 1,
+            "should have at least one active connection"
+        );
 
         // Now send an event with a much later timestamp (> STREAM_TTL_MS=60s later)
         // and the eviction interval (10s) has passed. Use different ssl_ptr to avoid
@@ -807,7 +1142,11 @@ mod tests {
 
         // The eviction should have cleaned up the old connection's buffers.
         // We verify by evicting explicitly and checking the conn is gone.
-        let conn_key = ConnKey { pid, ssl_ptr: ssl, born_ms: old_ts / 1_000_000 };
+        let conn_key = ConnKey {
+            pid,
+            ssl_ptr: ssl,
+            born_ms: old_ts / 1_000_000,
+        };
         ss.evict_connection(&conn_key);
 
         // After explicit eviction, the old connection should be cleaned up.
@@ -856,7 +1195,8 @@ mod tests {
         assert!(
             dropped_after > dropped_before,
             "expected EVENTS_DROPPED to increase; before={}, after={}",
-            dropped_before, dropped_after
+            dropped_before,
+            dropped_after
         );
     }
 
@@ -899,7 +1239,10 @@ mod tests {
         let ev = make_event(pid, ssl, 0, h3_payload.len() as u32, ts_base);
         let out = ss.handle_event(&ev, &h3_payload);
         // Request alone queues; no output yet
-        assert!(out.is_empty(), "H3 request should be queued, not emitted yet");
+        assert!(
+            out.is_empty(),
+            "H3 request should be queued, not emitted yet"
+        );
 
         // Now send a response with :status 200
         // QPACK: index 25 = :status 200 => 0x80 | 0x40 | 25 = 0xD9
@@ -946,7 +1289,13 @@ mod tests {
         let mut unknown_correlations = 0;
         for i in 0..150u64 {
             let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-            let ev = make_event(pid, ssl, 1, resp.len() as u32, ts_base + 200_000_000 + i * 100_000);
+            let ev = make_event(
+                pid,
+                ssl,
+                1,
+                resp.len() as u32,
+                ts_base + 200_000_000 + i * 100_000,
+            );
             let out = ss.handle_event(&ev, resp);
             for event in &out {
                 if event.request.method == "UNKNOWN" {

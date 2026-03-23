@@ -1,20 +1,20 @@
-mod types;
-mod metrics;
-mod redaction;
-mod websocket;
-mod grpc;
-mod mcp;
-mod http2;
-mod http;
-mod go_tls;
 mod boringssl;
-mod container;
-mod stream;
-mod ingest;
 mod bpf;
-mod dns;
-mod quic;
 mod config;
+mod container;
+mod dns;
+mod go_tls;
+mod grpc;
+mod http;
+mod http2;
+mod ingest;
+mod mcp;
+mod metrics;
+mod quic;
+mod redaction;
+mod stream;
+mod types;
+mod websocket;
 
 use anyhow::Result;
 use clap::Parser;
@@ -28,11 +28,11 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
 
-use crate::bpf::{attach_tls_uprobes, attach_kernel_probes, attach_quic_uprobes};
 use crate::boringssl::attach_boring_ssl_static;
+use crate::bpf::{attach_kernel_probes, attach_quic_uprobes, attach_tls_uprobes};
 use crate::config::load_config;
-use crate::container::{ContainerLookupRequest, ContainerResolver, fetch_container_metadata};
-use crate::dns::{DnsResolver, reverse_dns_lookup};
+use crate::container::{fetch_container_metadata, ContainerLookupRequest, ContainerResolver};
+use crate::dns::{reverse_dns_lookup, DnsResolver};
 use crate::go_tls::{attach_go_tls_probes, find_go_tls_offsets};
 use crate::http::discover_tls_libs;
 use crate::ingest::send_batch_with_client;
@@ -78,16 +78,16 @@ fn init_tracing() {
     }
 
     // Default: stdout tracing. Set LOG_FORMAT=json for structured JSON output.
-    let json_logging = std::env::var("LOG_FORMAT").map(|v| v == "json").unwrap_or(false);
+    let json_logging = std::env::var("LOG_FORMAT")
+        .map(|v| v == "json")
+        .unwrap_or(false);
     if json_logging {
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .json()
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 }
 
@@ -159,51 +159,59 @@ fn resolve_config(args: Args) -> anyhow::Result<ResolvedConfig> {
     let file_cfg = load_config(&args.config)?;
     let c = file_cfg.sensor;
 
-    let bpf = args.bpf
+    let bpf = args
+        .bpf
         .or(c.bpf)
         .unwrap_or_else(|| "/opt/sensor/http_trace.bpf.o".to_string());
-    let ingest = args.ingest
+    let ingest = args
+        .ingest
         .or(c.ingest)
         .ok_or_else(|| anyhow::anyhow!("--ingest URL is required (CLI or config file)"))?;
-    let api_key = args.api_key
-        .or(c.api_key)
-        .unwrap_or_default();
+    let api_key = args.api_key.or(c.api_key).unwrap_or_default();
 
     Ok(ResolvedConfig {
         bpf,
         ingest,
         api_key,
-        account_id:           args.account_id.or(c.account_id).unwrap_or(1_000_000),
-        batch_size:           args.batch_size.or(c.batch_size).unwrap_or(200),
-        role:                 args.role.or(c.role).unwrap_or_else(|| "server".to_string()),
-        tls_libs:             args.tls_libs.or(c.tls_libs)
-                                  .unwrap_or_else(|| {
-                                      // Try common paths for the platform
-                                      let candidates = [
-                                          "/usr/lib/x86_64-linux-gnu/libssl.so.3",
-                                          "/usr/lib/aarch64-linux-gnu/libssl.so.3",
-                                          "/usr/lib/libssl.so.3",
-                                          "/usr/lib64/libssl.so.3",
-                                          "/lib/x86_64-linux-gnu/libssl.so.3",
-                                      ];
-                                      for path in &candidates {
-                                          if std::path::Path::new(path).exists() {
-                                              return vec![path.to_string()];
-                                          }
-                                      }
-                                      // Fallback: rely on discover_libs
-                                      tracing::warn!("no default libssl found, enable --discover-libs");
-                                      vec![]
-                                  }),
-        tls_provider:         args.tls_provider.or(c.tls_provider).unwrap_or_else(|| "auto".to_string()),
-        pid:                  args.pid.or(c.pid).unwrap_or(-1),
-        discover_libs:        args.discover_libs || c.discover_libs.unwrap_or(false),
-        max_buffer_bytes:     args.max_buffer_bytes.or(c.max_buffer_bytes).unwrap_or(65536),
-        max_total_buffer_bytes: args.max_total_buffer_bytes.or(c.max_total_buffer_bytes).unwrap_or(104_857_600),
-        metrics_port:         args.metrics_port.or(c.metrics_port).unwrap_or(9090),
-        go_tls:               args.go_tls || c.go_tls.unwrap_or(false),
-        sample_default:       args.sample_default.or(c.sample_default).unwrap_or(100),
-        sample_health:        args.sample_health.or(c.sample_health).unwrap_or(5),
+        account_id: args.account_id.or(c.account_id).unwrap_or(1_000_000),
+        batch_size: args.batch_size.or(c.batch_size).unwrap_or(200),
+        role: args.role.or(c.role).unwrap_or_else(|| "server".to_string()),
+        tls_libs: args.tls_libs.or(c.tls_libs).unwrap_or_else(|| {
+            // Try common paths for the platform
+            let candidates = [
+                "/usr/lib/x86_64-linux-gnu/libssl.so.3",
+                "/usr/lib/aarch64-linux-gnu/libssl.so.3",
+                "/usr/lib/libssl.so.3",
+                "/usr/lib64/libssl.so.3",
+                "/lib/x86_64-linux-gnu/libssl.so.3",
+            ];
+            for path in &candidates {
+                if std::path::Path::new(path).exists() {
+                    return vec![path.to_string()];
+                }
+            }
+            // Fallback: rely on discover_libs
+            tracing::warn!("no default libssl found, enable --discover-libs");
+            vec![]
+        }),
+        tls_provider: args
+            .tls_provider
+            .or(c.tls_provider)
+            .unwrap_or_else(|| "auto".to_string()),
+        pid: args.pid.or(c.pid).unwrap_or(-1),
+        discover_libs: args.discover_libs || c.discover_libs.unwrap_or(false),
+        max_buffer_bytes: args
+            .max_buffer_bytes
+            .or(c.max_buffer_bytes)
+            .unwrap_or(65536),
+        max_total_buffer_bytes: args
+            .max_total_buffer_bytes
+            .or(c.max_total_buffer_bytes)
+            .unwrap_or(104_857_600),
+        metrics_port: args.metrics_port.or(c.metrics_port).unwrap_or(9090),
+        go_tls: args.go_tls || c.go_tls.unwrap_or(false),
+        sample_default: args.sample_default.or(c.sample_default).unwrap_or(100),
+        sample_health: args.sample_health.or(c.sample_health).unwrap_or(5),
     })
 }
 
@@ -265,13 +273,21 @@ fn discover_static_tls_candidates(target_pid: i32) -> Vec<StaticTlsCandidate> {
 
     for p in &pids_to_scan {
         let maps_path = format!("/proc/{}/maps", p);
-        let Ok(maps) = fs::read_to_string(&maps_path) else { continue };
+        let Ok(maps) = fs::read_to_string(&maps_path) else {
+            continue;
+        };
         for line in maps.lines() {
-            if !line.contains("r-xp") { continue; }
+            if !line.contains("r-xp") {
+                continue;
+            }
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 6 { continue; }
+            if parts.len() < 6 {
+                continue;
+            }
             let path = parts[parts.len() - 1];
-            if !path.starts_with('/') { continue; }
+            if !path.starts_with('/') {
+                continue;
+            }
 
             // Skip paths that can never contain SSL symbols
             let basename = path.rsplit('/').next().unwrap_or("");
@@ -289,13 +305,17 @@ fn discover_static_tls_candidates(target_pid: i32) -> Vec<StaticTlsCandidate> {
                 || basename.ends_with(".so")
                 || basename.contains(".so.");
             if !dominated_by_ssl {
-                if !path.contains("/bin/") { continue; }
+                if !path.contains("/bin/") {
+                    continue;
+                }
             }
 
             // Dedup by dev:inode — uprobes attach by inode, so one probe
             // per unique file covers all PIDs that map the same binary.
             let dedup_key = format!("{}:{}", parts[3], parts[4]);
-            if !seen_inodes.insert(dedup_key) { continue; }
+            if !seen_inodes.insert(dedup_key) {
+                continue;
+            }
 
             let host_path = crate::types::proc_root_path(*p, path);
             candidates.push(StaticTlsCandidate { host_path, pid: *p });
@@ -334,7 +354,10 @@ async fn main() -> Result<()> {
         anyhow::bail!("--api-key or API_KEY env var is required");
     }
     if !args.ingest.starts_with("http://") && !args.ingest.starts_with("https://") {
-        anyhow::bail!("--ingest must be an http:// or https:// URL, got: {}", args.ingest);
+        anyhow::bail!(
+            "--ingest must be an http:// or https:// URL, got: {}",
+            args.ingest
+        );
     }
     let role = match args.role.as_str() {
         "server" => TrafficRole::Server,
@@ -346,10 +369,14 @@ async fn main() -> Result<()> {
 
     // Pre-flight validation: BPF filesystem write access
     if !std::path::Path::new("/sys/fs/bpf").exists() {
-        anyhow::bail!("FATAL: /sys/fs/bpf not mounted — BPF maps unavailable. Kernel may lack BPF support.");
+        anyhow::bail!(
+            "FATAL: /sys/fs/bpf not mounted — BPF maps unavailable. Kernel may lack BPF support."
+        );
     }
     match std::fs::write("/sys/fs/bpf/.probe-writable-check", "test") {
-        Ok(_) => { let _ = std::fs::remove_file("/sys/fs/bpf/.probe-writable-check"); },
+        Ok(_) => {
+            let _ = std::fs::remove_file("/sys/fs/bpf/.probe-writable-check");
+        }
         Err(e) => {
             anyhow::bail!("FATAL: Cannot write to /sys/fs/bpf: {} — Check kernel security policies (SELinux/AppArmor). Enable CAP_BPF or run privileged.", e);
         }
@@ -375,12 +402,23 @@ async fn main() -> Result<()> {
     // Warn if no TLS libraries are configured — this will result in zero events captured
     if tls_libs.is_empty() && !args.go_tls {
         tracing::warn!("⚠️  No TLS libraries configured and --go-tls not enabled");
-        tracing::warn!("    Configure --tls-libs or enable --discover-libs to capture encrypted traffic");
+        tracing::warn!(
+            "    Configure --tls-libs or enable --discover-libs to capture encrypted traffic"
+        );
         tracing::warn!("    Sensor will run but likely capture zero events");
-        tracing::warn!("    To suppress this warning, set --tls-libs with at least one library path");
+        tracing::warn!(
+            "    To suppress this warning, set --tls-libs with at least one library path"
+        );
     }
 
-    attach_tls_uprobes(&mut obj, &args.tls_provider, args.pid, args.go_tls, &tls_libs, &mut links)?;
+    attach_tls_uprobes(
+        &mut obj,
+        &args.tls_provider,
+        args.pid,
+        args.go_tls,
+        &tls_libs,
+        &mut links,
+    )?;
     attach_kernel_probes(&mut obj, &mut links)?;
 
     // Initialize sampling_config — must happen before polling starts.
@@ -411,12 +449,19 @@ async fn main() -> Result<()> {
     // This runs concurrently with ring buffer polling so events are captured immediately.
     let static_tls_discovery = if args.go_tls {
         let scan_mode = if args.pid > 0 { "targeted" } else { "global" };
-        tracing::info!(pid = args.pid, mode = scan_mode, "Go TLS + static TLS: starting background discovery");
+        tracing::info!(
+            pid = args.pid,
+            mode = scan_mode,
+            "Go TLS + static TLS: starting background discovery"
+        );
         let target_pid = args.pid;
         Some(tokio::task::spawn_blocking(move || {
             let static_tls = discover_static_tls_candidates(target_pid);
             let go_binaries = crate::go_tls::detect_go_binaries(target_pid);
-            DiscoveryResults { static_tls, go_binaries }
+            DiscoveryResults {
+                static_tls,
+                go_binaries,
+            }
         }))
     } else {
         None
@@ -426,8 +471,8 @@ async fn main() -> Result<()> {
     let node_name = env::var("NODE_NAME")
         .or_else(|_| env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown-node".to_string());
-    let cri_socket = env::var("CRI_SOCKET")
-        .unwrap_or_else(|_| "/run/containerd/containerd.sock".to_string());
+    let cri_socket =
+        env::var("CRI_SOCKET").unwrap_or_else(|_| "/run/containerd/containerd.sock".to_string());
 
     let (lookup_tx, mut lookup_rx) = mpsc::channel::<ContainerLookupRequest>(1024);
     let container_resolver = Arc::new(ContainerResolver::new(lookup_tx, node_name));
@@ -474,9 +519,9 @@ async fn main() -> Result<()> {
             .build()?,
     );
 
-    let ingest_url  = args.ingest.clone();
-    let api_key     = args.api_key.clone();
-    let batch_size  = args.batch_size;
+    let ingest_url = args.ingest.clone();
+    let api_key = args.api_key.clone();
+    let batch_size = args.batch_size;
     let client_handle = http_client.clone();
     let resolver_for_batch = container_resolver.clone();
     let batch_handle = tokio::spawn(async move {
@@ -538,12 +583,13 @@ async fn main() -> Result<()> {
     let sender = tx.clone();
     let state_handle = state.clone();
 
-    let events_map = obj
-        .map_mut("events")
-        .ok_or_else(|| anyhow::anyhow!("missing events map"))? as *mut libbpf_rs::Map;
+    let events_map =
+        obj.map_mut("events")
+            .ok_or_else(|| anyhow::anyhow!("missing events map"))? as *mut libbpf_rs::Map;
     let close_events_map = obj
         .map_mut("close_events")
-        .ok_or_else(|| anyhow::anyhow!("missing close_events map"))? as *mut libbpf_rs::Map;
+        .ok_or_else(|| anyhow::anyhow!("missing close_events map"))?
+        as *mut libbpf_rs::Map;
 
     let channel_capacity = 10000u64;
     // SAFETY: `events_map` is a valid pointer to an `Object`-owned map that outlives
@@ -576,7 +622,11 @@ async fn main() -> Result<()> {
                 return 0;
             }
             let ev = std::ptr::read_unaligned(data.as_ptr() as *const CloseEvent);
-            let key = ConnKey { pid: ev.pid, ssl_ptr: ev.ssl_ptr, born_ms: 0 };
+            let key = ConnKey {
+                pid: ev.pid,
+                ssl_ptr: ev.ssl_ptr,
+                born_ms: 0,
+            };
             state_handle_close.evict_connection(&key);
             0
         })?;
@@ -594,7 +644,11 @@ async fn main() -> Result<()> {
                     return 0;
                 }
                 let ev = std::ptr::read_unaligned(data.as_ptr() as *const NewProcEvent);
-                let filename_end = ev.filename.iter().position(|&b| b == 0).unwrap_or(ev.filename.len());
+                let filename_end = ev
+                    .filename
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(ev.filename.len());
                 let filename = String::from_utf8_lossy(&ev.filename[..filename_end]);
                 tracing::debug!(pid = ev.pid, file = %filename, "new process detected");
                 let _ = new_pid_tx.try_send(ev.pid);
@@ -610,11 +664,17 @@ async fn main() -> Result<()> {
         let mut seen_pids = std::collections::HashSet::new();
         while let Some(pid) = new_pid_rx.recv().await {
             let pid = pid as i32;
-            if pid <= 2 || !seen_pids.insert(pid) { continue; }
-            if seen_pids.len() > 100_000 { seen_pids.clear(); }
+            if pid <= 2 || !seen_pids.insert(pid) {
+                continue;
+            }
+            if seen_pids.len() > 100_000 {
+                seen_pids.clear();
+            }
             tokio::time::sleep(Duration::from_millis(500)).await;
             let maps_path = format!("/proc/{}/maps", pid);
-            if std::fs::read_to_string(&maps_path).is_err() { continue; }
+            if std::fs::read_to_string(&maps_path).is_err() {
+                continue;
+            }
             if discover_libs_enabled {
                 let libs = crate::http::discover_tls_libs(pid);
                 for lib in libs {
@@ -695,7 +755,9 @@ async fn main() -> Result<()> {
 
         // Final guard
         if links.is_empty() {
-            anyhow::bail!("no probes attached; --go-tls enabled but no TLS library or Go binary found");
+            anyhow::bail!(
+                "no probes attached; --go-tls enabled but no TLS library or Go binary found"
+            );
         }
     }
 
@@ -714,7 +776,9 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_millis(poll_backoff_ms)).await;
         }
         match ringbuf.poll(Duration::from_millis(200)) {
-            Ok(()) => { poll_backoff_ms = 0; }
+            Ok(()) => {
+                poll_backoff_ms = 0;
+            }
             Err(e) => {
                 poll_backoff_ms = (poll_backoff_ms * 2 + 10).min(1000);
                 tracing::warn!(error = %e, backoff_ms = poll_backoff_ms, "ring buffer poll error");
@@ -747,7 +811,7 @@ mod tests {
 
     #[test]
     fn test_ssl_ptr_to_pid_resolution() {
-        let owner   = Some(0x1234_0000_0001u64);
+        let owner = Some(0x1234_0000_0001u64);
         let current = 0x9999_0000_0002u64;
         assert_eq!(resolve_owner_pid_tgid(owner, current), 0x1234_0000_0001);
         assert_eq!(resolve_owner_pid_tgid(None, current), current);
