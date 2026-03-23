@@ -9,8 +9,8 @@ fail() { echo -e "${RED}[FAIL]${RESET} $1"; FAIL=$((FAIL+1)); TOTAL_TESTS=$((TOT
 info() { echo -e "${YELLOW}[INFO]${RESET} $1"; }
 step() { echo -e "\n${CYAN}── $1 ──${RESET}"; }
 
-SENSOR_BIN="/sensor/userspace/target/release/api-sec-sensor"
-BPF_OBJ="/sensor/bpf/http_trace.bpf.o"
+SENSOR_BIN="/home/admin/sensor/API-Sensor/userspace/target/release/api-sec-sensor"
+BPF_OBJ="/home/admin/sensor/API-Sensor/bpf/http_trace.bpf.o"
 INGEST_PORT=9999
 METRICS_PORT=9091
 INGEST_PID=""
