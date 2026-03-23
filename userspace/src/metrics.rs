@@ -24,6 +24,7 @@ async fn metrics_handler() -> impl IntoResponse {
     let captured = EVENTS_CAPTURED.load(Ordering::Relaxed);
     let dropped  = EVENTS_DROPPED.load(Ordering::Relaxed);
     let drop_rate = if captured > 0 { dropped * 10000 / captured } else { 0 };
+    let drop_ratio = if captured > 0 { (dropped as f64) / (captured as f64) } else { 0.0 };
     let uptime = now_secs().saturating_sub(START_TIME_SECS.load(Ordering::Relaxed));
 
     format!(
@@ -43,9 +44,13 @@ apisec_events_sent_total {}
 # TYPE apisec_send_errors_total counter
 apisec_send_errors_total {}
 
-# HELP apisec_drop_rate_bps Drop rate basis points
+# HELP apisec_drop_rate_bps Drop rate basis points (0-10000)
 # TYPE apisec_drop_rate_bps gauge
 apisec_drop_rate_bps {drop_rate}
+
+# HELP apisec_drop_ratio Drop ratio as decimal (0-1.0)
+# TYPE apisec_drop_ratio gauge
+apisec_drop_ratio {drop_ratio:.6}
 
 # HELP apisec_active_connections Active TLS connections
 # TYPE apisec_active_connections gauge

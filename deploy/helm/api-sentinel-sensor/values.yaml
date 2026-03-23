@@ -41,5 +41,11 @@ rbac:
 
 priorityClassName: system-node-critical
 
+# CRI socket path — change per node if using cri-o, docker, or custom socket locations
+# containerd (default): /run/containerd/containerd.sock
+# cri-o: /run/crio/crio.sock
+# docker: /var/run/docker.sock
+criSocketPath: /run/containerd/containerd.sock
+
 nodeSelector: {}
 tolerations: []

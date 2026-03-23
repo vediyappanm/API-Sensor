@@ -102,9 +102,11 @@ spec:
             - name: cgroup
               mountPath: /sys/fs/cgroup
               readOnly: true
+            {{- if .Values.criSocketPath }}
             - name: cri-socket
               mountPath: /run/containerd/containerd.sock
               readOnly: true
+            {{- end }}
             - name: tmp
               mountPath: /tmp
       volumes:
@@ -120,10 +122,12 @@ spec:
         - name: cgroup
           hostPath:
             path: /sys/fs/cgroup
+        {{- if .Values.criSocketPath }}
         - name: cri-socket
           hostPath:
-            path: /run/containerd/containerd.sock
+            path: {{ .Values.criSocketPath }}
             type: Socket
+        {{- end }}
         - name: tmp
           emptyDir:
             medium: Memory
