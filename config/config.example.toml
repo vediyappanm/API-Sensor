@@ -33,7 +33,7 @@ tls_provider = "auto"
 pid = -1
 
 # Auto-detect TLS libraries from /proc/<pid>/maps
-discover_libs = true
+discover_libs = false
 
 # Enable Go crypto/tls interception
 go_tls = false

@@ -258,11 +258,6 @@ pub fn detect_go_binaries(pid: i32) -> Vec<(String, i32)> {
     results
 }
 
-/// Backward-compatible single-result wrapper.
-pub fn detect_go_binary(pid: i32) -> Option<String> {
-    detect_go_binaries(pid).into_iter().next().map(|(path, _)| path)
-}
-
 pub fn attach_go_tls_probes(
     obj: &mut libbpf_rs::Object,
     offsets: &GoTlsOffsets,

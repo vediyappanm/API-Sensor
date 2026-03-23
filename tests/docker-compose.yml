@@ -47,9 +47,31 @@ services:
     build: ./test-servers/grpc
     ports: ["19000:50051"]
 
+  # GnuTLS TLS server — tests gnutls_record_send/recv uprobes
+  gnutls-server:
+    build: ./test-servers/gnutls
+    ports: ["18446:8446"]
+
+  # GnuTLS client — pre-built image with gnutls-cli (avoids apt-get on every run)
+  gnutls-client:
+    build: ./test-servers/gnutls-client
+    profiles: ["tools"]
+    depends_on: ["gnutls-server"]
+
+  # QUIC/HTTP3 server — tests quiche quic_conn_stream_recv/send uprobes
+  quic-server:
+    build: ./test-servers/quic
+    ports: ["18447:8447/udp"]
+
+  # QUIC client — reuses the same image (has http3-client binary + libquiche.so)
+  quic-client:
+    build: ./test-servers/quic
+    profiles: ["tools"]
+    depends_on: ["quic-server"]
+
   # Ingest validator — collects and validates captured events
   ingest-validator:
     build: ./test-servers/validator
-    ports: ["19999:9999"]
+    ports: ["${VALIDATOR_PORT_MAP:-29999:9999}"]
     environment:
       - VALIDATOR_PORT=9999

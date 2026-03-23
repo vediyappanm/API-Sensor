@@ -1,0 +1,22 @@
+# Fast image build — uses pre-built binaries from host
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 libelf1 ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY bpf/http_trace.bpf.o /opt/sensor/http_trace.bpf.o
+COPY userspace/target/release/api-sec-sensor /opt/sensor/api-sec-sensor
+
+RUN mkdir -p /etc/api-sentinel
+COPY config/config.example.toml /etc/api-sentinel/config.toml
+
+WORKDIR /opt/sensor
+ENV RUST_LOG=info
+EXPOSE 9090
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -sf http://localhost:9090/healthz || exit 1
+
+ENTRYPOINT ["/opt/sensor/api-sec-sensor"]
+CMD ["--config", "/etc/api-sentinel/config.toml"]

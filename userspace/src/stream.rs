@@ -9,7 +9,7 @@ use crate::dns::{self, DnsResolver};
 use crate::grpc::decode_grpc_fields;
 use crate::http::{HttpMessage, HttpResponseParsed, extract_http_header, split_query};
 use crate::http2::{Http2HpackDecoder, contains_http2_preface, parse_http2_frames};
-use crate::mcp::{is_mcp_response, parse_sse_events};
+use crate::mcp::{is_mcp_response, is_mcp_jsonrpc, parse_sse_events, parse_jsonrpc_mcp};
 use crate::metrics::*;
 use crate::quic;
 use crate::redaction::redact_pii;
@@ -257,10 +257,40 @@ impl StreamState {
             ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         }
 
+        // direction: 0=TLS read, 1=TLS write, 2=H3 read, 3=H3 write
+        let is_h3_event = ev.direction >= 2;
         let is_request_dir = match self.role {
-            TrafficRole::Server => ev.direction == 0,
-            TrafficRole::Client => ev.direction == 1,
+            TrafficRole::Server => ev.direction == 0 || ev.direction == 2,
+            TrafficRole::Client => ev.direction == 1 || ev.direction == 3,
         };
+
+        // QUIC/HTTP3 body events (direction 2/3) — create event directly
+        if is_h3_event && data_len > 0 {
+            self.http3_connections.insert(conn_key.clone());
+            PROTO_HTTP3.fetch_add(1, Ordering::Relaxed);
+            let net_ctx = self.net_context_from_event(ev);
+            let body_str = String::from_utf8_lossy(payload).to_string();
+            if is_request_dir {
+                let queue = self.pending.entry(conn_key.clone()).or_default();
+                if queue.len() < MAX_PENDING_PER_CONN {
+                    queue.push_back(ParsedRequest {
+                        method: "GET".to_string(), path: "/".to_string(), host: None,
+                        headers: HashMap::new(), body: Some(body_str), ts_ms, net_ctx,
+                    });
+                }
+            } else {
+                let request = self.pending.entry(conn_key.clone()).or_default()
+                    .pop_front()
+                    .unwrap_or_else(|| ParsedRequest {
+                        method: "GET".to_string(), path: "/".to_string(), host: None,
+                        headers: HashMap::new(), body: None, ts_ms, net_ctx: NetContext::default(),
+                    });
+                let latency_ms = ts_ms.saturating_sub(request.ts_ms);
+                let resp = HttpResponseParsed { status_code: 200, headers: HashMap::new(), body: Some(body_str) };
+                output.push(build_event(self.account_id, ts_ms, request, resp, latency_ms, "HTTP/3", "ebpf"));
+            }
+            return output;
+        }
 
         // Accumulate data for this stream to handle split packets/prefaces
         {
@@ -389,25 +419,47 @@ impl StreamState {
                     let upgrade_hdr = resp.headers.get("upgrade").map(|v| v.to_lowercase());
                     if upgrade_hdr.as_deref() == Some("websocket") { self.ws_connections.insert(conn_key.clone()); }
 
-                    let is_mcp = is_mcp_response(&resp.headers);
+                    let is_mcp_sse = is_mcp_response(&resp.headers);
                     let request = self.pending.entry(conn_key.clone()).or_default().pop_front()
                         .unwrap_or_else(|| ParsedRequest {
                             method: "UNKNOWN".to_string(), path: "/".to_string(), host: None,
                             headers: HashMap::new(), body: None, ts_ms, net_ctx: NetContext::default(),
                         });
+                    // Also detect MCP from JSON-RPC 2.0 request body with MCP methods
+                    let is_mcp_json = !is_mcp_sse &&
+                        request.body.as_deref().map(|b| is_mcp_jsonrpc(b)).unwrap_or(false);
+                    let is_mcp = is_mcp_sse || is_mcp_json;
+
+                    // Extract response body for MCP analysis before build_event consumes it
+                    let mcp_resp_body = if is_mcp_json {
+                        resp.body.clone().or_else(|| request.body.clone())
+                    } else { None };
+
                     let latency_ms = ts_ms.saturating_sub(request.ts_ms);
                     let protocol = if is_mcp { "MCP" } else { "HTTP/1.1" };
                     let mut event = build_event(self.account_id, ts_ms, request, resp, latency_ms, protocol, "ebpf");
                     if is_mcp {
-                        let mcp_events = parse_sse_events(payload);
-                        if let Some(mcp_ev) = mcp_events.first() {
-                            event.metadata = Some(EventMetadata {
-                                has_injection: mcp_ev.has_injection,
-                                injection_patterns: if mcp_ev.has_injection { vec!["prompt_injection".to_string()] } else { vec![] },
-                                permission_flags: mcp_ev.permission_flags.clone(),
-                                mcp_method: mcp_ev.method.clone(),
-                                mcp_tool_name: mcp_ev.tool_name.clone(),
-                            });
+                        if is_mcp_sse {
+                            let mcp_events = parse_sse_events(payload);
+                            if let Some(mcp_ev) = mcp_events.first() {
+                                event.metadata = Some(EventMetadata {
+                                    has_injection: mcp_ev.has_injection,
+                                    injection_patterns: if mcp_ev.has_injection { vec!["prompt_injection".to_string()] } else { vec![] },
+                                    permission_flags: mcp_ev.permission_flags.clone(),
+                                    mcp_method: mcp_ev.method.clone(),
+                                    mcp_tool_name: mcp_ev.tool_name.clone(),
+                                });
+                            }
+                        } else if let Some(body) = mcp_resp_body {
+                            if let Some(mcp_ev) = parse_jsonrpc_mcp(&body) {
+                                event.metadata = Some(EventMetadata {
+                                    has_injection: mcp_ev.has_injection,
+                                    injection_patterns: if mcp_ev.has_injection { vec!["prompt_injection".to_string()] } else { vec![] },
+                                    permission_flags: mcp_ev.permission_flags.clone(),
+                                    mcp_method: mcp_ev.method.clone(),
+                                    mcp_tool_name: mcp_ev.tool_name.clone(),
+                                });
+                            }
                         }
                     }
                     output.push(event);
@@ -463,7 +515,8 @@ impl StreamState {
                     });
                 let latency_ms = ts_ms.saturating_sub(request.ts_ms);
                 let resp = HttpResponseParsed { status_code: status.parse::<i32>().unwrap_or(0), headers: headers.clone(), body: None };
-                let is_grpc = headers.get("content-type").map(|v| v.starts_with("application/grpc")).unwrap_or(false);
+                let is_grpc = headers.get("content-type").map(|v| v.starts_with("application/grpc")).unwrap_or(false)
+                    || request.headers.get("content-type").map(|v| v.starts_with("application/grpc")).unwrap_or(false);
                 let grpc_body = if is_grpc {
                     let fields = decode_grpc_fields(&conn_state.buffer);
                     if !fields.is_empty() { serde_json::to_string(&fields).ok() } else { None }

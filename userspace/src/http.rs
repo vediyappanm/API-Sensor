@@ -91,10 +91,10 @@ pub fn extract_http_header(buf: &[u8]) -> Option<(HttpMessage, Vec<u8>)> {
         let _ = parts.next();
         let status = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
         let headers = parse_headers(lines);
-        let (body, remaining) = advance_past_body(&headers, buf, body_start);
-        return Some((HttpMessage::Response(HttpResponseParsed { 
-            status_code: status, 
-            headers, 
+        let (body, remaining) = advance_past_body(&headers, buf, body_start)?;
+        return Some((HttpMessage::Response(HttpResponseParsed {
+            status_code: status,
+            headers,
             body: if body.is_empty() { None } else { Some(String::from_utf8_lossy(&body).to_string()) }
         }), remaining));
     }
@@ -113,40 +113,46 @@ pub fn extract_http_header(buf: &[u8]) -> Option<(HttpMessage, Vec<u8>)> {
     let path    = parts.next().unwrap_or("/").to_string();
     let headers = parse_headers(lines);
     let host    = headers.get("host").cloned();
-    let (body, remaining) = advance_past_body(&headers, buf, body_start);
-    Some((HttpMessage::Request(HttpRequestParsed { 
-        method, 
-        path, 
-        host, 
-        headers, 
+    let (body, remaining) = advance_past_body(&headers, buf, body_start)?;
+    Some((HttpMessage::Request(HttpRequestParsed {
+        method,
+        path,
+        host,
+        headers,
         body: if body.is_empty() { None } else { Some(String::from_utf8_lossy(&body).to_string()) }
     }), remaining))
 }
 
+/// Returns None if a body is expected but not yet fully received (caller should
+/// keep buffering).  Returns Some((body, remaining)) when the message is complete.
 fn advance_past_body(
     headers: &HashMap<String, String>,
     buf: &[u8],
     body_start: usize,
-) -> (Vec<u8>, Vec<u8>) {
+) -> Option<(Vec<u8>, Vec<u8>)> {
     let body_slice = &buf[body_start..];
 
     if headers.get("transfer-encoding").map(|v| v.contains("chunked")).unwrap_or(false) {
         if let Some((decoded, consumed)) = decode_chunked_body(body_slice) {
-            return (decoded, body_slice[consumed..].to_vec());
+            return Some((decoded, body_slice[consumed..].to_vec()));
         }
-        return (Vec::new(), body_slice.to_vec());
+        return None; // chunked body not yet complete
     }
 
     if let Some(len_str) = headers.get("content-length") {
         if let Ok(content_len) = len_str.trim().parse::<usize>() {
             if body_slice.len() >= content_len {
-                return (body_slice[..content_len].to_vec(), body_slice[content_len..].to_vec());
+                return Some((body_slice[..content_len].to_vec(), body_slice[content_len..].to_vec()));
             }
-            return (Vec::new(), body_slice.to_vec());
+            // Wait for complete body if reasonably small; emit without body for large payloads
+            if content_len <= 8192 {
+                return None;
+            }
+            return Some((Vec::new(), body_slice.to_vec()));
         }
     }
 
-    (Vec::new(), body_slice.to_vec())
+    Some((Vec::new(), body_slice.to_vec()))
 }
 
 pub fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> HashMap<String, String> {

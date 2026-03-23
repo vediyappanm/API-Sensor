@@ -23,12 +23,20 @@ RUN apt-get update && apt-get install -y \
     pkg-config libssl-dev libelf-dev zlib1g-dev libzstd-dev clang protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /build
-COPY userspace/ userspace/
-COPY --from=bpf-builder /build/bpf/http_trace.bpf.o userspace/bpf/http_trace.bpf.o
-
 WORKDIR /build/userspace
-RUN cargo build --release
+
+# Cache dependencies — only re-fetched when Cargo.toml/Cargo.lock change
+COPY userspace/Cargo.toml userspace/Cargo.lock ./
+COPY userspace/proto/ proto/
+COPY userspace/build.rs build.rs
+RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs \
+    && cargo build --release 2>/dev/null || true \
+    && rm -rf src
+
+# Now copy real source and build (deps already cached)
+COPY userspace/src/ src/
+COPY --from=bpf-builder /build/bpf/http_trace.bpf.o bpf/http_trace.bpf.o
+RUN touch src/main.rs src/lib.rs && cargo build --release
 
 # ---- Stage 3: Minimal runtime image ----
 FROM ubuntu:24.04

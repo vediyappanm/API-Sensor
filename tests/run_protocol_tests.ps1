@@ -4,7 +4,7 @@
 
 $ErrorActionPreference = "Continue"
 $SENSOR_URL = "http://localhost:9090"
-$VALIDATOR_URL = "http://localhost:19999"
+$VALIDATOR_URL = "http://localhost:29999"
 $PASS = 0
 $FAIL = 0
 

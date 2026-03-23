@@ -151,6 +151,7 @@ impl ContainerResolver {
     }
 
     /// Check if a CRI lookup is still pending for this cgroup_id.
+    #[allow(dead_code)]
     pub fn is_pending(&self, cgroup_id: u64) -> bool {
         let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.contains(&cgroup_id)

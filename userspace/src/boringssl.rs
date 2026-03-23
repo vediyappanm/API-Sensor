@@ -10,9 +10,14 @@ use crate::go_tls::{find_elf_symbol, find_elf_symbol_dyn, attach_at_offset, va_t
 pub fn attach_static_tls(
     obj: &mut libbpf_rs::Object,
     binary_path: &str,
-    pid: i32,
+    _pid: i32,
     links: &mut Vec<libbpf_rs::Link>,
 ) -> bool {
+    // Always use pid=-1 (system-wide) for uprobes. The uprobe is inode-based,
+    // so it fires for ANY process using this binary/library regardless of PID
+    // or mount namespace. Using a specific PID fails when the sensor runs in
+    // a different container (mount namespace) than the target process.
+    let pid = -1;
     let data = match fs::read(binary_path) {
         Ok(d) => {
             tracing::debug!(path = %binary_path, size = d.len(), "static TLS: read binary");

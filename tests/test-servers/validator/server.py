@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Ingest validator — receives APISentinel events and validates them for integration tests."""
+import gzip
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -19,6 +20,9 @@ class ValidatorHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body   = self.rfile.read(length)
             try:
+                encoding = self.headers.get("Content-Encoding", "")
+                if encoding == "gzip":
+                    body = gzip.decompress(body)
                 batch = json.loads(body)
                 evs   = batch.get("events", [])
                 with _lock:

@@ -208,6 +208,85 @@ fn enrich_metadata(resolver: &Arc<ContainerResolver>, events: &mut [ApiTrafficEv
 }
 
 // ---------------------------------------------------------------------------
+// Static TLS discovery — scans /proc/*/maps for binaries with SSL symbols.
+// Runs on a blocking thread so the ring buffer can poll concurrently.
+// Returns (host_path, pid) pairs for attachment on the main thread.
+// ---------------------------------------------------------------------------
+
+/// A candidate binary discovered by scanning /proc/PID/maps.
+struct StaticTlsCandidate {
+    host_path: String,
+    pid: i32,
+}
+
+/// Results from the background discovery scan.
+struct DiscoveryResults {
+    static_tls: Vec<StaticTlsCandidate>,
+    go_binaries: Vec<(String, i32)>,
+}
+
+/// Scan all processes for binaries that might contain static TLS symbols.
+/// This is pure I/O (reads /proc/*/maps) and does NOT touch the BPF object.
+fn discover_static_tls_candidates(target_pid: i32) -> Vec<StaticTlsCandidate> {
+    let pids_to_scan: Vec<i32> = if target_pid > 0 {
+        vec![target_pid]
+    } else {
+        crate::http::enumerate_pids()
+    };
+
+    let mut candidates = Vec::new();
+    // Key = (dev, inode) from /proc/PID/maps — guarantees one scan per unique file
+    let mut seen_inodes = std::collections::HashSet::new();
+
+    for p in &pids_to_scan {
+        let maps_path = format!("/proc/{}/maps", p);
+        let Ok(maps) = fs::read_to_string(&maps_path) else { continue };
+        for line in maps.lines() {
+            if !line.contains("r-xp") { continue; }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 6 { continue; }
+            let path = parts[parts.len() - 1];
+            if !path.starts_with('/') { continue; }
+
+            // Skip paths that can never contain SSL symbols
+            let basename = path.rsplit('/').next().unwrap_or("");
+            let dominated_by_ssl = basename.contains("ssl")
+                || basename.contains("SSL")
+                || basename.contains("crypto")
+                || basename.contains("tls")
+                || basename.contains("node")
+                || basename.contains("nginx")
+                || basename.contains("haproxy")
+                || basename.contains("envoy")
+                || basename.contains("python")
+                || basename.contains("ruby")
+                || basename.contains("arrow")
+                || basename.ends_with(".so")
+                || basename.contains(".so.");
+            if !dominated_by_ssl {
+                if !path.contains("/bin/") { continue; }
+            }
+
+            // Dedup by dev:inode — uprobes attach by inode, so one probe
+            // per unique file covers all PIDs that map the same binary.
+            let dedup_key = format!("{}:{}", parts[3], parts[4]);
+            if !seen_inodes.insert(dedup_key) { continue; }
+
+            let host_path = crate::types::proc_root_path(*p, path);
+            candidates.push(StaticTlsCandidate { host_path, pid: *p });
+        }
+    }
+
+    tracing::info!(
+        candidates = candidates.len(),
+        unique_files = seen_inodes.len(),
+        pids = pids_to_scan.len(),
+        "static TLS: discovery scan complete"
+    );
+    candidates
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -260,7 +339,6 @@ async fn main() -> Result<()> {
     attach_kernel_probes(&mut obj, &mut links)?;
 
     // Initialize sampling_config — must happen before polling starts.
-    // BPF arrays are zero-initialized; rate=0 means "filter everything".
     if let Some(map) = obj.map_mut("sampling_config") {
         let key: u32 = 0;
         let cfg_bytes: [u8; 4] = [sample_default, sample_health, 0, 0];
@@ -271,75 +349,35 @@ async fn main() -> Result<()> {
         tracing::warn!("sampling_config map not found in BPF object");
     }
 
-    // Go TLS + static TLS probes (OpenSSL, BoringSSL statically linked into binaries)
-    if args.go_tls {
-        use crate::go_tls::detect_go_binaries;
+    // Discover and attach QUIC library probes
+    if args.discover_libs || args.go_tls {
+        let quic_libs = discover_quic_libs(args.pid);
+        if !quic_libs.is_empty() {
+            tracing::info!(libs = ?quic_libs, "discovered QUIC libraries");
+            match attach_quic_uprobes(&mut obj, args.pid, &quic_libs, &mut links) {
+                Ok(n) if n > 0 => tracing::info!(attached = n, "QUIC probes active"),
+                Ok(_) => tracing::debug!("no QUIC symbols resolved"),
+                Err(e) => tracing::warn!(error = %e, "QUIC uprobe attachment failed"),
+            }
+        }
+    }
 
+    // --- Kick off static TLS discovery in background (I/O-heavy, no BPF access) ---
+    // This runs concurrently with ring buffer polling so events are captured immediately.
+    let static_tls_discovery = if args.go_tls {
         let scan_mode = if args.pid > 0 { "targeted" } else { "global" };
-        tracing::info!(pid = args.pid, mode = scan_mode, "Go TLS + static TLS: scanning");
+        tracing::info!(pid = args.pid, mode = scan_mode, "Go TLS + static TLS: starting background discovery");
+        let target_pid = args.pid;
+        Some(tokio::task::spawn_blocking(move || {
+            let static_tls = discover_static_tls_candidates(target_pid);
+            let go_binaries = crate::go_tls::detect_go_binaries(target_pid);
+            DiscoveryResults { static_tls, go_binaries }
+        }))
+    } else {
+        None
+    };
 
-        // --- Go TLS ---
-        let go_binaries = detect_go_binaries(args.pid);
-        for (go_bin, go_pid) in &go_binaries {
-            tracing::info!(binary = %go_bin, pid = go_pid, "Go TLS: detected binary");
-            if let Some(offsets) = find_go_tls_offsets(go_bin) {
-                tracing::info!(binary = %go_bin, version = %offsets.go_version, "attaching Go TLS probes");
-                attach_go_tls_probes(&mut obj, &offsets, &mut links, *go_pid);
-            } else {
-                tracing::warn!(binary = %go_bin, "Go TLS: no offsets found (symbols stripped?)");
-            }
-        }
-        if go_binaries.is_empty() {
-            tracing::debug!(pid = args.pid, "Go TLS: no Go binaries found");
-        }
-
-        // --- Static TLS (OpenSSL / BoringSSL embedded in binaries) ---
-        // Scan /proc/<pid>/maps for all target processes, looking for executables
-        // with SSL_read/SSL_write symbols (covers Node.js, Nginx static, etc.)
-        let pids_to_scan: Vec<i32> = if args.pid > 0 {
-            vec![args.pid]
-        } else {
-            crate::http::enumerate_pids()
-        };
-        let mut scanned = 0u32;
-        let mut attached_static = 0u32;
-        let mut seen_binaries = std::collections::HashSet::new();
-        for p in &pids_to_scan {
-            let maps_path = format!("/proc/{}/maps", p);
-            let Ok(maps) = fs::read_to_string(&maps_path) else { continue };
-            for line in maps.lines() {
-                if line.contains("r-xp") {
-                    if let Some(path) = line.split_whitespace().last() {
-                        if path.starts_with('/') {
-                            // Dedup: same binary path from the same PID namespace
-                            let dedup_key = format!("{}:{}", p, path);
-                            if !seen_binaries.insert(dedup_key) { continue; }
-
-                            let host_path = crate::types::proc_root_path(*p, path);
-                            tracing::debug!(target_path = %path, host_path = %host_path, pid = p, "static TLS: scanning");
-                            if attach_boring_ssl_static(&mut obj, &host_path, *p, &mut links) {
-                                tracing::info!(path = %host_path, pid = p, "static TLS probes attached");
-                                attached_static += 1;
-                            }
-                            scanned += 1;
-                        }
-                    }
-                }
-            }
-        }
-        tracing::info!(
-            scanned,
-            attached = attached_static,
-            pids = pids_to_scan.len(),
-            mode = scan_mode,
-            "static TLS: bootstrap scan complete"
-        );
-    }
-    // Final guard: if --go-tls and nothing attached, bail
-    if args.go_tls && links.is_empty() {
-        anyhow::bail!("no probes attached; --go-tls enabled but no TLS library or Go binary found");
-    }
-
+    // --- Set up infrastructure (container resolver, DNS, batch sender) ---
     let node_name = env::var("NODE_NAME")
         .or_else(|_| env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown-node".to_string());
@@ -381,19 +419,6 @@ async fn main() -> Result<()> {
             });
         }
     });
-
-    // Discover and attach QUIC library probes
-    if args.discover_libs || args.go_tls {
-        let quic_libs = discover_quic_libs(args.pid);
-        if !quic_libs.is_empty() {
-            tracing::info!(libs = ?quic_libs, "discovered QUIC libraries");
-            match attach_quic_uprobes(&mut obj, args.pid, &quic_libs, &mut links) {
-                Ok(n) if n > 0 => tracing::info!(attached = n, "QUIC probes active"),
-                Ok(_) => tracing::debug!("no QUIC symbols resolved"),
-                Err(e) => tracing::warn!(error = %e, "QUIC uprobe attachment failed"),
-            }
-        }
-    }
 
     let (tx, mut rx) = mpsc::channel::<ApiTrafficEvent>(10000);
 
@@ -461,6 +486,9 @@ async fn main() -> Result<()> {
         dns_resolver.clone(),
     ));
 
+    // --- Build ring buffer and start polling IMMEDIATELY ---
+    // This ensures events are captured from kernel/TLS uprobes while the
+    // slower static TLS scan runs in the background.
     let mut ringbuf = RingBufferBuilder::new();
     let sender = tx.clone();
     let state_handle = state.clone();
@@ -480,7 +508,6 @@ async fn main() -> Result<()> {
         ringbuf.add(&mut *events_map, move |data| {
             if let Some((header, payload)) = TlsEventHeader::from_bytes(data) {
                 EVENTS_CAPTURED.fetch_add(1, Ordering::Relaxed);
-                // Compute channel watermark for backpressure monitoring
                 let current_len = channel_capacity.saturating_sub(sender.capacity() as u64);
                 let watermark = (current_len * 100) / channel_capacity;
                 CHANNEL_WATERMARK_PCT.store(watermark, Ordering::Relaxed);
@@ -498,8 +525,6 @@ async fn main() -> Result<()> {
 
     let state_handle_close = state.clone();
     // SAFETY: Same as above — `close_events_map` outlives the ring buffer.
-    // `read_unaligned` is used because BPF ring buffer data may not be aligned
-    // to CloseEvent's alignment requirement. Length check above guarantees bounds.
     unsafe {
         ringbuf.add(&mut *close_events_map, move |data| {
             if data.len() < size_of::<CloseEvent>() {
@@ -512,16 +537,12 @@ async fn main() -> Result<()> {
         })?;
     }
 
-    // proc_events ring buffer — detect new processes and queue them for
-    // dynamic TLS library discovery + probe attachment.
-    // The callback runs in the ring buffer poll loop and MUST NOT block,
-    // so we send new PIDs to a background Tokio task via an mpsc channel.
+    // proc_events ring buffer — detect new processes
     let (new_pid_tx, mut new_pid_rx) = mpsc::channel::<u32>(256);
     let proc_events_result = obj.map_mut("proc_events");
     if let Some(proc_map) = proc_events_result {
         let proc_map_ptr = proc_map as *mut libbpf_rs::Map;
         // SAFETY: Same raw pointer pattern as events_map above.
-        // `read_unaligned` handles BPF ring buffer alignment; length is checked.
         unsafe {
             let _ = ringbuf.add(&mut *proc_map_ptr, move |data| {
                 if data.len() < size_of::<NewProcEvent>() {
@@ -531,29 +552,24 @@ async fn main() -> Result<()> {
                 let filename_end = ev.filename.iter().position(|&b| b == 0).unwrap_or(ev.filename.len());
                 let filename = String::from_utf8_lossy(&ev.filename[..filename_end]);
                 tracing::debug!(pid = ev.pid, file = %filename, "new process detected");
-                // Queue for background TLS discovery (non-blocking)
                 let _ = new_pid_tx.try_send(ev.pid);
                 0
             });
         }
     }
 
-    // Background worker: attach TLS probes to newly-started processes.
-    // This handles the "dynamic discovery" problem — containers started AFTER
-    // the sensor will still get probes attached.
+    // Background worker: dynamic TLS discovery for new processes
     let discover_libs_enabled = args.discover_libs;
-    let _go_tls_enabled = args.go_tls;
-    let _tls_provider_bg = args.tls_provider.clone();
     tokio::spawn(async move {
         let mut seen_pids = std::collections::HashSet::new();
         while let Some(pid) = new_pid_rx.recv().await {
             let pid = pid as i32;
             if pid <= 2 || !seen_pids.insert(pid) { continue; }
+            // Bound the set to prevent unbounded growth
+            if seen_pids.len() > 100_000 { seen_pids.clear(); }
 
-            // Small delay: let the process fully start and load libraries
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            // Check if process still exists
             let maps_path = format!("/proc/{}/maps", pid);
             if std::fs::read_to_string(&maps_path).is_err() { continue; }
 
@@ -561,13 +577,8 @@ async fn main() -> Result<()> {
                 let libs = crate::http::discover_tls_libs(pid);
                 if !libs.is_empty() {
                     tracing::info!(pid, libs = ?libs, "dynamic discovery: new TLS libs found");
-                    // Note: We can't attach new uprobes here because `obj` is not Send.
-                    // The shared libssl uprobes from bootstrap already cover most cases
-                    // because uprobes are inode-based — if the new process uses the same
-                    // libssl inode (same Docker layer), existing probes already fire.
                 }
             }
-
             tracing::debug!(pid, "dynamic discovery: checked new process");
         }
     });
@@ -594,7 +605,59 @@ async fn main() -> Result<()> {
         r.store(false, Ordering::Relaxed);
     });
 
-    // Poll loop with exponential backoff on repeated errors
+    // --- Wait for static TLS discovery to finish, then attach probes ---
+    // This interleaves with ring buffer polling: we poll while waiting,
+    // then attach the discovered probes on the main thread (obj is !Send).
+    if let Some(discovery_handle) = static_tls_discovery {
+        // Poll ring buffer while waiting for discovery to complete.
+        // This ensures events are captured from shared-lib uprobes immediately.
+        while !discovery_handle.is_finished() && running.load(Ordering::Relaxed) {
+            let _ = ringbuf.poll(Duration::from_millis(50));
+        }
+
+        // Attach discovered probes (must be on main thread — obj is !Send)
+        match discovery_handle.await {
+            Ok(results) => {
+                // Static TLS probes
+                let mut attached_static = 0u32;
+                for c in &results.static_tls {
+                    if attach_boring_ssl_static(&mut obj, &c.host_path, c.pid, &mut links) {
+                        tracing::info!(path = %c.host_path, pid = c.pid, "static TLS probes attached");
+                        attached_static += 1;
+                    }
+                }
+                tracing::info!(
+                    scanned = results.static_tls.len(),
+                    attached = attached_static,
+                    "static TLS: probe attachment complete"
+                );
+
+                // Go TLS probes
+                for (go_bin, go_pid) in &results.go_binaries {
+                    tracing::info!(binary = %go_bin, pid = go_pid, "Go TLS: detected binary");
+                    if let Some(offsets) = find_go_tls_offsets(go_bin) {
+                        tracing::info!(binary = %go_bin, version = %offsets.go_version, "attaching Go TLS probes");
+                        attach_go_tls_probes(&mut obj, &offsets, &mut links, *go_pid);
+                    } else {
+                        tracing::warn!(binary = %go_bin, "Go TLS: no offsets found (symbols stripped?)");
+                    }
+                }
+                if results.go_binaries.is_empty() {
+                    tracing::debug!(pid = args.pid, "Go TLS: no Go binaries found");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "discovery task failed");
+            }
+        }
+
+        // Final guard
+        if links.is_empty() {
+            anyhow::bail!("no probes attached; --go-tls enabled but no TLS library or Go binary found");
+        }
+    }
+
+    // Main poll loop with exponential backoff on repeated errors
     let mut poll_backoff_ms = 0u64;
     while running.load(Ordering::Relaxed) {
         if poll_backoff_ms > 0 {

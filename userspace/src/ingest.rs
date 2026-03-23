@@ -43,17 +43,27 @@ pub async fn send_batch_with_client(
         }
         match req.body(payload.clone()).send().await {
             Ok(resp) => {
-                if resp.status().is_success() {
+                let status = resp.status();
+                if status.is_success() {
                     EVENTS_SENT.fetch_add(event_count, Ordering::Relaxed);
                     return Ok(());
                 }
-                if resp.status().is_server_error() && attempt + 1 < MAX_RETRIES {
-                    last_err = Some(format!("HTTP {}", resp.status()));
+                // Client errors are not retryable — bad key, bad payload, etc.
+                if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+                    SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    return Err(anyhow::anyhow!("ingest auth error HTTP {} (check API key, not retryable)", status));
+                }
+                if status.is_client_error() {
+                    SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow::anyhow!("ingest HTTP {} (not retryable): {}", status, text));
+                }
+                // Server errors — retry if attempts remain
+                if status.is_server_error() && attempt + 1 < MAX_RETRIES {
+                    last_err = Some(format!("HTTP {}", status));
                     continue;
                 }
-                // Final failure — count the error
                 SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
-                let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 return Err(anyhow::anyhow!("ingest HTTP {}: {}", status, text));
             }

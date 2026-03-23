@@ -901,6 +901,85 @@ int quic_stream_send_exit(struct pt_regs *ctx)
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// HTTP/3 high-level C FFI hooks
+//
+// The quiche h3 layer inlines internal Rust methods (Connection::stream_send
+// etc.), making offset-based uprobe attachment unreliable.  Instead, we hook
+// the C FFI functions called by the APPLICATION code:
+//
+//   ssize_t quiche_h3_recv_body(h3, conn, stream_id, body, body_len)
+//   int     quiche_h3_send_body(h3, conn, stream_id, body, body_len, fin)
+//
+// We use direction=2 (h3 read) / direction=3 (h3 write) to let userspace
+// distinguish QUIC/HTTP3 events from TLS events (direction 0/1).
+// ---------------------------------------------------------------------------
+
+struct h3_body_args {
+    __u64 h3_conn;
+    void *body;
+    __u32 body_len;
+    __u32 _pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);
+    __type(value, struct h3_body_args);
+} h3_recv_args SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);
+    __type(value, struct h3_body_args);
+} h3_send_args SEC(".maps");
+
+// quiche_h3_recv_body(h3, conn, stream_id, body, body_len)
+SEC("uprobe/h3_recv_body")
+int h3_recv_body_entry(struct pt_regs *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct h3_body_args a = {};
+    a.h3_conn  = (__u64)PT_REGS_PARM1(ctx);
+    a.body     = (void *)PT_REGS_PARM4(ctx);
+    a.body_len = (__u32)PT_REGS_PARM5(ctx);
+    bpf_map_update_elem(&h3_recv_args, &pid_tgid, &a, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/h3_recv_body")
+int h3_recv_body_exit(struct pt_regs *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct h3_body_args *a = bpf_map_lookup_elem(&h3_recv_args, &pid_tgid);
+    long ret = (long)PT_REGS_RC(ctx);
+    if (!a) return 0;
+    if (ret > 0) {
+        __u32 len = (__u32)ret;
+        len &= (MAX_DATA - 1);
+        emit_event(ctx, a->body, len, 2, a->h3_conn); // direction=2 → h3 read
+    }
+    bpf_map_delete_elem(&h3_recv_args, &pid_tgid);
+    return 0;
+}
+
+// quiche_h3_send_body(h3, conn, stream_id, body, body_len, fin)
+SEC("uprobe/h3_send_body")
+int h3_send_body_entry(struct pt_regs *ctx)
+{
+    __u64 h3_conn  = (__u64)PT_REGS_PARM1(ctx);
+    void *body     = (void *)PT_REGS_PARM4(ctx);
+    __u32 body_len = (__u32)PT_REGS_PARM5(ctx);
+    if (body_len > 0) {
+        __u32 len = body_len;
+        len &= (MAX_DATA - 1);
+        emit_event(ctx, body, len, 3, h3_conn); // direction=3 → h3 write
+    }
+    return 0;
+}
+
 SEC("kprobe/tcp_close")
 int tcp_close_entry(struct pt_regs *ctx)
 {

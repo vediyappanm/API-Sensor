@@ -46,16 +46,6 @@ pub fn load_config(path: &str) -> anyhow::Result<SensorConfig> {
     Ok(cfg)
 }
 
-/// Merge: CLI arg wins if user provided it; otherwise config file; otherwise compiled default.
-/// `cli_val` is the clap-parsed value, `cfg_val` is from the config file.
-/// `is_default` indicates whether clap returned the compiled default (user did not pass flag).
-pub fn merge_opt<T>(cli_val: T, cfg_val: Option<T>, is_default: bool) -> T {
-    if !is_default {
-        return cli_val; // user explicitly set on CLI
-    }
-    cfg_val.unwrap_or(cli_val)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -114,20 +104,5 @@ batch_size = 100
         assert_eq!(cfg.sensor.ingest.as_deref(), Some("http://localhost:8080/events"));
         assert_eq!(cfg.sensor.batch_size, Some(100));
         assert_eq!(cfg.sensor.bpf, None);
-    }
-
-    #[test]
-    fn merge_opt_cli_wins() {
-        assert_eq!(merge_opt(9090u16, Some(9091), false), 9090);
-    }
-
-    #[test]
-    fn merge_opt_config_wins_over_default() {
-        assert_eq!(merge_opt(9090u16, Some(9091), true), 9091);
-    }
-
-    #[test]
-    fn merge_opt_compiled_default_when_nothing() {
-        assert_eq!(merge_opt(9090u16, None, true), 9090);
     }
 }

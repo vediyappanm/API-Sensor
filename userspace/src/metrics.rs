@@ -89,15 +89,23 @@ apisec_uptime_seconds {uptime}
 }
 
 async fn health_handler() -> impl IntoResponse {
-    let dropped  = EVENTS_DROPPED.load(Ordering::Relaxed);
-    let captured = EVENTS_CAPTURED.load(Ordering::Relaxed);
+    let dropped     = EVENTS_DROPPED.load(Ordering::Relaxed);
+    let captured    = EVENTS_CAPTURED.load(Ordering::Relaxed);
+    let sent        = EVENTS_SENT.load(Ordering::Relaxed);
+    let send_errors = SEND_ERRORS.load(Ordering::Relaxed);
+    let ringbuf_drops = RINGBUF_DROPS.load(Ordering::Relaxed);
     let drop_pct = if captured > 0 { dropped * 100 / captured } else { 0 };
-    if drop_pct > 20 {
+
+    // Degraded if: high drop rate, all sends failing, or excessive ringbuf drops
+    let all_sends_failing = send_errors > 0 && sent == 0;
+    let high_ringbuf_drops = ringbuf_drops > 100;
+
+    if drop_pct > 20 || all_sends_failing || high_ringbuf_drops {
         (axum::http::StatusCode::SERVICE_UNAVAILABLE,
-         format!("{{\"status\":\"degraded\",\"drop_pct\":{drop_pct}}}"))
+         format!("{{\"status\":\"degraded\",\"drop_pct\":{drop_pct},\"send_errors\":{send_errors},\"ringbuf_drops\":{ringbuf_drops}}}"))
     } else {
         (axum::http::StatusCode::OK,
-         format!("{{\"status\":\"ok\",\"captured\":{captured},\"drop_pct\":{drop_pct}}}"))
+         format!("{{\"status\":\"ok\",\"captured\":{captured},\"sent\":{sent},\"drop_pct\":{drop_pct}}}"))
     }
 }
 

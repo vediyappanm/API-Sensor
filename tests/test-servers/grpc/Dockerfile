@@ -1,6 +1,12 @@
-FROM python:3.11-slim
-RUN apt-get update && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
-RUN pip install grpcio grpcio-tools grpcio-reflection
-COPY server.py /server.py
+FROM golang:1.22-alpine AS builder
+RUN apk add --no-cache git
+WORKDIR /app
+COPY go.mod .
+COPY main.go .
+RUN go mod tidy && go mod download
+RUN CGO_ENABLED=0 go build -o grpc-server .
+
+FROM alpine:3.19
+COPY --from=builder /app/grpc-server /grpc-server
 EXPOSE 50051
-CMD ["python3", "/server.py"]
+CMD ["/grpc-server"]

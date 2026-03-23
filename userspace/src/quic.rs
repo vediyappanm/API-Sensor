@@ -356,9 +356,7 @@ pub fn extract_h3_headers(buf: &[u8]) -> Vec<HashMap<String, String>> {
     for frame in frames {
         if frame.frame_type == H3_HEADERS {
             let headers = decode_qpack_headers(frame.payload);
-            if !headers.is_empty() {
-                result.push(headers);
-            }
+            result.push(headers);
         }
     }
     result

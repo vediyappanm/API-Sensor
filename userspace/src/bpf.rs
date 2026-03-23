@@ -135,6 +135,15 @@ pub fn attach_quic_uprobes(
         if try_attach(obj, "quic_stream_recv_exit",  lib, recv_sym, true,  pid, links) { attached += 1; }
         if try_attach(obj, "quic_stream_send_entry", lib, send_sym, false, pid, links) { attached += 1; }
         if try_attach(obj, "quic_stream_send_exit",  lib, send_sym, true,  pid, links) { attached += 1; }
+
+        // Hook h3-level C FFI body functions. The quiche h3 layer inlines
+        // internal Rust methods, so we hook the C FFI functions that the
+        // application binary calls via PLT.
+        if lib_type == Some(QuicLibType::Quiche) {
+            if try_attach(obj, "h3_recv_body_entry", lib, "quiche_h3_recv_body", false, pid, links) { attached += 1; }
+            if try_attach(obj, "h3_recv_body_exit",  lib, "quiche_h3_recv_body", true,  pid, links) { attached += 1; }
+            if try_attach(obj, "h3_send_body_entry", lib, "quiche_h3_send_body", false, pid, links) { attached += 1; }
+        }
     }
     if attached > 0 {
         tracing::info!(attached, "QUIC uprobes attached");
