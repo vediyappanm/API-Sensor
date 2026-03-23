@@ -540,7 +540,14 @@ async fn main() -> Result<()> {
                 let events = state_handle.handle_event(&header, payload);
                 for item in events {
                     if sender.try_send(item).is_err() {
-                        EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        let dropped = EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                        // Log every 100th drop to avoid log spam under sustained pressure
+                        if dropped % 100 == 1 {
+                            tracing::warn!(
+                                total_dropped = dropped,
+                                "event channel full — dropping events (backpressure)"
+                            );
+                        }
                     }
                 }
             }

@@ -6,3 +6,6 @@ bpf/vmlinux.h
 *.swp
 *.tmp
 .worktrees/
+
+# Debug output
+metrics.txt

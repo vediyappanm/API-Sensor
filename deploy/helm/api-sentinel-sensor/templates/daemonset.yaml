@@ -46,9 +46,23 @@ spec:
                   fieldPath: spec.nodeName
             - name: RUST_LOG
               value: "info"
+            - name: SENSOR_ENV
+              value: "production"
+            - name: PII_HASH_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKeySecret.name }}
+                  key: pii-hash-key
+                  optional: false
           securityContext:
             privileged: false
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
             capabilities:
+              drop:
+                - ALL
               add:
                 - BPF
                 - PERFMON
@@ -91,6 +105,8 @@ spec:
             - name: cri-socket
               mountPath: /run/containerd/containerd.sock
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config
           configMap:
@@ -108,6 +124,10 @@ spec:
           hostPath:
             path: /run/containerd/containerd.sock
             type: Socket
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

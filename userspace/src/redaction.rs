@@ -32,12 +32,11 @@ pub struct PiiDetection {
 
 static PII_PATTERNS: OnceLock<Vec<(PiiType, Regex)>> = OnceLock::new();
 
-/// Default HMAC-SHA256 key — 32 bytes, deterministic across sensor instances.
-/// Override at runtime by setting `PII_HASH_KEY` env var (64 hex chars = 32 bytes).
-const DEFAULT_PII_HASH_KEY: &[u8; 32] = b"apisec_pii_key_part1_apisec_part";
-
 static PII_HASH_KEY: OnceLock<Vec<u8>> = OnceLock::new();
 
+/// Initialize the PII hash key from `PII_HASH_KEY` env var.
+/// In production (`SENSOR_ENV=production`), the sensor refuses to start without an explicit key.
+/// In dev/test, a deterministic fallback is used with a loud warning.
 fn pii_hash_key() -> &'static [u8] {
     PII_HASH_KEY.get_or_init(|| {
         if let Ok(hex) = std::env::var("PII_HASH_KEY") {
@@ -49,11 +48,27 @@ fn pii_hash_key() -> &'static [u8] {
                     return key;
                 }
             }
-            eprintln!("WARNING: PII_HASH_KEY must be 64 hex chars (32 bytes). Using default key.");
-        } else {
-            eprintln!("WARNING: PII_HASH_KEY not set. Using default HMAC key — PII tokens are correlatable across deployments. Set PII_HASH_KEY env var (64 hex chars) for production.");
+            panic!("FATAL: PII_HASH_KEY must be exactly 64 hex chars (32 bytes). Got {} chars.", hex.len());
         }
-        DEFAULT_PII_HASH_KEY.to_vec()
+
+        let is_production = std::env::var("SENSOR_ENV")
+            .map(|v| v.eq_ignore_ascii_case("production") || v.eq_ignore_ascii_case("prod"))
+            .unwrap_or(false);
+
+        if is_production {
+            panic!(
+                "FATAL: PII_HASH_KEY env var is required in production. \
+                 Set a unique 64 hex char (32 byte) key per deployment. \
+                 PII tokens are correlatable across deployments without a unique key."
+            );
+        }
+
+        tracing::warn!(
+            "PII_HASH_KEY not set — using deterministic dev key. \
+             PII tokens are correlatable. Set PII_HASH_KEY (64 hex chars) for production."
+        );
+        // Dev-only fallback key — never used in production
+        b"apisec_dev_key_not_for_prod_use!".to_vec()
     })
 }
 
@@ -102,12 +117,14 @@ fn init_pii_patterns() -> Vec<(PiiType, Regex)> {
         // GCP OAuth token
         (PiiType::GcpToken,
          Regex::new(r"ya29\.[A-Za-z0-9_-]{20,}").unwrap()),
-        // Indian PAN (ABCDE1234F format)
+        // Indian PAN — 5th char encodes holder type (P=Person, C=Company, etc.)
+        // Require PAN: or pan: prefix, or assignment context to avoid false positives
         (PiiType::IndianPan,
-         Regex::new(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b").unwrap()),
-        // Aadhaar (12 digits, optionally space/dash separated as 4-4-4)
+         Regex::new(r"(?i)(?:pan[:\s=]+)[A-Z]{3}[ABCFGHLJPT][A-Z][0-9]{4}[A-Z]").unwrap()),
+        // Aadhaar — 12 digits starting with 2-9 (UIDAI spec), space/dash separated as 4-4-4
+        // Require aadhaar/uid prefix or separator pattern to avoid matching arbitrary 12-digit numbers
         (PiiType::Aadhaar,
-         Regex::new(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}\b").unwrap()),
+         Regex::new(r"(?i)(?:aadhaar|uid|aadhar)[:\s=]+[2-9]\d{3}[\s-]\d{4}[\s-]\d{4}").unwrap()),
     ]
 }
 
@@ -223,18 +240,36 @@ mod tests {
 
     #[test]
     fn test_pii_redact_indian_pan() {
-        let input = "PAN: ABCDE1234F";
+        // PAN with context prefix — should be redacted
+        let input = "PAN: ABCPD1234F";
         let output = redact_pii(input);
-        assert!(!output.contains("ABCDE1234F"));
+        assert!(!output.contains("ABCPD1234F"));
         assert!(output.contains("PII_PAN_"));
     }
 
     #[test]
-    fn test_pii_redact_aadhaar() {
-        let input = "Aadhaar: 1234 5678 9012";
+    fn test_pii_no_false_positive_pan() {
+        // Bare 10-char uppercase string without PAN context — should NOT be redacted
+        let input = "Product code XYZAB1234C in stock";
         let output = redact_pii(input);
-        assert!(!output.contains("1234 5678 9012"));
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn test_pii_redact_aadhaar() {
+        // Aadhaar with context prefix and valid first digit (2-9)
+        let input = "Aadhaar: 2345 6789 0123";
+        let output = redact_pii(input);
+        assert!(!output.contains("2345 6789 0123"));
         assert!(output.contains("PII_AADHAAR_"));
+    }
+
+    #[test]
+    fn test_pii_no_false_positive_aadhaar() {
+        // Bare 12-digit number without Aadhaar context — should NOT be redacted
+        let input = "Order #1234 5678 9012 confirmed";
+        let output = redact_pii(input);
+        assert_eq!(input, output);
     }
 
     #[test]

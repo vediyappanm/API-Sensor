@@ -6,7 +6,7 @@ import sys
 import os
 
 # Add project root to path for imports
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from server.modules.auth.jwt_issuer import JWTIssuer
 
