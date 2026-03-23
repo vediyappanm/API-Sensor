@@ -2,6 +2,9 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 
+/// BPF event struct version — must match BPF_EVENT_VERSION in http_trace.bpf.c
+pub const BPF_EVENT_VERSION: u8 = 1;
+
 // ---------------------------------------------------------------------------
 // Global memory ceiling
 // ---------------------------------------------------------------------------
@@ -61,6 +64,10 @@ impl TlsEventHeader {
         // read_unaligned handles any alignment — ring buffer data may not be
         // aligned to TlsEventHeader's 8-byte alignment requirement.
         let header: Self = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Self) };
+        // Sanity check — reject events with clearly invalid fields
+        if header.pid == 0 || header.data_len as usize > data.len() {
+            return None;
+        }
         // Clamp kernel-supplied data_len to the actual remaining bytes to prevent
         // any possibility of out-of-bounds slice indexing.
         let max_payload = data.len().saturating_sub(Self::HEADER_SIZE);

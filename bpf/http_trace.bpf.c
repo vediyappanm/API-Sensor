@@ -237,6 +237,35 @@ struct {
     __type(value, __u64);
 } ringbuf_drop_counter SEC(".maps");
 
+// PID filter map — when non-empty, only capture events from listed PIDs.
+// Key = pid (u32), Value = 1 (u8). Empty map = capture all.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 16384);
+    __type(key, __u32);
+    __type(value, __u8);
+} target_pids SEC(".maps");
+
+// Set to 1 from userspace when target_pids has entries (enables filtering)
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u8);
+} pid_filter_enabled SEC(".maps");
+
+static __always_inline bool should_skip_pid(void)
+{
+    __u32 key = 0;
+    __u8 *enabled = bpf_map_lookup_elem(&pid_filter_enabled, &key);
+    if (!enabled || !*enabled)
+        return false; // filtering disabled, capture all
+
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    __u8 *val = bpf_map_lookup_elem(&target_pids, &pid);
+    return val == NULL; // skip if pid not in target list
+}
+
 static __always_inline void fill_conn_info(struct conn_info *out, struct sock *sk)
 {
     __u16 family = 0;
@@ -431,6 +460,7 @@ int tcp_accept_ret(struct pt_regs *ctx)
 SEC("uprobe/SSL_write")
 int ssl_write_entry(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct write_args args = {};
     args.ssl_ptr = (__u64)PT_REGS_PARM1(ctx);
@@ -444,6 +474,7 @@ int ssl_write_entry(struct pt_regs *ctx)
 SEC("uretprobe/SSL_write")
 int ssl_write_exit(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct write_args *args = bpf_map_lookup_elem(&ssl_write_args, &pid_tgid);
     int ret = (int)PT_REGS_RC(ctx);
@@ -460,6 +491,7 @@ int ssl_write_exit(struct pt_regs *ctx)
 SEC("uprobe/SSL_read")
 int ssl_read_entry(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct read_args args = {};
     args.ssl_ptr = (__u64)PT_REGS_PARM1(ctx);
@@ -473,6 +505,7 @@ int ssl_read_entry(struct pt_regs *ctx)
 SEC("uretprobe/SSL_read")
 int ssl_read_exit(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct read_args *args = bpf_map_lookup_elem(&ssl_read_args, &pid_tgid);
     int ret = (int)PT_REGS_RC(ctx);
@@ -490,6 +523,7 @@ int ssl_read_exit(struct pt_regs *ctx)
 SEC("uprobe/SSL_read_ex")
 int ssl_read_ex_entry(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct read_ex_args args = {};
     args.ssl_ptr = (__u64)PT_REGS_PARM1(ctx);
@@ -504,6 +538,7 @@ int ssl_read_ex_entry(struct pt_regs *ctx)
 SEC("uretprobe/SSL_read_ex")
 int ssl_read_ex_exit(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct read_ex_args *args = bpf_map_lookup_elem(&ssl_read_ex_args, &pid_tgid);
     int ret = (int)PT_REGS_RC(ctx);
@@ -525,6 +560,7 @@ int ssl_read_ex_exit(struct pt_regs *ctx)
 SEC("uprobe/SSL_write_ex")
 int ssl_write_ex_entry(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct write_ex_args args = {};
     args.ssl_ptr = (__u64)PT_REGS_PARM1(ctx);
@@ -540,6 +576,7 @@ int ssl_write_ex_entry(struct pt_regs *ctx)
 SEC("uprobe/SSL_set_fd")
 int ssl_set_fd_entry(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 ssl_ptr = (__u64)PT_REGS_PARM1(ctx);
     int fd = (int)PT_REGS_PARM2(ctx);
     if (fd < 0 || fd >= 1024*1024) {
@@ -594,6 +631,7 @@ int ssl_set_fd_entry(struct pt_regs *ctx)
 SEC("uprobe/SSL_free")
 int ssl_free_entry(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 ssl_ptr = (__u64)PT_REGS_PARM1(ctx);
     __u64 *owner = bpf_map_lookup_elem(&ssl_ptr_to_pid, &ssl_ptr);
     __u64 pid_tgid = owner ? *owner : bpf_get_current_pid_tgid();
@@ -620,6 +658,7 @@ int ssl_free_entry(struct pt_regs *ctx)
 SEC("uretprobe/SSL_write_ex")
 int ssl_write_ex_exit(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct write_ex_args *args = bpf_map_lookup_elem(&ssl_write_ex_args, &pid_tgid);
     int ret = (int)PT_REGS_RC(ctx);
@@ -642,6 +681,7 @@ int ssl_write_ex_exit(struct pt_regs *ctx)
 SEC("uprobe/gnutls_record_send")
 int gnutls_send_entry(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct write_args args = {};
     args.ssl_ptr = (__u64)PT_REGS_PARM1(ctx);
@@ -654,6 +694,7 @@ int gnutls_send_entry(struct pt_regs *ctx)
 SEC("uretprobe/gnutls_record_send")
 int gnutls_send_exit(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct write_args *args = bpf_map_lookup_elem(&gnutls_write_args, &pid_tgid);
     int ret = (int)PT_REGS_RC(ctx);
@@ -670,6 +711,7 @@ int gnutls_send_exit(struct pt_regs *ctx)
 SEC("uprobe/gnutls_record_recv")
 int gnutls_recv_entry(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct read_args args = {};
     args.ssl_ptr = (__u64)PT_REGS_PARM1(ctx);
@@ -682,6 +724,7 @@ int gnutls_recv_entry(struct pt_regs *ctx)
 SEC("uretprobe/gnutls_record_recv")
 int gnutls_recv_exit(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct read_args *args = bpf_map_lookup_elem(&gnutls_read_args, &pid_tgid);
     int ret = (int)PT_REGS_RC(ctx);
@@ -735,6 +778,7 @@ static __always_inline __u64 get_goroutine_id(void)
 SEC("uprobe/go_tls_write_entry")
 int go_tls_write_entry(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 goroutine_id = get_goroutine_id();
     struct go_write_args args = {};
 
@@ -756,6 +800,7 @@ int go_tls_write_entry(struct pt_regs *ctx)
 SEC("uprobe/go_tls_write_exit")
 int go_tls_write_exit(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 goroutine_id = get_goroutine_id();
     struct go_write_args *args = bpf_map_lookup_elem(&go_tls_write_args, &goroutine_id);
     if (!args) return 0;
@@ -779,6 +824,7 @@ int go_tls_write_exit(struct pt_regs *ctx)
 SEC("uprobe/go_tls_read_entry")
 int go_tls_read_entry(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 goroutine_id = get_goroutine_id();
     struct go_read_args args = {};
 
@@ -800,6 +846,7 @@ int go_tls_read_entry(struct pt_regs *ctx)
 SEC("uprobe/go_tls_read_exit")
 int go_tls_read_exit(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 goroutine_id = get_goroutine_id();
     struct go_read_args *args = bpf_map_lookup_elem(&go_tls_read_args, &goroutine_id);
     if (!args) return 0;
@@ -951,6 +998,7 @@ struct {
 SEC("uprobe/h3_recv_body")
 int h3_recv_body_entry(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct h3_body_args a = {};
     a.h3_conn  = (__u64)PT_REGS_PARM1(ctx);
@@ -963,6 +1011,7 @@ int h3_recv_body_entry(struct pt_regs *ctx)
 SEC("uretprobe/h3_recv_body")
 int h3_recv_body_exit(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct h3_body_args *a = bpf_map_lookup_elem(&h3_recv_args, &pid_tgid);
     long ret = (long)PT_REGS_RC(ctx);
@@ -980,6 +1029,7 @@ int h3_recv_body_exit(struct pt_regs *ctx)
 SEC("uprobe/h3_send_body")
 int h3_send_body_entry(struct pt_regs *ctx)
 {
+    if (should_skip_pid()) return 0;
     __u64 h3_conn  = (__u64)PT_REGS_PARM1(ctx);
     void *body     = (void *)PT_REGS_PARM4(ctx);
     __u32 body_len = (__u32)PT_REGS_PARM5(ctx);

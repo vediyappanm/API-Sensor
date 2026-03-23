@@ -77,10 +77,18 @@ fn init_tracing() {
         }
     }
 
-    // Default: stdout-only tracing (no OTel overhead)
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .init();
+    // Default: stdout tracing. Set LOG_FORMAT=json for structured JSON output.
+    let json_logging = std::env::var("LOG_FORMAT").map(|v| v == "json").unwrap_or(false);
+    if json_logging {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .init();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +177,24 @@ fn resolve_config(args: Args) -> anyhow::Result<ResolvedConfig> {
         batch_size:           args.batch_size.or(c.batch_size).unwrap_or(200),
         role:                 args.role.or(c.role).unwrap_or_else(|| "server".to_string()),
         tls_libs:             args.tls_libs.or(c.tls_libs)
-                                  .unwrap_or_else(|| vec!["/usr/lib/x86_64-linux-gnu/libssl.so.3".to_string()]),
+                                  .unwrap_or_else(|| {
+                                      // Try common paths for the platform
+                                      let candidates = [
+                                          "/usr/lib/x86_64-linux-gnu/libssl.so.3",
+                                          "/usr/lib/aarch64-linux-gnu/libssl.so.3",
+                                          "/usr/lib/libssl.so.3",
+                                          "/usr/lib64/libssl.so.3",
+                                          "/lib/x86_64-linux-gnu/libssl.so.3",
+                                      ];
+                                      for path in &candidates {
+                                          if std::path::Path::new(path).exists() {
+                                              return vec![path.to_string()];
+                                          }
+                                      }
+                                      // Fallback: rely on discover_libs
+                                      tracing::warn!("no default libssl found, enable --discover-libs");
+                                      vec![]
+                                  }),
         tls_provider:         args.tls_provider.or(c.tls_provider).unwrap_or_else(|| "auto".to_string()),
         pid:                  args.pid.or(c.pid).unwrap_or(-1),
         discover_libs:        args.discover_libs || c.discover_libs.unwrap_or(false),
