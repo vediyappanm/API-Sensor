@@ -1,19 +1,20 @@
 image:
   repository: ghcr.io/api-sentinel-team/sensor
-  tag: latest
+  tag: "0.2.0"
   pullPolicy: IfNotPresent
 
 resources:
   limits:
-    cpu: 500m
-    memory: 512Mi
+    cpu: "1"
+    memory: 1Gi
   requests:
     cpu: 100m
     memory: 256Mi
 
 sensor:
   bpfObjectPath: /opt/sensor/http_trace.bpf.o
-  ingestUrl: http://api-sentinel-ingest:8080/v1/events
+  ingestUrl: https://api-sentinel-ingest:8443/v1/events
+  ingestPort: 8443
   accountId: "1000000"
   batchSize: "200"
   role: server

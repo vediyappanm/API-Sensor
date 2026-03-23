@@ -32,6 +32,14 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
 {{/*
+Selector labels
+*/}}
+{{- define "api-sentinel-sensor.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "api-sentinel-sensor.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "api-sentinel-sensor.serviceAccountName" -}}
