@@ -59,7 +59,8 @@ fn http_utf8_invalid_in_headers() {
 
 #[test]
 fn http_nested_chunked_encoding() {
-    let buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n3\r\nfoo\r\n0\r\n\r\n";
+    let buf =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n3\r\nfoo\r\n0\r\n\r\n";
     let result = extract_http_header(buf);
     assert!(result.is_some());
 }

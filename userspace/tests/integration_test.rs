@@ -13,7 +13,6 @@
 ///     --ingest http://localhost:19999 --api-key test --account-id 1 --role client
 ///   SENSOR_INTEGRATION=1 SENSOR_RUNNING=1 cargo test --test integration_test
 ///   Tests: all of Level 1 + HTTP capture, Go TLS, HTTP/2, MCP/SSE, PII redaction
-
 use std::time::Duration;
 
 const VALIDATOR_URL: &str = "http://localhost:19999";
