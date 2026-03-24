@@ -29,6 +29,7 @@ indexmap = { version = "1.9.3", features = ["std"] }
 libbpf-rs = "0.23"
 lru = "0.12"
 prost = "0.12"
+rand = "0.9"
 regex = "1"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -37,7 +38,7 @@ hmac = "0.12"
 libc = "0.2"
 sha2 = "0.10"
 toml = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal", "fs"] }
 tonic = { version = "0.11", features = ["transport"] }
 tower = "0.4"
 tracing = "0.1"

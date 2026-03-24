@@ -72,6 +72,12 @@ done
 header "Starting sensor"
 docker run -d --name "$SENSOR_NAME" --privileged --pid=host \
   --network tests_default --init \
+  --security-opt apparmor=unconfined \
+  -v /sys/fs/bpf:/sys/fs/bpf:rw \
+  -v /sys/kernel/debug:/sys/kernel/debug \
+  -v /sys/kernel/btf:/sys/kernel/btf:ro \
+  -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+  -v /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro \
   -p "${METRICS_PORT}:${METRICS_PORT}" -e RUST_LOG=info \
   api-sentinel-sensor:v0.2.0 \
   --config /dev/null \

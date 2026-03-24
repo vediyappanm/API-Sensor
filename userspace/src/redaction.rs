@@ -1,4 +1,5 @@
 use hmac::{Hmac, Mac};
+use rand::RngCore;
 use regex::Regex;
 use sha2::Sha256;
 use std::sync::OnceLock;
@@ -32,14 +33,17 @@ pub struct PiiDetection {
 
 static PII_PATTERNS: OnceLock<Vec<(PiiType, Regex)>> = OnceLock::new();
 
-/// Default HMAC-SHA256 key — 32 bytes, deterministic across sensor instances.
-/// Override at runtime by setting `PII_HASH_KEY` env var (64 hex chars = 32 bytes).
-const DEFAULT_PII_HASH_KEY: &[u8; 32] = b"apisec_pii_key_part1_apisec_part";
-
 static PII_HASH_KEY: OnceLock<Vec<u8>> = OnceLock::new();
 
+/// Initialize PII HMAC key. In production mode (SENSOR_ENV=production), PII_HASH_KEY
+/// is mandatory — the sensor will panic at startup if it's missing or malformed.
+/// In non-production mode, a random key is generated as fallback.
 fn pii_hash_key() -> &'static [u8] {
     PII_HASH_KEY.get_or_init(|| {
+        let is_production = std::env::var("SENSOR_ENV")
+            .map(|v| v.eq_ignore_ascii_case("production"))
+            .unwrap_or(false);
+
         if let Ok(hex) = std::env::var("PII_HASH_KEY") {
             if hex.len() == 64 {
                 let bytes: Option<Vec<u8>> = (0..32)
@@ -49,11 +53,21 @@ fn pii_hash_key() -> &'static [u8] {
                     return key;
                 }
             }
-            eprintln!("WARNING: PII_HASH_KEY must be 64 hex chars (32 bytes). Using default key.");
+            if is_production {
+                panic!("FATAL: PII_HASH_KEY must be 64 hex chars (32 bytes). Cannot start in production mode with invalid key.");
+            }
+            eprintln!("WARNING: PII_HASH_KEY must be 64 hex chars (32 bytes). Generating random key.");
+        } else if is_production {
+            panic!(
+                "FATAL: PII_HASH_KEY env var is required when SENSOR_ENV=production. \
+                 Generate with: openssl rand -hex 32"
+            );
         } else {
-            eprintln!("WARNING: PII_HASH_KEY not set. Using default HMAC key — PII tokens are correlatable across deployments. Set PII_HASH_KEY env var (64 hex chars) for production.");
+            eprintln!("WARNING: PII_HASH_KEY not set. Generating random HMAC key — PII tokens will differ across restarts. Set PII_HASH_KEY env var (64 hex chars) for stable tokens.");
         }
-        DEFAULT_PII_HASH_KEY.to_vec()
+        let mut key = vec![0u8; 32];
+        rand::rng().fill_bytes(&mut key);
+        key
     })
 }
 
@@ -153,25 +167,32 @@ fn luhn_check(digits: &str) -> bool {
 
 pub fn redact_pii(text: &str) -> String {
     let patterns = PII_PATTERNS.get_or_init(init_pii_patterns);
-    let mut result = text.to_string();
+
+    // Collect ALL matches from ALL patterns in one pass over the result string,
+    // then apply replacements in reverse order. This avoids cloning per-pattern.
+    let mut all_ranges: Vec<(usize, usize, String)> = Vec::new();
     for (pii_type, pattern) in patterns {
-        // Collect all matches first (to avoid borrow conflict during replacement)
-        let ranges: Vec<(usize, usize, String)> = pattern
-            .find_iter(&result.clone())
-            .filter(|m| {
-                // Apply Luhn validation for credit card matches
-                if *pii_type == PiiType::CreditCard {
-                    luhn_check(m.as_str())
-                } else {
-                    true
-                }
-            })
-            .map(|m| (m.start(), m.end(), pii_token(pii_type, m.as_str())))
-            .collect();
-        // Replace in reverse order to preserve offsets
-        for (start, end, token) in ranges.into_iter().rev() {
-            result.replace_range(start..end, &token);
+        for m in pattern.find_iter(text) {
+            if *pii_type == PiiType::CreditCard && !luhn_check(m.as_str()) {
+                continue;
+            }
+            all_ranges.push((m.start(), m.end(), pii_token(pii_type, m.as_str())));
         }
+    }
+
+    if all_ranges.is_empty() {
+        return text.to_string();
+    }
+
+    // Sort by start position descending so replacements don't shift earlier offsets.
+    // For overlapping matches, keep the one that starts earliest (last after reverse sort).
+    all_ranges.sort_by(|a, b| b.0.cmp(&a.0));
+    // Remove overlapping ranges (after reverse sort, skip if a range overlaps a later one)
+    all_ranges.dedup_by(|later, earlier| later.0 < earlier.1);
+
+    let mut result = text.to_string();
+    for (start, end, token) in all_ranges {
+        result.replace_range(start..end, &token);
     }
     result
 }

@@ -1,4 +1,7 @@
-use axum::{response::IntoResponse, routing::get, Router};
+use axum::{
+    extract::Request, middleware::Next, response::IntoResponse, response::Response, routing::get,
+    Router,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub static EVENTS_CAPTURED: AtomicU64 = AtomicU64::new(0);
@@ -17,8 +20,44 @@ pub static ACTIVE_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 pub static START_TIME_SECS: AtomicU64 = AtomicU64::new(0);
 pub static CHANNEL_WATERMARK_PCT: AtomicU64 = AtomicU64::new(0);
 
+// Granular drop reason counters
+pub static DROPS_CHANNEL_FULL: AtomicU64 = AtomicU64::new(0);
+pub static DROPS_PARSE_ERROR: AtomicU64 = AtomicU64::new(0);
+pub static DROPS_MEMORY_LIMIT: AtomicU64 = AtomicU64::new(0);
+pub static DROPS_SAMPLED: AtomicU64 = AtomicU64::new(0);
+
 /// Startup grace period — /readyz returns 200 during this window even without events.
 const READYZ_GRACE_SECS: u64 = 30;
+
+use std::sync::OnceLock;
+static METRICS_AUTH_TOKEN: OnceLock<Option<String>> = OnceLock::new();
+
+fn metrics_auth_token() -> &'static Option<String> {
+    METRICS_AUTH_TOKEN.get_or_init(|| std::env::var("METRICS_AUTH_TOKEN").ok())
+}
+
+/// Middleware: if METRICS_AUTH_TOKEN is set, require Bearer token on /metrics.
+async fn auth_middleware(req: Request, next: Next) -> Response {
+    if let Some(expected) = metrics_auth_token() {
+        let auth_header = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok());
+        match auth_header {
+            Some(val) if val.strip_prefix("Bearer ").unwrap_or("") == expected => {
+                next.run(req).await
+            }
+            _ => (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{\"error\":\"unauthorized\"}",
+            )
+                .into_response(),
+        }
+    } else {
+        // No token configured — allow all requests
+        next.run(req).await
+    }
+}
 
 async fn metrics_handler() -> impl IntoResponse {
     let captured = EVENTS_CAPTURED.load(Ordering::Relaxed);
@@ -34,6 +73,9 @@ async fn metrics_handler() -> impl IntoResponse {
         0.0
     };
     let uptime = now_secs().saturating_sub(START_TIME_SECS.load(Ordering::Relaxed));
+
+    let dlq_spilled = crate::ingest::DLQ_SPILLED.load(Ordering::Relaxed);
+    let dlq_recovered = crate::ingest::DLQ_RECOVERED.load(Ordering::Relaxed);
 
     format!(
         "# HELP apisec_events_captured_total TLS events captured
@@ -85,6 +127,30 @@ apisec_channel_watermark_pct {}
 # HELP apisec_uptime_seconds Sensor uptime
 # TYPE apisec_uptime_seconds gauge
 apisec_uptime_seconds {uptime}
+
+# HELP apisec_drops_channel_full_total Events dropped due to channel backpressure
+# TYPE apisec_drops_channel_full_total counter
+apisec_drops_channel_full_total {dcf}
+
+# HELP apisec_drops_parse_error_total Events dropped due to parse errors
+# TYPE apisec_drops_parse_error_total counter
+apisec_drops_parse_error_total {dpe}
+
+# HELP apisec_drops_memory_limit_total Events dropped due to memory ceiling
+# TYPE apisec_drops_memory_limit_total counter
+apisec_drops_memory_limit_total {dml}
+
+# HELP apisec_drops_sampled_total Events dropped due to sampling
+# TYPE apisec_drops_sampled_total counter
+apisec_drops_sampled_total {ds}
+
+# HELP apisec_dlq_spilled_total Events spilled to dead letter queue
+# TYPE apisec_dlq_spilled_total counter
+apisec_dlq_spilled_total {dlq_spilled}
+
+# HELP apisec_dlq_recovered_total Events recovered from dead letter queue
+# TYPE apisec_dlq_recovered_total counter
+apisec_dlq_recovered_total {dlq_recovered}
 ",
         EVENTS_SENT.load(Ordering::Relaxed),
         SEND_ERRORS.load(Ordering::Relaxed),
@@ -98,6 +164,10 @@ apisec_uptime_seconds {uptime}
         PROTO_HTTP3.load(Ordering::Relaxed),
         PROTO_GO_TLS.load(Ordering::Relaxed),
         CHANNEL_WATERMARK_PCT.load(Ordering::Relaxed),
+        dcf = DROPS_CHANNEL_FULL.load(Ordering::Relaxed),
+        dpe = DROPS_PARSE_ERROR.load(Ordering::Relaxed),
+        dml = DROPS_MEMORY_LIMIT.load(Ordering::Relaxed),
+        ds = DROPS_SAMPLED.load(Ordering::Relaxed),
     )
 }
 
@@ -113,16 +183,25 @@ async fn health_handler() -> impl IntoResponse {
         0
     };
 
-    // Degraded if: high drop rate, all sends failing, or excessive ringbuf drops
     let all_sends_failing = send_errors > 0 && sent == 0;
     let high_ringbuf_drops = ringbuf_drops > 100;
 
     if drop_pct > 20 || all_sends_failing || high_ringbuf_drops {
-        (axum::http::StatusCode::SERVICE_UNAVAILABLE,
-         format!("{{\"status\":\"degraded\",\"drop_pct\":{drop_pct},\"send_errors\":{send_errors},\"ringbuf_drops\":{ringbuf_drops}}}"))
+        tracing::warn!(
+            drop_pct,
+            send_errors,
+            ringbuf_drops,
+            "health check: degraded"
+        );
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{\"status\":\"degraded\"}".to_string(),
+        )
     } else {
-        (axum::http::StatusCode::OK,
-         format!("{{\"status\":\"ok\",\"captured\":{captured},\"sent\":{sent},\"drop_pct\":{drop_pct}}}"))
+        (
+            axum::http::StatusCode::OK,
+            "{\"status\":\"ok\"}".to_string(),
+        )
     }
 }
 
@@ -131,7 +210,6 @@ async fn ready_handler() -> impl IntoResponse {
     if captured > 0 {
         return (axum::http::StatusCode::OK, "{\"ready\":true}");
     }
-    // Grace period: report ready during startup even without events
     let uptime = now_secs().saturating_sub(START_TIME_SECS.load(Ordering::Relaxed));
     if uptime < READYZ_GRACE_SECS {
         (axum::http::StatusCode::OK, "{\"ready\":true}")
@@ -151,14 +229,24 @@ fn now_secs() -> u64 {
 }
 
 pub async fn start_metrics_server(port: u16) {
-    let app = Router::new()
+    // /metrics gets optional auth middleware; /healthz and /readyz are always open (for K8s probes)
+    let metrics_routes = Router::new()
         .route("/metrics", get(metrics_handler))
+        .layer(axum::middleware::from_fn(auth_middleware));
+
+    let probe_routes = Router::new()
         .route("/healthz", get(health_handler))
         .route("/readyz", get(ready_handler));
+
+    let app = metrics_routes.merge(probe_routes);
     let addr = format!("0.0.0.0:{port}");
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
-            tracing::info!(addr = %addr, "metrics server started");
+            if metrics_auth_token().is_some() {
+                tracing::info!(addr = %addr, "metrics server started (auth enabled on /metrics)");
+            } else {
+                tracing::info!(addr = %addr, "metrics server started");
+            }
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!(error = %e, "metrics server error");
             }

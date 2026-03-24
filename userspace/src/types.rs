@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 
@@ -90,7 +90,7 @@ pub struct CloseEvent {
 // API traffic model
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiRequest {
     pub method: String,
     pub path: String,
@@ -101,7 +101,7 @@ pub struct ApiRequest {
     pub body: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiResponse {
     pub status_code: i32,
     pub headers: HashMap<String, String>,
@@ -109,7 +109,7 @@ pub struct ApiResponse {
     pub latency_ms: Option<u64>,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EventMetadata {
     pub has_injection: bool,
     pub injection_patterns: Vec<String>,
@@ -118,7 +118,7 @@ pub struct EventMetadata {
     pub mcp_tool_name: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiTrafficEvent {
     pub version: String,
     pub event_type: String,
@@ -148,7 +148,7 @@ pub struct ApiTrafficEvent {
     pub anomaly_features: Option<AnomalyFeatures>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerContext {
     pub pod_name: Option<String>,
     pub pod_namespace: Option<String>,
@@ -159,7 +159,7 @@ pub struct ContainerContext {
     pub workload_type: Option<String>,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AnomalyFeatures {
     pub path_depth: u8,
     pub query_param_count: u8,
@@ -216,7 +216,7 @@ pub struct ParsedRequest {
     pub net_ctx: NetContext,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventBatch {
     pub version: String,
     pub events: Vec<ApiTrafficEvent>,

@@ -35,7 +35,7 @@ use crate::container::{fetch_container_metadata, ContainerLookupRequest, Contain
 use crate::dns::{reverse_dns_lookup, DnsResolver};
 use crate::go_tls::{attach_go_tls_probes, find_go_tls_offsets};
 use crate::http::discover_tls_libs;
-use crate::ingest::send_batch_with_client;
+use crate::ingest::{send_batch_with_client, spill_to_dlq};
 use crate::metrics::*;
 use crate::quic::discover_quic_libs;
 use crate::stream::ShardedStreamState;
@@ -133,6 +133,9 @@ struct Args {
     sample_default: Option<u8>,
     #[arg(long)]
     sample_health: Option<u8>,
+    /// Directory for dead letter queue spill files (failed batches persisted to disk).
+    #[arg(long)]
+    dlq_dir: Option<String>,
 }
 
 /// Resolved configuration after merging CLI args + config file + defaults.
@@ -153,6 +156,7 @@ struct ResolvedConfig {
     go_tls: bool,
     sample_default: u8,
     sample_health: u8,
+    dlq_dir: Option<String>,
 }
 
 fn resolve_config(args: Args) -> anyhow::Result<ResolvedConfig> {
@@ -212,6 +216,7 @@ fn resolve_config(args: Args) -> anyhow::Result<ResolvedConfig> {
         go_tls: args.go_tls || c.go_tls.unwrap_or(false),
         sample_default: args.sample_default.or(c.sample_default).unwrap_or(100),
         sample_health: args.sample_health.or(c.sample_health).unwrap_or(5),
+        dlq_dir: args.dlq_dir,
     })
 }
 
@@ -349,7 +354,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let args = resolve_config(args)?;
 
-    // Validate required args
+    // --- Startup config validation (fail fast) ---
     if args.api_key.is_empty() {
         anyhow::bail!("--api-key or API_KEY env var is required");
     }
@@ -364,10 +369,29 @@ async fn main() -> Result<()> {
         "client" => TrafficRole::Client,
         other => anyhow::bail!("invalid --role '{}': must be 'server' or 'client'", other),
     };
-    let sample_default = args.sample_default.min(100);
-    let sample_health = args.sample_health.min(100);
+    if args.batch_size == 0 {
+        anyhow::bail!("--batch-size must be > 0");
+    }
+    if args.max_buffer_bytes == 0 {
+        anyhow::bail!("--max-buffer-bytes must be > 0");
+    }
+    if args.max_total_buffer_bytes == 0 {
+        anyhow::bail!("--max-total-buffer-bytes must be > 0");
+    }
+    if args.sample_default > 100 {
+        anyhow::bail!(
+            "--sample-default must be 0-100, got: {}",
+            args.sample_default
+        );
+    }
+    if args.sample_health > 100 {
+        anyhow::bail!("--sample-health must be 0-100, got: {}", args.sample_health);
+    }
+    let sample_default = args.sample_default;
+    let sample_health = args.sample_health;
 
-    // Pre-flight validation: BPF filesystem write access
+    // Pre-flight validation: BPF filesystem presence (write access is optional —
+    // BPF program loading uses bpf() syscall, not file writes to bpffs).
     if !std::path::Path::new("/sys/fs/bpf").exists() {
         anyhow::bail!(
             "FATAL: /sys/fs/bpf not mounted — BPF maps unavailable. Kernel may lack BPF support."
@@ -378,7 +402,11 @@ async fn main() -> Result<()> {
             let _ = std::fs::remove_file("/sys/fs/bpf/.probe-writable-check");
         }
         Err(e) => {
-            anyhow::bail!("FATAL: Cannot write to /sys/fs/bpf: {} — Check kernel security policies (SELinux/AppArmor). Enable CAP_BPF or run privileged.", e);
+            tracing::warn!(
+                error = %e,
+                "cannot write to /sys/fs/bpf (map pinning may be unavailable) — \
+                 BPF program loading via syscall may still work"
+            );
         }
     }
 
@@ -524,6 +552,25 @@ async fn main() -> Result<()> {
     let batch_size = args.batch_size;
     let client_handle = http_client.clone();
     let resolver_for_batch = container_resolver.clone();
+    let dlq_dir = args
+        .dlq_dir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/api-sentinel/dlq"));
+    let dlq_for_batch = dlq_dir.clone();
+
+    // Start DLQ retry loop (retries spilled batches every 30s)
+    let dlq_client = http_client.clone();
+    let dlq_url = ingest_url.clone();
+    let dlq_key = api_key.clone();
+    let dlq_retry_dir = dlq_dir.clone();
+    tokio::spawn(crate::ingest::dlq_retry_loop(
+        dlq_retry_dir,
+        dlq_client,
+        dlq_url,
+        dlq_key,
+    ));
+
     let batch_handle = tokio::spawn(async move {
         let mut batch: Vec<ApiTrafficEvent> = Vec::new();
         let mut flush_interval = time::interval(Duration::from_secs(1));
@@ -536,8 +583,9 @@ async fn main() -> Result<()> {
                             if batch.len() >= batch_size {
                                 let mut payload = std::mem::take(&mut batch);
                                 enrich_metadata(&resolver_for_batch, &mut payload);
-                                if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await {
-                                    tracing::error!(error = %e, "batch send failed");
+                                if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload.clone()).await {
+                                    tracing::error!(error = %e, "batch send failed, spilling to DLQ");
+                                    spill_to_dlq(&dlq_for_batch, &payload).await;
                                 }
                             }
                         }
@@ -545,8 +593,9 @@ async fn main() -> Result<()> {
                             if !batch.is_empty() {
                                 let mut payload = std::mem::take(&mut batch);
                                 enrich_metadata(&resolver_for_batch, &mut payload);
-                                if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await {
-                                    tracing::error!(error = %e, "final flush failed");
+                                if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload.clone()).await {
+                                    tracing::error!(error = %e, "final flush failed, spilling to DLQ");
+                                    spill_to_dlq(&dlq_for_batch, &payload).await;
                                 }
                             }
                             break;
@@ -557,8 +606,9 @@ async fn main() -> Result<()> {
                     if !batch.is_empty() {
                         let mut payload = std::mem::take(&mut batch);
                         enrich_metadata(&resolver_for_batch, &mut payload);
-                        if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await {
-                            tracing::error!(error = %e, "interval flush failed");
+                        if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload.clone()).await {
+                            tracing::error!(error = %e, "interval flush failed, spilling to DLQ");
+                            spill_to_dlq(&dlq_for_batch, &payload).await;
                         }
                     }
                 }
@@ -606,7 +656,16 @@ async fn main() -> Result<()> {
                 let events = state_handle.handle_event(&header, payload);
                 for item in events {
                     if sender.try_send(item).is_err() {
-                        EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        let dropped = EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                        DROPS_CHANNEL_FULL.fetch_add(1, Ordering::Relaxed);
+                        let captured = EVENTS_CAPTURED.load(Ordering::Relaxed);
+                        if dropped.is_power_of_two() || (captured > 0 && dropped % 1000 == 0) {
+                            tracing::warn!(
+                                dropped,
+                                captured,
+                                "channel full, events being dropped — consider increasing batch throughput"
+                            );
+                        }
                     }
                 }
             }

@@ -65,9 +65,9 @@ impl ShardedStreamState {
         let shard = &self.shards[idx];
         match shard.lock() {
             Ok(mut guard) => guard.handle_event(ev, payload),
-            Err(e) => {
-                tracing::warn!("shard mutex poisoned, recovering");
-                e.into_inner().handle_event(ev, payload)
+            Err(_) => {
+                tracing::error!("shard mutex poisoned, dropping event to avoid corrupted state");
+                vec![]
             }
         }
     }
@@ -77,10 +77,8 @@ impl ShardedStreamState {
         let shard = &self.shards[idx];
         match shard.lock() {
             Ok(mut guard) => guard.evict_connection_by_ptr(conn_key.pid, conn_key.ssl_ptr),
-            Err(e) => {
-                tracing::warn!("shard mutex poisoned, recovering");
-                e.into_inner()
-                    .evict_connection_by_ptr(conn_key.pid, conn_key.ssl_ptr);
+            Err(_) => {
+                tracing::error!("shard mutex poisoned, skipping eviction");
             }
         }
     }
@@ -391,6 +389,7 @@ impl StreamState {
                 buf.extend_from_slice(payload);
             } else {
                 EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                DROPS_MEMORY_LIMIT.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -681,6 +680,7 @@ impl StreamState {
         }
         if !reserve_memory(self.max_total_buffer_bytes, data_len) {
             EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROPS_MEMORY_LIMIT.fetch_add(1, Ordering::Relaxed);
             return Some(vec![]);
         }
         conn_state.buffer.extend_from_slice(payload);
