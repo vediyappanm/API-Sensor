@@ -106,6 +106,11 @@ async fn main() -> Result<()> {
     if !args.ingest.starts_with("http://") && !args.ingest.starts_with("https://") {
         anyhow::bail!("--ingest must be an http:// or https:// URL, got: {}", args.ingest);
     }
+    // Refuse to start without an explicit PII hash key. A guessable / hardcoded
+    // key would let any reader of the binary or environment de-tokenize all
+    // redacted PII downstream — that defeats the entire redaction guarantee.
+    redaction::init_pii_hash_key()
+        .map_err(|e| anyhow::anyhow!("PII redaction init failed: {e}"))?;
     let role = match args.role.as_str() {
         "server" => TrafficRole::Server,
         "client" => TrafficRole::Client,

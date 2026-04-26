@@ -46,6 +46,10 @@ pub struct ContainerMetadata {
 }
 
 const MAX_CACHE_ENTRIES: usize = 10_000;
+/// Cap on in-flight CRI lookups. A permanently-failing cgroup (e.g. container
+/// already deleted) would otherwise grow `pending` without bound as new
+/// events keep arriving for stale cgroup ids.
+const MAX_PENDING_LOOKUPS: usize = 4_096;
 
 pub struct ContainerResolver {
     cache: Mutex<HashMap<u64, ContainerCacheEntry>>,
@@ -117,7 +121,15 @@ impl ContainerResolver {
 
         if let Some(full_id) = container_id_full {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            // Drop oldest pending lookups when at capacity. A bounded set
+            // prevents permanently-failing cgroups (e.g. container exited
+            // before our CRI lookup landed) from accumulating forever.
             if !pending.contains(&ev.cgroup_id) {
+                if pending.len() >= MAX_PENDING_LOOKUPS {
+                    if let Some(victim) = pending.iter().next().copied() {
+                        pending.remove(&victim);
+                    }
+                }
                 pending.insert(ev.cgroup_id);
                 let _ = self.lookup_tx.try_send(ContainerLookupRequest {
                     cgroup_id: ev.cgroup_id,

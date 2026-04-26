@@ -584,9 +584,12 @@ impl StreamState {
                             net_ctx: net_ctx.clone().unwrap_or_default(),
                         });
                     }
-                    let cleared = conn_state.buffer.len();
-                    conn_state.buffer.clear();
-                    release_memory(cleared);
+                    // Don't clear the buffer here — multiplexed streams may
+                    // have additional HEADERS / DATA frames in this same chunk
+                    // that we still need to parse. The buffer is drained at
+                    // the end of the function (after all frames processed)
+                    // and bounded by the max_buffer guard above, so we won't
+                    // grow without bound either.
                 }
             } else if let Some(status) = headers.get(":status") {
                 let request = conn_state.pending_requests.remove(&stream_id)
@@ -711,13 +714,14 @@ fn find_next_frame_boundary(buf: &[u8], start: usize) -> usize {
 
 /// Atomic CAS memory reservation — returns true if reservation succeeded.
 /// Uses fetch_update to avoid TOCTOU races between check and increment.
+/// `checked_add` defends against an attacker-controlled or buggy `additional`
+/// that could otherwise overflow `usize`.
 fn reserve_memory(max_total: usize, additional: usize) -> bool {
     TOTAL_BUFFER_BYTES
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            if current + additional <= max_total {
-                Some(current + additional)
-            } else {
-                None
+            match current.checked_add(additional) {
+                Some(next) if next <= max_total => Some(next),
+                _ => None,
             }
         })
         .is_ok()

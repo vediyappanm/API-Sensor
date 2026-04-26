@@ -201,8 +201,38 @@ fn parse_go_version_from_binary(data: &[u8]) -> Option<String> {
     None
 }
 
+/// Offset of the `goid` field inside `runtime.g` for each Go release.
+///
+/// The struct `g` was reorganized in Go 1.17 alongside the register-based
+/// calling convention; goid moved from 192 (1.13–1.16 layout) to 152 and has
+/// stayed there through Go 1.24. We keep an explicit per-version mapping
+/// rather than a single default so future Go releases that move the field
+/// will produce a clear miss instead of silently corrupting attribution.
+///
+/// Cross-referenced against:
+/// - eCapture (gojue/ecapture) — uses 152 for Go 1.18+
+/// - gspy (Mutasem-mk4/gspy) — validated for 1.21.x–1.23.x with 152
+/// - outrigdev/goid — universal fallback at 152 for 1.23–1.25
+/// - Go runtime source: src/runtime/runtime2.go `type g struct`
 fn goid_offset_for_version(version: &str) -> u64 {
-    if version.contains("go1.17") || version.contains("go1.16") { 192 } else { 152 }
+    // Strip patch/extra to get the base "go1.NN".
+    let base = version.split('.').take(2).collect::<Vec<_>>().join(".");
+    match base.as_str() {
+        // Pre-1.17 layout — goid sat after a wider sched/preempt block.
+        "go1.13" | "go1.14" | "go1.15" | "go1.16" => 192,
+        // Modern layout, stable from 1.17 onwards.
+        "go1.17" | "go1.18" | "go1.19" | "go1.20"
+        | "go1.21" | "go1.22" | "go1.23" | "go1.24" => 152,
+        // Unknown / future version — assume modern layout but log so an
+        // operator can investigate if attribution drifts.
+        other => {
+            tracing::warn!(
+                version = %other,
+                "Go TLS: unknown Go release; using goid offset 152 (modern layout)"
+            );
+            152
+        }
+    }
 }
 
 /// Maximum file size to read when scanning for Go binaries (200 MB).
