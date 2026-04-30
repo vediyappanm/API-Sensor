@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tower::service_fn;
@@ -279,7 +280,10 @@ async fn fetch_container_metadata_inner(
     let path = socket_path.to_string();
     let endpoint = tonic::transport::Endpoint::try_from("http://[::]:0")?;
     let channel = endpoint
-        .connect_with_connector(service_fn(move |_uri| UnixStream::connect(path.clone())))
+        .connect_with_connector(service_fn(move |_uri| {
+            let path = path.clone();
+            async move { UnixStream::connect(path).await.map(TokioIo::new) }
+        }))
         .await?;
 
     let mut client = RuntimeServiceClient::new(channel);

@@ -23,7 +23,7 @@ http = "1"
 hpack = { package = "hpack-patched", version = "0.3" }
 indexmap = { version = "1.9.3", features = ["std"] }
 libbpf-rs = "0.23"
-prost = "0.12"
+prost = "0.13"
 regex = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,10 +32,11 @@ hmac = "0.12"
 libc = "0.2"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
-tonic = { version = "0.11", features = ["transport"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tonic = { version = "0.12", features = ["transport"] }
 tower = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [build-dependencies]
-tonic-build = "0.11"
+tonic-build = "0.12"

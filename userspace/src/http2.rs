@@ -158,15 +158,66 @@ pub fn contains_http2_preface(buffer: &[u8]) -> bool {
     buffer.windows(HTTP2_PREFACE.len()).any(|w| w == HTTP2_PREFACE)
 }
 
+/// RFC 7540 §4.2 default; SETTINGS_MAX_FRAME_SIZE (id=0x5) may raise this up
+/// to 2^24-1 via a SETTINGS frame.
+const H2_DEFAULT_MAX_FRAME_SIZE: usize = 16_384;
+
+/// Scan `buffer` for a SETTINGS frame (type=0x04) and return the negotiated
+/// SETTINGS_MAX_FRAME_SIZE value, or the RFC default (16 384) if absent.
+fn extract_settings_max_frame_size(buffer: &[u8]) -> usize {
+    let mut i = 0;
+    // Skip the client preface if present.
+    let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    if buffer.starts_with(preface) {
+        i = preface.len();
+    }
+    while i + 9 <= buffer.len() {
+        let frame_len = ((buffer[i] as usize) << 16)
+            | ((buffer[i + 1] as usize) << 8)
+            | (buffer[i + 2] as usize);
+        let frame_type = buffer[i + 3];
+        let flags      = buffer[i + 4];
+        // Stream ID must be 0 for SETTINGS (RFC 7540 §6.5).
+        let stream_id  = u32::from_be_bytes([
+            buffer[i + 5], buffer[i + 6], buffer[i + 7], buffer[i + 8],
+        ]) & 0x7fff_ffff;
+
+        if i + 9 + frame_len > buffer.len() {
+            break;
+        }
+
+        if frame_type == 0x04 && stream_id == 0 && flags & 0x01 == 0 {
+            // SETTINGS payload: repeated (u16 id, u32 value) tuples.
+            let payload = &buffer[i + 9..i + 9 + frame_len];
+            let mut j = 0;
+            while j + 6 <= payload.len() {
+                let id  = u16::from_be_bytes([payload[j], payload[j + 1]]);
+                let val = u32::from_be_bytes([
+                    payload[j + 2], payload[j + 3], payload[j + 4], payload[j + 5],
+                ]) as usize;
+                if id == 0x0005 {
+                    // Clamp to the legal range (RFC 7540 §6.5.2).
+                    let clamped = val.clamp(H2_DEFAULT_MAX_FRAME_SIZE, (1 << 24) - 1);
+                    return clamped;
+                }
+                j += 6;
+            }
+        }
+        i += 9 + frame_len;
+    }
+    H2_DEFAULT_MAX_FRAME_SIZE
+}
+
 /// Returns per-stream decoded headers: Vec<(stream_id, headers)>.
 pub fn parse_http2_frames(
     decoder: &mut Http2HpackDecoder,
     buffer: &[u8],
 ) -> Vec<(u32, HashMap<String, String>)> {
-    let blocks = extract_hpack_blocks(buffer);
+    let max_frame_size = extract_settings_max_frame_size(buffer);
+    let blocks = extract_hpack_blocks(buffer, max_frame_size);
     if blocks.is_empty() {
         let mut map = HashMap::new();
-        hpack_static_scan(buffer, &mut map);
+        hpack_static_scan(buffer, &mut map, max_frame_size);
         for key in &[":method", ":path", ":authority", ":status", "content-type"] {
             if !map.contains_key(*key) {
                 if let Some(value) = find_token_value(buffer, key) {
@@ -212,7 +263,7 @@ fn parse_http2_metadata(
         .unwrap_or_default()
 }
 
-fn hpack_static_scan(buffer: &[u8], map: &mut HashMap<String, String>) {
+fn hpack_static_scan(buffer: &[u8], map: &mut HashMap<String, String>, max_frame_size: usize) {
     const STATIC_TABLE: &[(u8, &str, &str)] = &[
         (2,  ":method", "GET"),
         (3,  ":method", "POST"),
@@ -239,7 +290,7 @@ fn hpack_static_scan(buffer: &[u8], map: &mut HashMap<String, String>) {
             | (buffer[i + 2] as usize);
         let frame_type = buffer[i + 3];
 
-        if frame_len > 16384 || i + 9 + frame_len > buffer.len() {
+        if frame_len > max_frame_size || i + 9 + frame_len > buffer.len() {
             i += 1;
             continue;
         }
@@ -267,7 +318,7 @@ fn hpack_static_scan(buffer: &[u8], map: &mut HashMap<String, String>) {
     }
 }
 
-fn extract_hpack_blocks(buffer: &[u8]) -> Vec<(u32, Vec<u8>)> {
+fn extract_hpack_blocks(buffer: &[u8], max_frame_size: usize) -> Vec<(u32, Vec<u8>)> {
     let mut blocks = Vec::new();
     let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     let start = buffer.windows(preface.len())
@@ -285,7 +336,7 @@ fn extract_hpack_blocks(buffer: &[u8]) -> Vec<(u32, Vec<u8>)> {
             buffer[i + 5], buffer[i + 6], buffer[i + 7], buffer[i + 8],
         ]) & 0x7fffffff;
 
-        if frame_len > 16384 || i + 9 + frame_len > buffer.len() {
+        if frame_len > max_frame_size || i + 9 + frame_len > buffer.len() {
             i += 1;
             continue;
         }

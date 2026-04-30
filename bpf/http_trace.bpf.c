@@ -157,6 +157,16 @@ struct {
     __type(value, struct conn_info);
 } ssl_ptr_to_conn SEC(".maps");
 
+// sock_ptr -> pid_tgid: populated at tcp_connect / inet_csk_accept so that
+// tcp_close can delete the correct active_connections entry even when the
+// closing thread differs from the thread that opened the connection.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);  // struct sock *
+    __type(value, __u64); // pid_tgid
+} sock_to_pid SEC(".maps");
+
 // Go TLS support
 struct go_write_args {
     __u64 conn_ptr;
@@ -399,6 +409,8 @@ int tcp_connect_entry(struct pt_regs *ctx)
     fill_conn_info(&info, sk);
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     bpf_map_update_elem(&active_connections, &pid_tgid, &info, BPF_ANY);
+    __u64 sk_ptr = (__u64)sk;
+    bpf_map_update_elem(&sock_to_pid, &sk_ptr, &pid_tgid, BPF_ANY);
     return 0;
 }
 
@@ -413,6 +425,8 @@ int tcp_accept_ret(struct pt_regs *ctx)
     fill_conn_info(&info, sk);
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     bpf_map_update_elem(&active_connections, &pid_tgid, &info, BPF_ANY);
+    __u64 sk_ptr = (__u64)sk;
+    bpf_map_update_elem(&sock_to_pid, &sk_ptr, &pid_tgid, BPF_ANY);
     return 0;
 }
 
@@ -904,8 +918,19 @@ int quic_stream_send_exit(struct pt_regs *ctx)
 SEC("kprobe/tcp_close")
 int tcp_close_entry(struct pt_regs *ctx)
 {
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+    __u64 sk_ptr = (__u64)sk;
+
+    // Look up which thread originally opened this connection.  tcp_close may
+    // be called from a thread different from the one that called tcp_connect /
+    // inet_csk_accept, so using bpf_get_current_pid_tgid() here would delete
+    // the wrong (or no) entry in active_connections, leaking the original
+    // entry forever.
+    __u64 *owner = bpf_map_lookup_elem(&sock_to_pid, &sk_ptr);
+    __u64 pid_tgid = owner ? *owner : bpf_get_current_pid_tgid();
+
     bpf_map_delete_elem(&active_connections, &pid_tgid);
+    bpf_map_delete_elem(&sock_to_pid, &sk_ptr);
     return 0;
 }
 
