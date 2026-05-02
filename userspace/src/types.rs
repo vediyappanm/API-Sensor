@@ -220,5 +220,5 @@ pub struct EventBatch {
 
 pub const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0";
 pub const MAX_STREAM_ENTRIES: usize = 10_000;
-pub const STREAM_TTL_MS: u64 = 60_000;
+pub const STREAM_TTL_MS: u64 = 300_000;
 pub const NUM_SHARDS: usize = 16;

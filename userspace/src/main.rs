@@ -244,7 +244,7 @@ async fn main() -> Result<()> {
 
     let http_client = Arc::new(
         reqwest::Client::builder()
-            .pool_max_idle_per_host(4)
+            .pool_max_idle_per_host(16)
             .timeout(Duration::from_secs(10))
             .build()?,
     );
