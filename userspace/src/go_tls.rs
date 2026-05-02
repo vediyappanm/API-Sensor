@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 
 // ---------------------------------------------------------------------------
@@ -295,7 +296,8 @@ pub fn attach_at_offset(
     pid: i32,
     links: &mut Vec<libbpf_rs::Link>,
 ) -> anyhow::Result<()> {
-    let prog = obj.prog_mut(prog_name)
+    let prog = obj.progs_mut()
+        .find(|p| p.name() == OsStr::new(prog_name))
         .ok_or_else(|| anyhow::anyhow!("missing BPF program {}", prog_name))?;
     // Use attach_uprobe (not attach_uprobe_with_opts) so that func_name is NULL and
     // libbpf uses func_offset directly without attempting an ELF symbol lookup.

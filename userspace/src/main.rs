@@ -17,7 +17,8 @@ mod quic;
 
 use anyhow::Result;
 use clap::Parser;
-use libbpf_rs::{ObjectBuilder, RingBufferBuilder};
+use libbpf_rs::{MapCore, ObjectBuilder, RingBufferBuilder};
+use std::ffi::OsStr;
 use std::env;
 use std::fs;
 use std::mem::size_of;
@@ -140,7 +141,7 @@ async fn main() -> Result<()> {
 
     // Initialize sampling_config — must happen before polling starts.
     // BPF arrays are zero-initialized; rate=0 means "filter everything".
-    if let Some(map) = obj.map_mut("sampling_config") {
+    if let Some(map) = obj.maps().find(|m| m.name() == OsStr::new("sampling_config")) {
         let key: u32 = 0;
         let cfg_bytes: [u8; 4] = [sample_default, sample_health, 0, 0];
         if let Err(e) = map.update(&key.to_ne_bytes(), &cfg_bytes, libbpf_rs::MapFlags::ANY) {
@@ -307,65 +308,58 @@ async fn main() -> Result<()> {
     let sender = tx.clone();
     let state_handle = state.clone();
 
-    let events_map = obj
-        .map_mut("events")
-        .ok_or_else(|| anyhow::anyhow!("missing events map"))? as *mut libbpf_rs::Map;
-    let close_events_map = obj
-        .map_mut("close_events")
-        .ok_or_else(|| anyhow::anyhow!("missing close_events map"))? as *mut libbpf_rs::Map;
+    let events_map = obj.maps()
+        .find(|m| m.name() == OsStr::new("events"))
+        .ok_or_else(|| anyhow::anyhow!("missing events map"))?;
+    let close_events_map = obj.maps()
+        .find(|m| m.name() == OsStr::new("close_events"))
+        .ok_or_else(|| anyhow::anyhow!("missing close_events map"))?;
+    let proc_map_opt = obj.maps().find(|m| m.name() == OsStr::new("proc_events"));
 
     let channel_capacity = 10000u64;
-    unsafe {
-        ringbuf.add(&mut *events_map, move |data| {
-            if let Some((header, payload)) = TlsEventHeader::from_bytes(data) {
-                EVENTS_CAPTURED.fetch_add(1, Ordering::Relaxed);
-                // Compute channel watermark for backpressure monitoring
-                let current_len = channel_capacity.saturating_sub(sender.capacity() as u64);
-                let watermark = (current_len * 100) / channel_capacity;
-                CHANNEL_WATERMARK_PCT.store(watermark, Ordering::Relaxed);
+    ringbuf.add(&events_map, move |data| {
+        if let Some((header, payload)) = TlsEventHeader::from_bytes(data) {
+            EVENTS_CAPTURED.fetch_add(1, Ordering::Relaxed);
+            // Compute channel watermark for backpressure monitoring
+            let current_len = channel_capacity.saturating_sub(sender.capacity() as u64);
+            let watermark = (current_len * 100) / channel_capacity;
+            CHANNEL_WATERMARK_PCT.store(watermark, Ordering::Relaxed);
 
-                let events = state_handle.handle_event(&header, payload);
-                for item in events {
-                    if sender.try_send(item).is_err() {
-                        EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
-                    }
+            let events = state_handle.handle_event(&header, payload);
+            for item in events {
+                if sender.try_send(item).is_err() {
+                    EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            0
-        })?;
-    }
+        }
+        0
+    })?;
 
     let state_handle_close = state.clone();
-    unsafe {
-        ringbuf.add(&mut *close_events_map, move |data| {
-            if data.len() < size_of::<CloseEvent>() {
-                return 0;
-            }
-            let ev = std::ptr::read_unaligned(data.as_ptr() as *const CloseEvent);
-            let key = ConnKey { pid: ev.pid, ssl_ptr: ev.ssl_ptr, born_ms: 0 };
-            state_handle_close.evict_connection(&key);
-            0
-        })?;
-    }
+    ringbuf.add(&close_events_map, move |data| {
+        if data.len() < size_of::<CloseEvent>() {
+            return 0;
+        }
+        let ev = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const CloseEvent) };
+        let key = ConnKey { pid: ev.pid, ssl_ptr: ev.ssl_ptr, born_ms: 0 };
+        state_handle_close.evict_connection(&key);
+        0
+    })?;
 
     // proc_events ring buffer (optional — map may not exist).
     // Only log new process info; do NOT call detect_go_binary here as it
     // reads entire binaries from disk and would block ring buffer processing.
-    let proc_events_result = obj.map_mut("proc_events");
-    if let Some(proc_map) = proc_events_result {
-        let proc_map_ptr = proc_map as *mut libbpf_rs::Map;
-        unsafe {
-            let _ = ringbuf.add(&mut *proc_map_ptr, move |data| {
-                if data.len() < size_of::<NewProcEvent>() {
-                    return 0;
-                }
-                let ev = std::ptr::read_unaligned(data.as_ptr() as *const NewProcEvent);
-                let filename_end = ev.filename.iter().position(|&b| b == 0).unwrap_or(ev.filename.len());
-                let filename = String::from_utf8_lossy(&ev.filename[..filename_end]);
-                tracing::debug!(pid = ev.pid, file = %filename, "new process");
-                0
-            });
-        }
+    if let Some(ref proc_map) = proc_map_opt {
+        let _ = ringbuf.add(proc_map, move |data| {
+            if data.len() < size_of::<NewProcEvent>() {
+                return 0;
+            }
+            let ev = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const NewProcEvent) };
+            let filename_end = ev.filename.iter().position(|&b| b == 0).unwrap_or(ev.filename.len());
+            let filename = String::from_utf8_lossy(&ev.filename[..filename_end]);
+            tracing::debug!(pid = ev.pid, file = %filename, "new process");
+            0
+        });
     }
 
     let ringbuf = ringbuf.build()?;

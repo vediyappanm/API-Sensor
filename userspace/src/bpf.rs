@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use libbpf_rs::UprobeOpts;
+use std::ffi::OsStr;
 
 // ---------------------------------------------------------------------------
 // BPF attachment helpers
@@ -56,18 +57,18 @@ pub fn attach_kernel_probes(
     obj: &mut libbpf_rs::Object,
     links: &mut Vec<libbpf_rs::Link>,
 ) -> Result<()> {
-    let tcp_connect = obj
-        .prog_mut("tcp_connect_entry")
+    let mut tcp_connect = obj.progs_mut()
+        .find(|p| p.name() == OsStr::new("tcp_connect_entry"))
         .context("missing tcp_connect_entry program")?;
     links.push(tcp_connect.attach().context("attach kprobe tcp_connect")?);
 
-    let tcp_accept = obj
-        .prog_mut("tcp_accept_ret")
+    let mut tcp_accept = obj.progs_mut()
+        .find(|p| p.name() == OsStr::new("tcp_accept_ret"))
         .context("missing tcp_accept_ret program")?;
     links.push(tcp_accept.attach().context("attach kretprobe inet_csk_accept")?);
 
-    let tcp_close = obj
-        .prog_mut("tcp_close_entry")
+    let mut tcp_close = obj.progs_mut()
+        .find(|p| p.name() == OsStr::new("tcp_close_entry"))
         .context("missing tcp_close_entry program")?;
     links.push(tcp_close.attach().context("attach kprobe tcp_close")?);
 
@@ -151,12 +152,12 @@ pub fn attach_symbol(
     pid: i32,
     links: &mut Vec<libbpf_rs::Link>,
 ) -> Result<()> {
-    let prog = obj
-        .prog_mut(prog_name)
+    let prog = obj.progs_mut()
+        .find(|p| p.name() == OsStr::new(prog_name))
         .with_context(|| format!("missing BPF program {}", prog_name))?;
     let opts = UprobeOpts {
         retprobe,
-        func_name: symbol.to_string(),
+        func_name: Some(symbol.to_string()),
         ..Default::default()
     };
     let link = prog
