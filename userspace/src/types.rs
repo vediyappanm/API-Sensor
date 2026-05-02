@@ -139,6 +139,15 @@ pub struct ApiTrafficEvent {
     pub metadata: Option<EventMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anomaly_features: Option<AnomalyFeatures>,
+    // Identity fields — populated from JWT, headers, and cookies
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

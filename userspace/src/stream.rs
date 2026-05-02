@@ -9,6 +9,7 @@ use crate::dns::{self, DnsResolver};
 use crate::grpc::decode_grpc_fields;
 use crate::http::{HttpMessage, HttpResponseParsed, extract_http_header, split_query};
 use crate::http2::{Http2HpackDecoder, contains_http2_preface, parse_http2_frames};
+use crate::identity::extract_identity;
 use crate::mcp::{is_mcp_response, parse_sse_events};
 use crate::metrics::*;
 use crate::quic;
@@ -773,6 +774,10 @@ pub fn build_ws_event(
         dest_hostname: net_ctx.dest_hostname,
         metadata: None,
         anomaly_features: None,
+        user_id: None,
+        user_role: None,
+        session_id: None,
+        auth_session_id: None,
     }
 }
 
@@ -800,6 +805,10 @@ pub fn build_event(
     // Compute anomaly features before redaction (on raw path/query)
     let (_, raw_query) = split_query(&req.path);
     let anomaly = compute_anomaly_features(&req.path, &raw_query, 0);
+
+    // Extract identity from raw headers BEFORE PII redaction so JWT tokens
+    // are still intact when we parse them.
+    let identity = extract_identity(&req.headers);
 
     // Apply PII redaction to path and header values
     let redacted_path = redact_pii(&req.path);
@@ -852,5 +861,9 @@ pub fn build_event(
         dest_hostname: net_ctx.dest_hostname,
         metadata: None,
         anomaly_features: Some(anomaly),
+        user_id: Some(identity.user_id),
+        user_role: Some(identity.user_role),
+        session_id: Some(identity.session_id),
+        auth_session_id: Some(identity.auth_session_id),
     }
 }

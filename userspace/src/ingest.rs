@@ -5,18 +5,14 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::metrics::{EVENTS_SENT, SEND_ERRORS};
-use crate::types::{ApiTrafficEvent, EventBatch};
+use crate::output::to_sensor_batch;
+use crate::types::ApiTrafficEvent;
 
-/// Number of attempts including the initial try. With 3, we make one initial
-/// request and up to 2 retries — matching the `is_server_error()` branch.
 const MAX_ATTEMPTS: u32 = 3;
 const COMPRESS_THRESHOLD_BYTES: usize = 4096;
 const BASE_BACKOFF_MS: u64 = 200;
 const MAX_BACKOFF_MS: u64 = 10_000;
 
-/// Lightweight LCG so we don't pull in the `rand` crate (which has its own
-/// RUSTSEC advisory and adds 100KB+ to the binary). Quality of randomness is
-/// irrelevant here — we just want backoff jitter to stagger sensor fleets.
 fn jittered_backoff_ms(attempt: u32) -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -24,8 +20,6 @@ fn jittered_backoff_ms(attempt: u32) -> u64 {
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
     let base = (BASE_BACKOFF_MS << attempt.min(6)).min(MAX_BACKOFF_MS);
-    // Full jitter (Marc Brooker, AWS): sleep = random_between(0, base).
-    // Avoids thundering herd when many sensors retry after a backend recovery.
     let mix = nanos.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
     base.saturating_sub(1).min(mix % base.max(1))
 }
@@ -34,18 +28,17 @@ pub async fn send_batch_with_client(
     client: &reqwest::Client,
     url: &str,
     api_key: &str,
+    tenant_id: &str,
+    policy_version: &str,
     events: Vec<ApiTrafficEvent>,
 ) -> Result<()> {
     use std::io::Write as IoWrite;
 
     let event_count = events.len() as u64;
-    let body_struct = EventBatch { version: "v1".to_string(), events };
-    let json_bytes = serde_json::to_vec(&body_struct)?;
+    let batch = to_sensor_batch(events, tenant_id, policy_version);
+    let json_bytes = serde_json::to_vec(&batch)?;
 
     let (payload, content_encoding) = if json_bytes.len() > COMPRESS_THRESHOLD_BYTES {
-        // `default()` (Compression::default = level 6) gives a much better
-        // ratio than `fast()` (level 1) and is still well under our latency
-        // budget for batches up to a few MB.
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&json_bytes)?;
         (encoder.finish()?, Some("gzip"))
@@ -74,7 +67,6 @@ pub async fn send_batch_with_client(
                     EVENTS_SENT.fetch_add(event_count, Ordering::Relaxed);
                     return Ok(());
                 }
-                // Honour Retry-After on 429 / 503 if the server provided one.
                 let retry_after_ms = resp.headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
@@ -90,8 +82,6 @@ pub async fn send_batch_with_client(
                     continue;
                 }
                 SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
-                // Read body but cap it — buggy backends can stream gigabytes
-                // back on error, which would consume sensor memory.
                 let text = resp
                     .text()
                     .await

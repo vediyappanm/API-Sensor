@@ -1,6 +1,8 @@
 mod types;
 mod metrics;
 mod redaction;
+mod identity;
+mod output;
 mod websocket;
 mod grpc;
 mod mcp;
@@ -56,6 +58,10 @@ struct Args {
     api_key: String,
     #[arg(long, default_value = "1000000")]
     account_id: u64,
+    #[arg(long, default_value = "default")]
+    tenant_id: String,
+    #[arg(long, default_value = "1")]
+    policy_version: String,
     #[arg(long, default_value = "200")]
     batch_size: usize,
     #[arg(long, default_value = "server")]
@@ -293,10 +299,12 @@ async fn main() -> Result<()> {
             .build()?,
     );
 
-    let ingest_url  = args.ingest.clone();
-    let api_key     = args.api_key.clone();
-    let batch_size  = args.batch_size;
-    let client_handle = http_client.clone();
+    let ingest_url      = args.ingest.clone();
+    let api_key         = args.api_key.clone();
+    let tenant_id       = args.tenant_id.clone();
+    let policy_version  = args.policy_version.clone();
+    let batch_size      = args.batch_size;
+    let client_handle   = http_client.clone();
     let batch_handle = tokio::spawn(async move {
         let mut batch: Vec<ApiTrafficEvent> = Vec::new();
         let mut flush_interval = time::interval(Duration::from_secs(1));
@@ -308,7 +316,7 @@ async fn main() -> Result<()> {
                             batch.push(event);
                             if batch.len() >= batch_size {
                                 let payload = std::mem::take(&mut batch);
-                                if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await {
+                                if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, &tenant_id, &policy_version, payload).await {
                                     tracing::error!(error = %e, "batch send failed");
                                 }
                             }
@@ -317,7 +325,7 @@ async fn main() -> Result<()> {
                             // Channel closed — flush remaining events before exit
                             if !batch.is_empty() {
                                 let payload = std::mem::take(&mut batch);
-                                if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await {
+                                if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, &tenant_id, &policy_version, payload).await {
                                     tracing::error!(error = %e, "final flush failed");
                                 }
                             }
@@ -328,7 +336,7 @@ async fn main() -> Result<()> {
                 _ = flush_interval.tick() => {
                     if !batch.is_empty() {
                         let payload = std::mem::take(&mut batch);
-                        if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, payload).await {
+                        if let Err(e) = send_batch_with_client(&client_handle, &ingest_url, &api_key, &tenant_id, &policy_version, payload).await {
                             tracing::error!(error = %e, "interval flush failed");
                         }
                     }
