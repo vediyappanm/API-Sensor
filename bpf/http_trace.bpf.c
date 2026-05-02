@@ -1093,3 +1093,212 @@ int handle_new_process(struct trace_event_raw_sched_process_exec *ctx)
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// NSS TLS (libnss3): PR_Read / PR_Write
+// Argument layout matches SSL_read/SSL_write — first arg used as conn handle.
+// ---------------------------------------------------------------------------
+SEC("uprobe/PR_Write")
+int nss_write_entry(struct pt_regs *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct write_args args = {};
+    args.ssl_ptr = (__u64)PT_REGS_PARM1(ctx);
+    args.buf     = (const void *)PT_REGS_PARM2(ctx);
+    args.len     = (__u32)PT_REGS_PARM3(ctx);
+    bpf_map_update_elem(&ssl_write_args, &pid_tgid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/PR_Write")
+int nss_write_exit(struct pt_regs *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct write_args *args = bpf_map_lookup_elem(&ssl_write_args, &pid_tgid);
+    int ret = (int)PT_REGS_RC(ctx);
+    if (!args) return 0;
+    if (ret > 0) emit_event(ctx, args->buf, (__u32)ret, 1, args->ssl_ptr);
+    bpf_map_delete_elem(&ssl_write_args, &pid_tgid);
+    return 0;
+}
+
+SEC("uprobe/PR_Read")
+int nss_read_entry(struct pt_regs *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct read_args args = {};
+    args.ssl_ptr = (__u64)PT_REGS_PARM1(ctx);
+    args.buf     = (const void *)PT_REGS_PARM2(ctx);
+    args.len     = (__u32)PT_REGS_PARM3(ctx);
+    bpf_map_update_elem(&ssl_read_args, &pid_tgid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/PR_Read")
+int nss_read_exit(struct pt_regs *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct read_args *args = bpf_map_lookup_elem(&ssl_read_args, &pid_tgid);
+    int ret = (int)PT_REGS_RC(ctx);
+    if (!args) return 0;
+    if (ret > 0) emit_event(ctx, args->buf, (__u32)ret, 0, args->ssl_ptr);
+    bpf_map_delete_elem(&ssl_read_args, &pid_tgid);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// kTLS: tls_sw_sendmsg / tls_sw_recvmsg (CONFIG_TLS=y required)
+// Captures plaintext before kernel-TLS encrypts (send) or after it decrypts
+// (recv), covering apps that call setsockopt(SO_TLS_TX/SO_TLS_RX).
+// ---------------------------------------------------------------------------
+
+struct ktls_args {
+    const void *iov_base;
+    __u32       iov_len;
+    __u64       sock_ptr;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);
+    __type(value, struct ktls_args);
+} ktls_sendmsg_args SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);
+    __type(value, struct ktls_args);
+} ktls_recvmsg_args SEC(".maps");
+
+static __always_inline void ktls_save_args(
+    struct sock *sk, struct msghdr *msg,
+    struct ktls_args *args)
+{
+    args->sock_ptr = (__u64)sk;
+    const struct iovec *iov = NULL;
+    bpf_core_read(&iov, sizeof(iov), &msg->msg_iter.iov);
+    if (iov) {
+        void *base = NULL;
+        size_t len = 0;
+        bpf_core_read(&base, sizeof(base), &iov->iov_base);
+        bpf_core_read(&len,  sizeof(len),  &iov->iov_len);
+        args->iov_base = base;
+        args->iov_len  = (__u32)len;
+    }
+    if (sk) {
+        struct conn_info info = {};
+        fill_conn_info(&info, sk);
+        __u64 pid_tgid = bpf_get_current_pid_tgid();
+        bpf_map_update_elem(&active_connections, &pid_tgid, &info, BPF_ANY);
+        __u64 sk_ptr = (__u64)sk;
+        bpf_map_update_elem(&sock_to_pid, &sk_ptr, &pid_tgid, BPF_ANY);
+    }
+}
+
+SEC("kprobe/tls_sw_sendmsg")
+int ktls_send_entry(struct pt_regs *ctx)
+{
+    struct sock *sk    = (struct sock *)PT_REGS_PARM1(ctx);
+    struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
+    struct ktls_args args = {};
+    ktls_save_args(sk, msg, &args);
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    bpf_map_update_elem(&ktls_sendmsg_args, &pid_tgid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("kretprobe/tls_sw_sendmsg")
+int ktls_send_exit(struct pt_regs *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct ktls_args *args = bpf_map_lookup_elem(&ktls_sendmsg_args, &pid_tgid);
+    if (!args) return 0;
+    int ret = (int)PT_REGS_RC(ctx);
+    if (ret > 0 && args->iov_base)
+        emit_event(ctx, args->iov_base, (__u32)ret, 1, args->sock_ptr);
+    bpf_map_delete_elem(&ktls_sendmsg_args, &pid_tgid);
+    return 0;
+}
+
+SEC("kprobe/tls_sw_recvmsg")
+int ktls_recv_entry(struct pt_regs *ctx)
+{
+    struct sock *sk    = (struct sock *)PT_REGS_PARM1(ctx);
+    struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
+    struct ktls_args args = {};
+    ktls_save_args(sk, msg, &args);
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    bpf_map_update_elem(&ktls_recvmsg_args, &pid_tgid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("kretprobe/tls_sw_recvmsg")
+int ktls_recv_exit(struct pt_regs *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct ktls_args *args = bpf_map_lookup_elem(&ktls_recvmsg_args, &pid_tgid);
+    if (!args) return 0;
+    int ret = (int)PT_REGS_RC(ctx);
+    if (ret > 0 && args->iov_base)
+        emit_event(ctx, args->iov_base, (__u32)ret, 0, args->sock_ptr);
+    bpf_map_delete_elem(&ktls_recvmsg_args, &pid_tgid);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// eBPF LSM: outbound IP block list (socket_connect)
+// Requires CONFIG_BPF_LSM=y and "bpf" in lsm= kernel parameter.
+// Userspace populates blocked_ips[] with CIDR entries and sets blocked_ips_count.
+// ---------------------------------------------------------------------------
+
+struct blocked_cidr {
+    __be32 ip;
+    __be32 mask;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 256);
+    __type(key, __u32);
+    __type(value, struct blocked_cidr);
+} blocked_ips SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} blocked_ips_count SEC(".maps");
+
+SEC("lsm/socket_connect")
+int BPF_PROG(lsm_socket_connect, struct socket *sock,
+             struct sockaddr *address, int addrlen)
+{
+    if (!address || addrlen < (int)sizeof(struct sockaddr_in))
+        return 0;
+
+    __u16 family = 0;
+    bpf_core_read(&family, sizeof(family), &address->sa_family);
+    if (family != AF_INET)
+        return 0;
+
+    __be32 dst_ip = 0;
+    bpf_core_read(&dst_ip, sizeof(dst_ip),
+                  &((struct sockaddr_in *)address)->sin_addr.s_addr);
+    if (!dst_ip) return 0;
+
+    __u32 key = 0;
+    __u32 *count = bpf_map_lookup_elem(&blocked_ips_count, &key);
+    __u32 n = (count && *count < 256) ? *count : 0;
+
+    for (__u32 i = 0; i < 256; i++) {
+        if (i >= n) break;
+        struct blocked_cidr *cidr = bpf_map_lookup_elem(&blocked_ips, &i);
+        if (cidr && cidr->mask &&
+            (dst_ip & cidr->mask) == (cidr->ip & cidr->mask))
+            return -EPERM;
+    }
+    return 0;
+}

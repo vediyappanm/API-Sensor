@@ -28,8 +28,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
 
-use crate::bpf::{attach_tls_uprobes, attach_kernel_probes, attach_quic_uprobes};
-use crate::boringssl::attach_boring_ssl_static;
+use crate::bpf::{attach_tls_uprobes, attach_kernel_probes, attach_quic_uprobes,
+                  attach_nss_uprobes, attach_ktls_kprobes, attach_lsm_hooks};
+use crate::boringssl::{attach_boring_ssl_static, attach_mbedtls_static, attach_wolfssl_static};
 use crate::container::{ContainerLookupRequest, ContainerResolver, fetch_container_metadata};
 use crate::dns::{DnsResolver, reverse_dns_lookup};
 use crate::go_tls::{attach_go_tls_probes, detect_go_binary, find_go_tls_offsets};
@@ -136,8 +137,18 @@ async fn main() -> Result<()> {
             tls_libs = discovered;
         }
     }
+    // Discover and attach NSS uprobes (libnss3) alongside TLS libs
+    let nss_libs: Vec<String> = tls_libs.iter()
+        .filter(|l| l.to_lowercase().contains("libnss") || l.to_lowercase().contains("nss3"))
+        .cloned()
+        .collect();
     attach_tls_uprobes(&mut obj, &args.tls_provider, args.pid, args.go_tls, &tls_libs, &mut links)?;
+    if !nss_libs.is_empty() {
+        attach_nss_uprobes(&mut obj, args.pid, &nss_libs, &mut links);
+    }
     attach_kernel_probes(&mut obj, &mut links)?;
+    attach_ktls_kprobes(&mut obj, &mut links);
+    attach_lsm_hooks(&mut obj, &mut links);
 
     // Initialize sampling_config — must happen before polling starts.
     // BPF arrays are zero-initialized; rate=0 means "filter everything".
@@ -192,6 +203,20 @@ async fn main() -> Result<()> {
                         if let Some(path) = line.split_whitespace().last() {
                             if path.starts_with('/') {
                                 attach_boring_ssl_static(&mut obj, path, args.pid, &mut links);
+                                attach_mbedtls_static(&mut obj, path, args.pid, &mut links);
+                                attach_wolfssl_static(&mut obj, path, args.pid, &mut links);
+                                // Warn if this is a known TLS-terminating sidecar — our uprobes
+                                // capture app-level plaintext but miss the outer TLS metadata.
+                                let basename = std::path::Path::new(path)
+                                    .file_name().and_then(|f| f.to_str()).unwrap_or("");
+                                if matches!(basename, "envoy" | "pilot-agent" | "linkerd2-proxy"
+                                            | "istio-proxy" | "nginx" | "haproxy") {
+                                    tracing::warn!(
+                                        binary = %path,
+                                        "sidecar/proxy detected: uprobes capture app-layer plaintext \
+                                         but outer TLS metadata (mTLS peer identity) is not captured"
+                                    );
+                                }
                             }
                         }
                     }
@@ -424,6 +449,15 @@ async fn main() -> Result<()> {
 
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// True if the BPF comm field belongs to a known TLS-terminating sidecar.
+/// Callers should emit a tracing::warn so operators know outer TLS metadata is missing.
+pub fn is_sidecar_comm(comm: &[u8; 16]) -> bool {
+    let s = comm.iter().take_while(|&&b| b != 0).copied().collect::<Vec<_>>();
+    let name = std::str::from_utf8(&s).unwrap_or("").trim_end_matches('\0');
+    matches!(name, "envoy" | "pilot-agent" | "linkerd2-proxy" | "istio-proxy"
+                 | "nginx" | "haproxy" | "traefik" | "caddy")
 }
 
 /// Returns (major, minor) from /proc/sys/kernel/osrelease (e.g. "6.8.0-110-generic" → (6, 8)).

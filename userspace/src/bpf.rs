@@ -39,7 +39,22 @@ pub fn attach_tls_uprobes(
             if try_attach(obj, "gnutls_recv_entry", lib, "gnutls_record_recv", false, pid, links) { attached += 1; }
             if try_attach(obj, "gnutls_recv_exit",  lib, "gnutls_record_recv", true,  pid, links) { attached += 1; }
         }
-        if provider == "auto" && !looks_openssl && !looks_gnutls {
+        let looks_mbedtls = lib_lower.contains("mbedtls");
+        let looks_wolfssl = lib_lower.contains("wolfssl");
+
+        if provider == "mbedtls" || (provider == "auto" && looks_mbedtls) {
+            if try_attach(obj, "ssl_write_entry", lib, "mbedtls_ssl_write", false, pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_write_exit",  lib, "mbedtls_ssl_write", true,  pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_read_entry",  lib, "mbedtls_ssl_read",  false, pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_read_exit",   lib, "mbedtls_ssl_read",  true,  pid, links) { attached += 1; }
+        }
+        if provider == "wolfssl" || (provider == "auto" && looks_wolfssl) {
+            if try_attach(obj, "ssl_write_entry", lib, "wolfSSL_write", false, pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_write_exit",  lib, "wolfSSL_write", true,  pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_read_entry",  lib, "wolfSSL_read",  false, pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_read_exit",   lib, "wolfSSL_read",  true,  pid, links) { attached += 1; }
+        }
+        if provider == "auto" && !looks_openssl && !looks_gnutls && !looks_mbedtls && !looks_wolfssl {
             if try_attach(obj, "ssl_write_entry", lib, "SSL_write", false, pid, links) { attached += 1; }
             if try_attach(obj, "ssl_write_exit",  lib, "SSL_write", true,  pid, links) { attached += 1; }
             if try_attach(obj, "ssl_read_entry",  lib, "SSL_read",  false, pid, links) { attached += 1; }
@@ -141,6 +156,59 @@ pub fn attach_quic_uprobes(
         tracing::info!(attached, "QUIC uprobes attached");
     }
     Ok(attached)
+}
+
+/// Attach NSS TLS uprobes (libnss3: PR_Read / PR_Write).
+pub fn attach_nss_uprobes(
+    obj: &mut libbpf_rs::Object,
+    pid: i32,
+    nss_libs: &[String],
+    links: &mut Vec<libbpf_rs::Link>,
+) -> usize {
+    let mut attached = 0;
+    for lib in nss_libs {
+        if try_attach(obj, "nss_write_entry", lib, "PR_Write", false, pid, links) { attached += 1; }
+        if try_attach(obj, "nss_write_exit",  lib, "PR_Write", true,  pid, links) { attached += 1; }
+        if try_attach(obj, "nss_read_entry",  lib, "PR_Read",  false, pid, links) { attached += 1; }
+        if try_attach(obj, "nss_read_exit",   lib, "PR_Read",  true,  pid, links) { attached += 1; }
+    }
+    if attached > 0 { tracing::info!(attached, "NSS uprobes attached"); }
+    attached
+}
+
+/// Attach kTLS kprobes (tls_sw_sendmsg / tls_sw_recvmsg). Requires CONFIG_TLS=y.
+/// Failures are logged at debug level — kTLS is optional.
+pub fn attach_ktls_kprobes(
+    obj: &mut libbpf_rs::Object,
+    links: &mut Vec<libbpf_rs::Link>,
+) -> usize {
+    let mut attached = 0;
+    for prog_name in ["ktls_send_entry", "ktls_send_exit", "ktls_recv_entry", "ktls_recv_exit"] {
+        if let Some(mut p) = obj.progs_mut().find(|p| p.name() == OsStr::new(prog_name)) {
+            match p.attach() {
+                Ok(link) => { links.push(link); attached += 1; }
+                Err(e)   => { tracing::debug!(prog = prog_name, error = %e, "kTLS kprobe skipped"); }
+            }
+        }
+    }
+    if attached > 0 { tracing::info!(attached, "kTLS kprobes attached"); }
+    attached
+}
+
+/// Attach eBPF LSM hook for outbound IP block list.
+/// Requires CONFIG_BPF_LSM=y and "bpf" in the kernel lsm= parameter.
+pub fn attach_lsm_hooks(
+    obj: &mut libbpf_rs::Object,
+    links: &mut Vec<libbpf_rs::Link>,
+) -> usize {
+    let mut attached = 0;
+    if let Some(mut p) = obj.progs_mut().find(|p| p.name() == OsStr::new("lsm_socket_connect")) {
+        match p.attach_lsm() {
+            Ok(link) => { links.push(link); attached += 1; tracing::info!("eBPF LSM hook attached (socket_connect)"); }
+            Err(e)   => { tracing::debug!(error = %e, "eBPF LSM skipped (CONFIG_BPF_LSM=y + bpf in lsm= required)"); }
+        }
+    }
+    attached
 }
 
 pub fn attach_symbol(
