@@ -15,7 +15,7 @@ path = "src/lib.rs"
 anyhow = "1"
 axum = "0.8"
 bytes = "1"
-capstone = "0.11"
+capstone = "0.14"
 clap = { version = "4", features = ["derive", "env"] }
 elf = "0.7"
 flate2 = "1.0"
