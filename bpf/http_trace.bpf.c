@@ -15,6 +15,9 @@ char LICENSE[] SEC("license") = "GPL";
 #ifndef AF_INET6
 #define AF_INET6 10
 #endif
+#ifndef EPERM
+#define EPERM 1
+#endif
 
 // Fixed header — layout must match types.rs:TlsEventHeader exactly.
 // Used as the dynptr-path event header (no trailing data[] array).
@@ -1178,7 +1181,7 @@ static __always_inline void ktls_save_args(
 {
     args->sock_ptr = (__u64)sk;
     const struct iovec *iov = NULL;
-    bpf_core_read(&iov, sizeof(iov), &msg->msg_iter.iov);
+    bpf_core_read(&iov, sizeof(iov), &msg->msg_iter.__iov); /* kernel ≥6.0 field name */
     if (iov) {
         void *base = NULL;
         size_t len = 0;
