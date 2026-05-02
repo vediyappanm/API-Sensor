@@ -151,6 +151,24 @@ async fn main() -> Result<()> {
         tracing::warn!("sampling_config map not found in BPF object");
     }
 
+    // Enable BPF dynptr path on kernel ≥5.19 (variable-length ring buffer slots).
+    {
+        let (maj, min) = kernel_version_maj_min();
+        if maj > 5 || (maj == 5 && min >= 19) {
+            if let Some(map) = obj.maps().find(|m| m.name() == OsStr::new("use_dynptr")) {
+                let key: u32 = 0;
+                let val: u32 = 1;
+                if let Err(e) = map.update(&key.to_ne_bytes(), &val.to_ne_bytes(), libbpf_rs::MapFlags::ANY) {
+                    tracing::warn!(error = %e, "failed to enable use_dynptr");
+                } else {
+                    tracing::info!(kernel_major = maj, kernel_minor = min, "BPF dynptr path enabled");
+                }
+            }
+        } else {
+            tracing::info!(kernel_major = maj, kernel_minor = min, "BPF dynptr path disabled (requires kernel ≥5.19)");
+        }
+    }
+
     // Go TLS probes
     if args.go_tls {
         tracing::info!(pid = args.pid, "Go TLS: scanning");
@@ -406,6 +424,18 @@ async fn main() -> Result<()> {
 
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Returns (major, minor) from /proc/sys/kernel/osrelease (e.g. "6.8.0-110-generic" → (6, 8)).
+fn kernel_version_maj_min() -> (u32, u32) {
+    let s = match fs::read_to_string("/proc/sys/kernel/osrelease") {
+        Ok(s) => s,
+        Err(_) => return (0, 0),
+    };
+    let mut parts = s.trim().split('.');
+    let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    (major, minor)
 }
 
 // ---------------------------------------------------------------------------

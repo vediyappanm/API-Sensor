@@ -16,14 +16,37 @@ char LICENSE[] SEC("license") = "GPL";
 #define AF_INET6 10
 #endif
 
+// Fixed header — layout must match types.rs:TlsEventHeader exactly.
+// Used as the dynptr-path event header (no trailing data[] array).
+struct tls_event_hdr {
+    __u64 ts_ns;
+    __u32 pid;
+    __u32 tid;
+    __u64 ssl_ptr;
+    __u32 data_len;
+    __u8  direction; // 0 = READ (ingress), 1 = WRITE (egress)
+    __u8  ip_family; // 4 = IPv4, 6 = IPv6, 0 = unknown
+    __u16 _pad16;
+    char  comm[16];
+    __u64 cgroup_id;
+    __u32 netns_ino;
+    __u16 src_port;
+    __u16 dst_port;
+    __u32 src_ip4;
+    __u32 dst_ip4;
+    __u8  src_ip6[16];
+    __u8  dst_ip6[16];
+};
+
+// Full fixed-size event (fallback for kernels < 5.19 without dynptr support).
 struct tls_event {
     __u64 ts_ns;
     __u32 pid;
     __u32 tid;
     __u64 ssl_ptr;
     __u32 data_len;
-    __u8 direction; // 0 = READ (ingress), 1 = WRITE (egress)
-    __u8 ip_family; // 4 = IPv4, 6 = IPv6, 0 = unknown
+    __u8 direction;
+    __u8 ip_family;
     __u16 _pad16;
     char comm[16];
     __u64 cgroup_id;
@@ -239,6 +262,22 @@ struct {
     __type(value, __u64);
 } event_counter SEC(".maps");
 
+// Per-CPU scratch buffer for dynptr payload writes (avoids BPF stack limit).
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, char[MAX_DATA]);
+} dynptr_scratch SEC(".maps");
+
+// Userspace sets this to 1 on kernel ≥5.19 to enable variable-length ring buffer slots.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} use_dynptr SEC(".maps");
+
 static __always_inline void fill_conn_info(struct conn_info *out, struct sock *sk)
 {
     __u16 family = 0;
@@ -312,8 +351,109 @@ static __always_inline bool should_sample_out(const char *data, __u32 len)
     return (n % 100) >= rate;
 }
 
+// Variable-length ring buffer event path (kernel ≥5.19).
+// Reserves only sizeof(tls_event_hdr) + actual payload bytes instead of 32 KB.
+static __always_inline int emit_event_dynptr(struct pt_regs *ctx, const void *buf, __u32 len, __u8 direction, __u64 ssl_ptr)
+{
+    struct bpf_dynptr dp;
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid = pid_tgid >> 32;
+    __u32 tid = (__u32)pid_tgid;
+    __u32 read_len = len;
+    if (read_len >= MAX_DATA) read_len = MAX_DATA - 1;
+
+    if (read_len > 0) {
+        char sample_hdr[64] = {};
+        __u32 sample_len = read_len < 64 ? read_len : 64;
+        bpf_probe_read_user(sample_hdr, sample_len, buf);
+        if (should_sample_out(sample_hdr, sample_len)) {
+            return 0;
+        }
+    }
+
+    __u32 total_size = ((__u32)sizeof(struct tls_event_hdr)) + read_len;
+    if (bpf_ringbuf_reserve_dynptr(&events, total_size, 0, &dp) < 0) {
+        return 0;
+    }
+
+    struct tls_event_hdr *hdr = bpf_dynptr_data(&dp, 0, sizeof(struct tls_event_hdr));
+    if (!hdr) {
+        bpf_ringbuf_discard_dynptr(&dp, 0);
+        return 0;
+    }
+
+    hdr->ts_ns = bpf_ktime_get_ns();
+    hdr->pid = pid;
+    hdr->tid = tid;
+    hdr->ssl_ptr = ssl_ptr;
+    hdr->data_len = read_len;
+    hdr->direction = direction;
+    hdr->ip_family = 0;
+    bpf_get_current_comm(&hdr->comm, sizeof(hdr->comm));
+    hdr->cgroup_id = bpf_get_current_cgroup_id();
+    hdr->netns_ino = 0;
+    hdr->src_port = 0;
+    hdr->dst_port = 0;
+    hdr->src_ip4 = 0;
+    hdr->dst_ip4 = 0;
+    __builtin_memset(hdr->src_ip6, 0, sizeof(hdr->src_ip6));
+    __builtin_memset(hdr->dst_ip6, 0, sizeof(hdr->dst_ip6));
+
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    struct nsproxy *nsproxy = NULL;
+    bpf_core_read(&nsproxy, sizeof(nsproxy), &task->nsproxy);
+    if (nsproxy) {
+        struct net *net_ns = NULL;
+        bpf_core_read(&net_ns, sizeof(net_ns), &nsproxy->net_ns);
+        if (net_ns) {
+            unsigned int ino = 0;
+            bpf_core_read(&ino, sizeof(ino), &net_ns->ns.inum);
+            hdr->netns_ino = ino;
+        }
+    }
+
+    struct conn_info *info = bpf_map_lookup_elem(&active_connections, &pid_tgid);
+    if (!info || (info->src_ip4 == 0 && info->dst_ip4 == 0
+                  && __builtin_memcmp(info->src_ip6, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16) == 0)) {
+        info = bpf_map_lookup_elem(&ssl_ptr_to_conn, &ssl_ptr);
+    }
+    if (info) {
+        hdr->src_port = info->src_port;
+        hdr->dst_port = info->dst_port;
+        if (info->family == AF_INET6) {
+            hdr->ip_family = 6;
+            __builtin_memcpy(hdr->src_ip6, info->src_ip6, sizeof(hdr->src_ip6));
+            __builtin_memcpy(hdr->dst_ip6, info->dst_ip6, sizeof(hdr->dst_ip6));
+        } else if (info->family == AF_INET) {
+            hdr->ip_family = 4;
+            hdr->src_ip4 = info->src_ip4;
+            hdr->dst_ip4 = info->dst_ip4;
+        }
+    }
+
+    if (read_len > 0) {
+        __u32 scratch_key = 0;
+        char *scratch = bpf_map_lookup_elem(&dynptr_scratch, &scratch_key);
+        if (!scratch) {
+            bpf_ringbuf_discard_dynptr(&dp, 0);
+            return 0;
+        }
+        bpf_probe_read_user(scratch, read_len & (MAX_DATA - 1), buf);
+        bpf_dynptr_write(&dp, sizeof(struct tls_event_hdr), scratch, read_len & (MAX_DATA - 1), 0);
+    }
+
+    bpf_ringbuf_submit_dynptr(&dp, 0);
+    return 0;
+}
+
 static __always_inline int emit_event(struct pt_regs *ctx, const void *buf, __u32 len, __u8 direction, __u64 ssl_ptr)
 {
+    __u32 dynptr_key = 0;
+    __u32 *dynptr_flag = bpf_map_lookup_elem(&use_dynptr, &dynptr_key);
+    if (dynptr_flag && *dynptr_flag) {
+        return emit_event_dynptr(ctx, buf, len, direction, ssl_ptr);
+    }
+
     struct tls_event *e;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
