@@ -21,7 +21,7 @@ elf = "0.7"
 flate2 = "1.0"
 http = "1"
 hpack = { package = "hpack-patched", version = "0.3" }
-indexmap = { version = "1.9.3", features = ["std"] }
+indexmap = { version = "2", features = ["std"] }
 libbpf-rs = "0.23"
 prost = "0.13"
 regex = "1"
