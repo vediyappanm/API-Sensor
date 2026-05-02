@@ -375,7 +375,11 @@ static __always_inline int emit_event_dynptr(struct pt_regs *ctx, const void *bu
     }
 
     __u32 total_size = ((__u32)sizeof(struct tls_event_hdr)) + read_len;
+    /* bpf_ringbuf_reserve_dynptr tracks a reference that the verifier requires
+     * to be released on ALL code paths, including the error path where reserve
+     * itself fails. Call discard unconditionally on the error branch. */
     if (bpf_ringbuf_reserve_dynptr(&events, total_size, 0, &dp) < 0) {
+        bpf_ringbuf_discard_dynptr(&dp, 0);
         return 0;
     }
 
@@ -1256,18 +1260,24 @@ int ktls_recv_exit(struct pt_regs *ctx)
 // Userspace populates blocked_ips[] with CIDR entries and sets blocked_ips_count.
 // ---------------------------------------------------------------------------
 
+// Maximum blocked CIDR entries — kept at 16 so the verifier can prove
+// loop termination via #pragma unroll (unrolled loops have no back-edge).
+#define MAX_BLOCKED_CIDRS 16
+
 struct blocked_cidr {
     __be32 ip;
     __be32 mask;
 };
 
+// ARRAY map — index 0..MAX_BLOCKED_CIDRS-1, each entry one CIDR rule.
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 256);
+    __uint(max_entries, MAX_BLOCKED_CIDRS);
     __type(key, __u32);
     __type(value, struct blocked_cidr);
 } blocked_ips SEC(".maps");
 
+// Single-entry ARRAY: blocked_ips_count[0] = number of active rules.
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -1292,13 +1302,13 @@ int BPF_PROG(lsm_socket_connect, struct socket *sock,
                   &((struct sockaddr_in *)address)->sin_addr.s_addr);
     if (!dst_ip) return 0;
 
-    __u32 key = 0;
-    __u32 *count = bpf_map_lookup_elem(&blocked_ips_count, &key);
-    __u32 n = (count && *count < 256) ? *count : 0;
-
-    for (__u32 i = 0; i < 256; i++) {
-        if (i >= n) break;
-        struct blocked_cidr *cidr = bpf_map_lookup_elem(&blocked_ips, &i);
+    // Scan all slots — entries with mask==0 are unused and never match.
+    // #pragma unroll produces a fixed sequence with no back-edges, which is
+    // what the BPF verifier requires to prove termination.
+#pragma unroll
+    for (__u32 i = 0; i < MAX_BLOCKED_CIDRS; i++) {
+        __u32 idx = i;
+        struct blocked_cidr *cidr = bpf_map_lookup_elem(&blocked_ips, &idx);
         if (cidr && cidr->mask &&
             (dst_ip & cidr->mask) == (cidr->ip & cidr->mask))
             return -EPERM;

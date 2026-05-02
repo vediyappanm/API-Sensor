@@ -14,6 +14,33 @@ use crate::types::ApiTrafficEvent;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+// Anchor: wall-clock ms at process start minus monotonic ms at process start.
+// Used to convert BPF ktime_get_ns (monotonic) to approximate wall-clock time.
+static WALL_MINUS_MONO_MS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+fn wall_mono_offset_ms() -> i64 {
+    *WALL_MINUS_MONO_MS.get_or_init(|| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let wall_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // /proc/uptime gives monotonic seconds since boot
+        let mono_ms = std::fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()))
+            .map(|up| (up * 1000.0) as i64)
+            .unwrap_or(0);
+        wall_ms - mono_ms
+    })
+}
+
+/// Convert BPF ktime_get_ns (nanoseconds since boot, monotonic) to wall-clock ms.
+fn bpf_ts_to_wall_ms(bpf_ns: u64) -> u64 {
+    let mono_ms = (bpf_ns / 1_000_000) as i64;
+    (mono_ms + wall_mono_offset_ms()).max(0) as u64
+}
+
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
@@ -84,8 +111,10 @@ fn event_to_value(ev: ApiTrafficEvent) -> Value {
     m.insert("LogVersion".into(), json!("v4"));
     m.insert("Id".into(), json!(make_event_id(ev.observed_at, ev.source_port.unwrap_or(0))));
 
-    // Session stats
-    m.insert("SessionStats.StartTime".into(), json!(format_iso8601(ev.observed_at)));
+    // SessionStats.StartTime: observed_at is BPF ktime_get_ns (monotonic ns since boot).
+    // Convert to wall-clock ms by anchoring to SystemTime at process start.
+    let wall_ms = bpf_ts_to_wall_ms(ev.observed_at);
+    m.insert("SessionStats.StartTime".into(), json!(format_iso8601(wall_ms)));
     m.insert("SessionStats.TimeToLastDownstreamTxByte".into(),
         json!(ev.response.latency_ms.unwrap_or(0)));
 
@@ -252,9 +281,10 @@ fn format_iso8601(ms: u64) -> String {
 /// Proleptic Gregorian calendar from Unix epoch seconds → (year, month, day, hour, min, sec).
 /// Algorithm from Howard Hinnant's chrono paper (public domain).
 fn unix_secs_to_dt(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
-    let h  = secs / 3600;
-    let mi = (secs % 3600) / 60;
-    let s  = secs % 60;
+    let time_of_day = secs % 86400;
+    let h  = time_of_day / 3600;
+    let mi = (time_of_day % 3600) / 60;
+    let s  = time_of_day % 60;
     let days = secs / 86400;
     let z   = days + 719_468;
     let era = z / 146_097;
