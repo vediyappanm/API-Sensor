@@ -77,21 +77,23 @@ impl ContainerResolver {
         }
         let now = Instant::now();
 
-        // Cache lookup — recover from mutex poisoning
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = cache.get_mut(&ev.cgroup_id) {
-            if now.duration_since(entry.last_seen) < self.ttl {
-                entry.last_seen = now;
-                return Some(entry.context.clone());
+        // Fast path: cache hit — lock held only for the lookup, no /proc I/O
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = cache.get_mut(&ev.cgroup_id) {
+                if now.duration_since(entry.last_seen) < self.ttl {
+                    entry.last_seen = now;
+                    return Some(entry.context.clone());
+                }
             }
-        }
+            // Evict stale entries if cache is too large
+            if cache.len() > MAX_CACHE_ENTRIES {
+                let ttl = self.ttl;
+                cache.retain(|_, entry| now.duration_since(entry.last_seen) < ttl);
+            }
+        } // cache lock dropped before /proc read
 
-        // Evict stale entries if cache is too large
-        if cache.len() > MAX_CACHE_ENTRIES {
-            let ttl = self.ttl;
-            cache.retain(|_, entry| now.duration_since(entry.last_seen) < ttl);
-        }
-
+        // /proc/<pid>/cgroup read happens outside all locks — no mutex chain contention
         let cgroup_info = parse_cgroup_info(ev.pid as i32);
         let container_short = cgroup_info
             .as_ref()
@@ -111,14 +113,17 @@ impl ContainerResolver {
             workload_type: None,
         };
 
-        cache.insert(
-            ev.cgroup_id,
-            ContainerCacheEntry {
-                context: context.clone(),
-                last_seen: now,
-            },
-        );
-        drop(cache); // release lock before channel send
+        // Re-acquire to insert; concurrent miss for same cgroup_id is benign (idempotent insert)
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.insert(
+                ev.cgroup_id,
+                ContainerCacheEntry {
+                    context: context.clone(),
+                    last_seen: now,
+                },
+            );
+        }
 
         if let Some(full_id) = container_id_full {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
