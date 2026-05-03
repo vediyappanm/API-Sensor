@@ -375,81 +375,86 @@ static __always_inline int emit_event_dynptr(struct pt_regs *ctx, const void *bu
     }
 
     __u32 total_size = ((__u32)sizeof(struct tls_event_hdr)) + read_len;
-    /* bpf_ringbuf_reserve_dynptr tracks a reference that the verifier requires
-     * to be released on ALL code paths, including the error path where reserve
-     * itself fails. Call discard unconditionally on the error branch. */
-    if (bpf_ringbuf_reserve_dynptr(&events, total_size, 0, &dp) < 0) {
-        bpf_ringbuf_discard_dynptr(&dp, 0);
-        return 0;
-    }
-
-    struct tls_event_hdr *hdr = bpf_dynptr_data(&dp, 0, sizeof(struct tls_event_hdr));
-    if (!hdr) {
-        bpf_ringbuf_discard_dynptr(&dp, 0);
-        return 0;
-    }
-
-    hdr->ts_ns = bpf_ktime_get_ns();
-    hdr->pid = pid;
-    hdr->tid = tid;
-    hdr->ssl_ptr = ssl_ptr;
-    hdr->data_len = read_len;
-    hdr->direction = direction;
-    hdr->ip_family = 0;
-    bpf_get_current_comm(&hdr->comm, sizeof(hdr->comm));
-    hdr->cgroup_id = bpf_get_current_cgroup_id();
-    hdr->netns_ino = 0;
-    hdr->src_port = 0;
-    hdr->dst_port = 0;
-    hdr->src_ip4 = 0;
-    hdr->dst_ip4 = 0;
-    __builtin_memset(hdr->src_ip6, 0, sizeof(hdr->src_ip6));
-    __builtin_memset(hdr->dst_ip6, 0, sizeof(hdr->dst_ip6));
-
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    struct nsproxy *nsproxy = NULL;
-    bpf_core_read(&nsproxy, sizeof(nsproxy), &task->nsproxy);
-    if (nsproxy) {
-        struct net *net_ns = NULL;
-        bpf_core_read(&net_ns, sizeof(net_ns), &nsproxy->net_ns);
-        if (net_ns) {
-            unsigned int ino = 0;
-            bpf_core_read(&ino, sizeof(ino), &net_ns->ns.inum);
-            hdr->netns_ino = ino;
-        }
-    }
-
-    struct conn_info *info = bpf_map_lookup_elem(&active_connections, &pid_tgid);
-    if (!info || (info->src_ip4 == 0 && info->dst_ip4 == 0
-                  && __builtin_memcmp(info->src_ip6, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16) == 0)) {
-        info = bpf_map_lookup_elem(&ssl_ptr_to_conn, &ssl_ptr);
-    }
-    if (info) {
-        hdr->src_port = info->src_port;
-        hdr->dst_port = info->dst_port;
-        if (info->family == AF_INET6) {
-            hdr->ip_family = 6;
-            __builtin_memcpy(hdr->src_ip6, info->src_ip6, sizeof(hdr->src_ip6));
-            __builtin_memcpy(hdr->dst_ip6, info->dst_ip6, sizeof(hdr->dst_ip6));
-        } else if (info->family == AF_INET) {
-            hdr->ip_family = 4;
-            hdr->src_ip4 = info->src_ip4;
-            hdr->dst_ip4 = info->dst_ip4;
-        }
-    }
-
-    if (read_len > 0) {
-        __u32 scratch_key = 0;
-        char *scratch = bpf_map_lookup_elem(&dynptr_scratch, &scratch_key);
-        if (!scratch) {
+    /* Invert the reserve check: branch into the SUCCESS block, let FAILURE fall
+     * through to the unconditional discard below.  When the condition is
+     * (reserve < 0), clang emits a direct jump to the caller's return/cleanup
+     * code, which bypasses the discard and causes the BPF verifier to complain
+     * "Unreleased reference" for the dynptr's ref_id.  By making SUCCESS the
+     * taken branch, the failure path is always the fall-through and the discard
+     * cannot be optimized away. */
+    if (bpf_ringbuf_reserve_dynptr(&events, total_size, 0, &dp) >= 0) {
+        struct tls_event_hdr *hdr = bpf_dynptr_data(&dp, 0, sizeof(struct tls_event_hdr));
+        if (!hdr) {
             bpf_ringbuf_discard_dynptr(&dp, 0);
             return 0;
         }
-        bpf_probe_read_user(scratch, read_len & (MAX_DATA - 1), buf);
-        bpf_dynptr_write(&dp, sizeof(struct tls_event_hdr), scratch, read_len & (MAX_DATA - 1), 0);
-    }
 
-    bpf_ringbuf_submit_dynptr(&dp, 0);
+        hdr->ts_ns = bpf_ktime_get_ns();
+        hdr->pid = pid;
+        hdr->tid = tid;
+        hdr->ssl_ptr = ssl_ptr;
+        hdr->data_len = read_len;
+        hdr->direction = direction;
+        hdr->ip_family = 0;
+        bpf_get_current_comm(&hdr->comm, sizeof(hdr->comm));
+        hdr->cgroup_id = bpf_get_current_cgroup_id();
+        hdr->netns_ino = 0;
+        hdr->src_port = 0;
+        hdr->dst_port = 0;
+        hdr->src_ip4 = 0;
+        hdr->dst_ip4 = 0;
+        __builtin_memset(hdr->src_ip6, 0, sizeof(hdr->src_ip6));
+        __builtin_memset(hdr->dst_ip6, 0, sizeof(hdr->dst_ip6));
+
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+        struct nsproxy *nsproxy = NULL;
+        bpf_core_read(&nsproxy, sizeof(nsproxy), &task->nsproxy);
+        if (nsproxy) {
+            struct net *net_ns = NULL;
+            bpf_core_read(&net_ns, sizeof(net_ns), &nsproxy->net_ns);
+            if (net_ns) {
+                unsigned int ino = 0;
+                bpf_core_read(&ino, sizeof(ino), &net_ns->ns.inum);
+                hdr->netns_ino = ino;
+            }
+        }
+
+        struct conn_info *info = bpf_map_lookup_elem(&active_connections, &pid_tgid);
+        if (!info || (info->src_ip4 == 0 && info->dst_ip4 == 0
+                      && __builtin_memcmp(info->src_ip6, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16) == 0)) {
+            info = bpf_map_lookup_elem(&ssl_ptr_to_conn, &ssl_ptr);
+        }
+        if (info) {
+            hdr->src_port = info->src_port;
+            hdr->dst_port = info->dst_port;
+            if (info->family == AF_INET6) {
+                hdr->ip_family = 6;
+                __builtin_memcpy(hdr->src_ip6, info->src_ip6, sizeof(hdr->src_ip6));
+                __builtin_memcpy(hdr->dst_ip6, info->dst_ip6, sizeof(hdr->dst_ip6));
+            } else if (info->family == AF_INET) {
+                hdr->ip_family = 4;
+                hdr->src_ip4 = info->src_ip4;
+                hdr->dst_ip4 = info->dst_ip4;
+            }
+        }
+
+        if (read_len > 0) {
+            __u32 scratch_key = 0;
+            char *scratch = bpf_map_lookup_elem(&dynptr_scratch, &scratch_key);
+            if (!scratch) {
+                bpf_ringbuf_discard_dynptr(&dp, 0);
+                return 0;
+            }
+            bpf_probe_read_user(scratch, read_len & (MAX_DATA - 1), buf);
+            bpf_dynptr_write(&dp, sizeof(struct tls_event_hdr), scratch, read_len & (MAX_DATA - 1), 0);
+        }
+
+        bpf_ringbuf_submit_dynptr(&dp, 0);
+        return 0;
+    }
+    /* Reserve failed — discard releases the verifier's reference tracking even
+     * though the dynptr holds no valid ring-buffer slot at runtime. */
+    bpf_ringbuf_discard_dynptr(&dp, 0);
     return 0;
 }
 

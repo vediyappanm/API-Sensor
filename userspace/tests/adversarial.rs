@@ -3,7 +3,7 @@ use api_sec_sensor::http2::{Http2HpackDecoder, parse_http2_frames, contains_http
 use api_sec_sensor::websocket::parse_websocket_frame;
 use api_sec_sensor::grpc::decode_grpc_fields;
 use api_sec_sensor::mcp::parse_sse_events;
-use api_sec_sensor::redaction::redact_pii;
+use api_sec_sensor::redaction::{redact_pii, init_pii_hash_key};
 
 // ---------------------------------------------------------------------------
 // HTTP/1.1 adversarial tests
@@ -215,6 +215,9 @@ fn redaction_extremely_long_input() {
 
 #[test]
 fn redaction_overlapping_patterns() {
+    // OnceLock: silently no-ops if already initialised by a prior test run.
+    unsafe { std::env::set_var("PII_HASH_KEY", "00".repeat(32)) };
+    let _ = init_pii_hash_key();
     // Email inside a JWT-like string
     let input = "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyQGV4YW1wbGUuY29tIn0.signature_here_abcdef";
     let output = redact_pii(input);
