@@ -52,26 +52,127 @@ pub fn attach_tls_uprobes(
     Ok(())
 }
 
+/// Attach the kernel-side connection-tracking probes (best-effort).
+///
+/// These kprobes/kretprobes hook stable, arch-agnostic kernel functions
+/// (`tcp_connect`, `inet_csk_accept`, `tcp_close`) and read the `struct sock`
+/// via CO-RE, so they are portable across kernels that expose BTF. They are,
+/// however, NON-ESSENTIAL: they only enrich events with the kernel-resolved
+/// source/dest IP 4-tuple. The core TLS capture runs entirely off the uprobes.
+///
+/// Therefore a failed attach must NOT abort the sensor. On a kernel where a
+/// symbol is missing, locked down, or otherwise unattachable, we log and keep
+/// running uprobe-only — TLS capture stays intact, only tuple enrichment is
+/// degraded. Returns the number of probes successfully attached.
 pub fn attach_kernel_probes(
     obj: &mut libbpf_rs::Object,
     links: &mut Vec<libbpf_rs::Link>,
-) -> Result<()> {
-    let tcp_connect = obj
-        .prog_mut("tcp_connect_entry")
-        .context("missing tcp_connect_entry program")?;
-    links.push(tcp_connect.attach().context("attach kprobe tcp_connect")?);
+) -> usize {
+    const PROBES: &[(&str, &str)] = &[
+        ("tcp_connect_entry", "kprobe/tcp_connect"),
+        ("tcp_accept_ret", "kretprobe/inet_csk_accept"),
+        ("tcp_close_entry", "kprobe/tcp_close"),
+    ];
 
-    let tcp_accept = obj
-        .prog_mut("tcp_accept_ret")
-        .context("missing tcp_accept_ret program")?;
-    links.push(tcp_accept.attach().context("attach kretprobe inet_csk_accept")?);
+    let mut attached = 0usize;
+    for &(prog_name, desc) in PROBES {
+        match obj.prog_mut(prog_name) {
+            Some(prog) => match prog.attach() {
+                Ok(link) => {
+                    links.push(link);
+                    attached += 1;
+                    tracing::debug!(probe = desc, "kernel probe attached");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        probe = desc,
+                        error = %e,
+                        "kernel probe attach failed; continuing without it \
+                         (connection-tuple enrichment degraded on this kernel)"
+                    );
+                }
+            },
+            None => {
+                tracing::warn!(
+                    probe = desc,
+                    program = prog_name,
+                    "kernel probe program not present in BPF object; skipping"
+                );
+            }
+        }
+    }
 
-    let tcp_close = obj
-        .prog_mut("tcp_close_entry")
-        .context("missing tcp_close_entry program")?;
-    links.push(tcp_close.attach().context("attach kprobe tcp_close")?);
+    if attached == 0 {
+        tracing::warn!(
+            "no kernel connection-tracking probes attached — running uprobe-only; \
+             TLS capture is intact but source/dest IP enrichment is limited"
+        );
+    } else {
+        tracing::info!(
+            attached,
+            total = PROBES.len(),
+            "kernel connection-tracking probes attached"
+        );
+    }
+    attached
+}
 
-    Ok(())
+/// Attach the plaintext-capture syscall tracepoints (best-effort, opt-in).
+///
+/// These hook the socket send/recv syscalls to capture non-TLS HTTP traffic
+/// (the BPF side content-sniffs for HTTP and resolves the fd to a socket, so
+/// only real plaintext HTTP is emitted). They are global syscall hooks, hence
+/// gated behind `--capture-plaintext`. Each attach is independent and a failure
+/// is non-fatal. Returns the number of tracepoints attached.
+pub fn attach_plaintext_probes(
+    obj: &mut libbpf_rs::Object,
+    links: &mut Vec<libbpf_rs::Link>,
+) -> usize {
+    const TPS: &[&str] = &[
+        "tp_sys_enter_write",
+        "tp_sys_enter_sendto",
+        "tp_sys_enter_read",
+        "tp_sys_enter_recvfrom",
+        "tp_sys_exit_read",
+        "tp_sys_exit_recvfrom",
+    ];
+
+    let mut attached = 0usize;
+    for prog_name in TPS {
+        match obj.prog_mut(prog_name) {
+            Some(prog) => match prog.attach() {
+                Ok(link) => {
+                    links.push(link);
+                    attached += 1;
+                    tracing::debug!(tracepoint = prog_name, "plaintext tracepoint attached");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        tracepoint = prog_name,
+                        error = %e,
+                        "plaintext tracepoint attach failed; continuing"
+                    );
+                }
+            },
+            None => {
+                tracing::warn!(
+                    tracepoint = prog_name,
+                    "plaintext tracepoint program not present in BPF object; skipping"
+                );
+            }
+        }
+    }
+
+    if attached > 0 {
+        tracing::info!(
+            attached,
+            total = TPS.len(),
+            "plaintext (non-TLS) capture enabled — hooking socket send/recv syscalls"
+        );
+    } else {
+        tracing::warn!("plaintext capture requested but no tracepoints attached");
+    }
+    attached
 }
 
 /// Attempt to attach a uprobe, logging success at debug and failure at warn.

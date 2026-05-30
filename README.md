@@ -48,7 +48,10 @@ A production-grade **eBPF-based TLS traffic capture sensor** for the API Sentine
 
 ## Requirements
 
-- Linux kernel **5.8+** (kernel 6.8+ recommended, tested on 6.8.0)
+- Linux kernel **5.8+** (kernel 6.8+ recommended, tested on 6.8.0). Runs across
+  the modern fleet (Ubuntu 20.04+, RHEL 9, Debian 11+, Amazon Linux 2022+, EKS/GKE/AKS)
+  via CO-RE — see [docs/PORTABILITY.md](docs/PORTABILITY.md) for the kernel support
+  matrix, graceful-degradation behavior, and the BTF-less (RHEL 7 / Ubuntu 18.04) path.
 - Root / `CAP_BPF`
 - `clang`, `llvm`, `libbpf-dev`
 - Rust stable (`cargo`)

@@ -19,6 +19,10 @@ use crate::websocket::{parse_websocket_frame, ws_opcode_name};
 const MAX_PENDING_PER_CONN: usize = 100;
 const MAX_H2_PENDING_STREAMS: usize = 200;
 
+/// High bit set by the BPF plaintext path on `ssl_ptr` to mark non-TLS events.
+/// Real userspace SSL pointers never use bit 63 (canonical addresses < 2^48).
+pub const PLAINTEXT_FLAG: u64 = 1u64 << 63;
+
 // ---------------------------------------------------------------------------
 // ShardedStreamState
 // ---------------------------------------------------------------------------
@@ -437,7 +441,8 @@ impl StreamState {
 
                     let latency_ms = ts_ms.saturating_sub(request.ts_ms);
                     let protocol = if is_mcp { "MCP" } else { "HTTP/1.1" };
-                    let mut event = build_event(self.account_id, ts_ms, request, resp, latency_ms, protocol, "ebpf");
+                    let source = if ev.ssl_ptr & PLAINTEXT_FLAG != 0 { "ebpf-plaintext" } else { "ebpf" };
+                    let mut event = build_event(self.account_id, ts_ms, request, resp, latency_ms, protocol, source);
                     if is_mcp {
                         if is_mcp_sse {
                             let mcp_events = parse_sse_events(payload);
@@ -523,7 +528,8 @@ impl StreamState {
                 } else { None };
 
                 let protocol = if is_grpc { "gRPC" } else { "HTTP/2" };
-                let mut event = build_event(self.account_id, ts_ms, request, resp, latency_ms, protocol, "ebpf");
+                let source = if ev.ssl_ptr & PLAINTEXT_FLAG != 0 { "ebpf-plaintext" } else { "ebpf" };
+                let mut event = build_event(self.account_id, ts_ms, request, resp, latency_ms, protocol, source);
                 if let Some(body) = grpc_body { event.response.body = Some(body); }
                 output.push(event);
             }
@@ -574,7 +580,8 @@ pub fn build_event(account_id: u64, ts_ms: u64, req: ParsedRequest, resp: HttpRe
         version: "v1".to_string(), event_type: "api_traffic".to_string(), source: source.to_string(), protocol: protocol.to_string(),
         account_id, observed_at: ts_ms,
         request: ApiRequest {
-            method: req.method, path, host: req.host, scheme: "https".to_string(),
+            method: req.method, path, host: req.host,
+            scheme: if source.starts_with("ebpf-plaintext") { "http".to_string() } else { "https".to_string() },
             headers: req.headers.into_iter().map(|(k,v)| (k, redact_pii(&v))).collect(),
             query, body: req.body.map(|b| redact_pii(&b)),
         },

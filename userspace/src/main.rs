@@ -15,6 +15,7 @@ mod bpf;
 mod dns;
 mod quic;
 mod config;
+mod compat;
 
 use anyhow::Result;
 use clap::Parser;
@@ -28,7 +29,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
 
-use crate::bpf::{attach_tls_uprobes, attach_kernel_probes, attach_quic_uprobes};
+use crate::bpf::{attach_tls_uprobes, attach_kernel_probes, attach_quic_uprobes, attach_plaintext_probes};
 use crate::boringssl::attach_boring_ssl_static;
 use crate::config::load_config;
 use crate::container::{ContainerLookupRequest, ContainerResolver, fetch_container_metadata};
@@ -129,6 +130,10 @@ struct Args {
     metrics_port: Option<u16>,
     #[arg(long)]
     go_tls: bool,
+    /// Capture plaintext (non-TLS) HTTP traffic via socket syscall hooks.
+    /// Off by default — adds system-wide syscall hooks; enable to cover plain HTTP.
+    #[arg(long)]
+    capture_plaintext: bool,
     #[arg(long)]
     sample_default: Option<u8>,
     #[arg(long)]
@@ -151,6 +156,7 @@ struct ResolvedConfig {
     max_total_buffer_bytes: usize,
     metrics_port: u16,
     go_tls: bool,
+    capture_plaintext: bool,
     sample_default: u8,
     sample_health: u8,
 }
@@ -202,6 +208,7 @@ fn resolve_config(args: Args) -> anyhow::Result<ResolvedConfig> {
         max_total_buffer_bytes: args.max_total_buffer_bytes.or(c.max_total_buffer_bytes).unwrap_or(104_857_600),
         metrics_port:         args.metrics_port.or(c.metrics_port).unwrap_or(9090),
         go_tls:               args.go_tls || c.go_tls.unwrap_or(false),
+        capture_plaintext:    args.capture_plaintext || c.capture_plaintext.unwrap_or(false),
         sample_default:       args.sample_default.or(c.sample_default).unwrap_or(100),
         sample_health:        args.sample_health.or(c.sample_health).unwrap_or(5),
     })
@@ -344,20 +351,16 @@ async fn main() -> Result<()> {
     let sample_default = args.sample_default.min(100);
     let sample_health = args.sample_health.min(100);
 
-    // Pre-flight validation: BPF filesystem write access
-    if !std::path::Path::new("/sys/fs/bpf").exists() {
-        anyhow::bail!("FATAL: /sys/fs/bpf not mounted — BPF maps unavailable. Kernel may lack BPF support.");
-    }
-    match std::fs::write("/sys/fs/bpf/.probe-writable-check", "test") {
-        Ok(_) => { let _ = std::fs::remove_file("/sys/fs/bpf/.probe-writable-check"); },
-        Err(e) => {
-            anyhow::bail!(
-                "FATAL: Cannot write to /sys/fs/bpf: {} — \
-                 Check kernel security policies (SELinux/AppArmor). \
-                 Enable CAP_BPF or run privileged.", e
-            );
-        }
-    }
+    // Pre-flight: BPF filesystem. A real bpffs accepts BPF pins but rejects
+    // regular-file writes — so we probe by statfs magic, not by writing a file.
+    // The sensor uses the ring buffer (no pinning), so this never aborts startup.
+    compat::check_bpf_fs();
+
+    // Kernel compatibility preflight — fail fast with an actionable message on
+    // unsupported kernels (< 5.8 or no BTF) instead of a cryptic libbpf error.
+    // Honors $BTF_CUSTOM_PATH for the BTF-less (RHEL 7 / Ubuntu 18.04) path.
+    let custom_btf = std::env::var("BTF_CUSTOM_PATH").ok();
+    let _kernel = compat::preflight(custom_btf.as_deref())?;
 
     tracing::info!(bpf = %args.bpf, ingest = %args.ingest, "starting sensor");
 
@@ -382,7 +385,14 @@ async fn main() -> Result<()> {
         tracing::warn!("Sensor will run but likely capture zero events");
     }
     attach_tls_uprobes(&mut obj, &args.tls_provider, args.pid, args.go_tls, &tls_libs, &mut links)?;
-    attach_kernel_probes(&mut obj, &mut links)?;
+    // Best-effort: failed kernel probes degrade enrichment but never abort the
+    // sensor — TLS capture runs entirely off the uprobes attached above.
+    let _kprobes = attach_kernel_probes(&mut obj, &mut links);
+
+    // Opt-in plaintext (non-TLS) HTTP capture via socket syscall tracepoints.
+    if args.capture_plaintext {
+        let _plain = attach_plaintext_probes(&mut obj, &mut links);
+    }
 
     // Initialize sampling_config — must happen before polling starts.
     if let Some(map) = obj.map_mut("sampling_config") {

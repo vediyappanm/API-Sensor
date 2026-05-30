@@ -9,12 +9,27 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
+# TARGETARCH is provided automatically by `docker buildx` (amd64 | arm64).
+ARG TARGETARCH=amd64
 COPY bpf/ bpf/
-RUN clang -O2 -g -target bpf \
-    -D__TARGET_ARCH_x86 \
-    -I/usr/include/x86_64-linux-gnu \
-    -c bpf/http_trace.bpf.c \
-    -o bpf/http_trace.bpf.o
+# Compile the BPF object from the committed, arch-specific vmlinux.h so the build
+# is reproducible from a clean checkout — independent of the build host's
+# /sys/kernel/btf/vmlinux. CO-RE relocates field offsets against the TARGET
+# kernel's BTF at load time, so the kernel that produced this header does not
+# constrain which kernels the object can run on.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      arm64) BPF_ARCH=arm64; MARCH=aarch64; INC=/usr/include/aarch64-linux-gnu ;; \
+      *)     BPF_ARCH=x86;   MARCH=x86_64;  INC=/usr/include/x86_64-linux-gnu  ;; \
+    esac; \
+    if [ ! -f "bpf/vmlinux.${MARCH}.h" ]; then \
+      echo "ERROR: bpf/vmlinux.${MARCH}.h is not committed. Generate it on a ${MARCH} node with:" >&2; \
+      echo "  bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.${MARCH}.h" >&2; \
+      exit 1; \
+    fi; \
+    cp "bpf/vmlinux.${MARCH}.h" bpf/vmlinux.h; \
+    clang -O2 -g -target bpf -D__TARGET_ARCH_${BPF_ARCH} -I"${INC}" \
+      -c bpf/http_trace.bpf.c -o bpf/http_trace.bpf.o
 
 # ---- Stage 2: Build Rust binary ----
 FROM rust:1.85-bookworm AS rust-builder

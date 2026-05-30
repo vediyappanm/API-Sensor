@@ -38,6 +38,10 @@ discover_libs = false
 # Enable Go crypto/tls interception
 go_tls = false
 
+# Capture plaintext (non-TLS) HTTP via socket syscall hooks.
+# Off by default — adds system-wide syscall tracepoints; enable to cover plain HTTP.
+capture_plaintext = false
+
 # Per-connection buffer size (bytes)
 max_buffer_bytes = 65536
 

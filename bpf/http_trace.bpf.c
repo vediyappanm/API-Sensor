@@ -339,7 +339,7 @@ static __always_inline bool should_sample_out(const char *data, __u32 len)
     return (n % 100) >= rate;
 }
 
-static __always_inline int emit_event(struct pt_regs *ctx, const void *buf, __u32 len, __u8 direction, __u64 ssl_ptr)
+static __always_inline int emit_event_inner(const void *buf, __u32 len, __u8 direction, __u64 ssl_ptr)
 {
     struct tls_event *e;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -426,6 +426,14 @@ static __always_inline int emit_event(struct pt_regs *ctx, const void *buf, __u3
         bpf_probe_read_user(e->data, read_len & (MAX_DATA - 1), buf);
     bpf_ringbuf_submit(e, 0);
     return 0;
+}
+
+/* Backwards-compatible wrapper: all uprobe handlers call emit_event(ctx, ...).
+ * The context is unused by the emit path, so it simply forwards. */
+static __always_inline int emit_event(struct pt_regs *ctx, const void *buf, __u32 len, __u8 direction, __u64 ssl_ptr)
+{
+    (void)ctx;
+    return emit_event_inner(buf, len, direction, ssl_ptr);
 }
 
 SEC("kprobe/tcp_connect")
@@ -1067,4 +1075,173 @@ int handle_new_process(struct trace_event_raw_sched_process_exec *ctx)
 
     bpf_ringbuf_submit(e, 0);
     return 0;
+}
+
+/* ====================================================================== *
+ * Plaintext (non-TLS) HTTP capture.
+ *
+ * TLS traffic is captured by the SSL_* uprobes above. Plaintext HTTP never
+ * touches a TLS library, so we capture it at the socket syscall layer:
+ *   - egress: sys_enter_write / sys_enter_sendto carry the bytes as a
+ *     userspace pointer (exactly like SSL_write), read at entry.
+ *   - ingress: sys_enter_read / sys_enter_recvfrom stash (fd, buf); the
+ *     matching exit provides the byte count, then we read the filled buffer.
+ *
+ * Every payload is content-sniffed for an HTTP signature before emit, so
+ * encrypted TLS bytes, binary protocols, and ordinary file/pipe I/O are
+ * dropped (this is what prevents double-capturing TLS and keeps volume low).
+ * The fd is resolved to a struct sock to (a) confirm it is a socket and
+ * (b) attach the real 4-tuple. These programs are only attached when the
+ * operator passes --capture-plaintext (zero overhead otherwise).
+ * ====================================================================== */
+
+#define PLAINTEXT_FLAG (1ULL << 63)
+
+struct plain_args {
+    __u64 buf;
+    __s32 fd;
+    __u32 _pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, __u64); /* pid_tgid */
+    __type(value, struct plain_args);
+} plain_read_args SEC(".maps");
+
+/* Resolve a file descriptor to its struct sock, or NULL if it is not a
+ * socket. Mirrors the walk in ssl_set_fd_entry (CO-RE, portable). */
+static __always_inline struct sock *plain_fd_to_sock(int fd)
+{
+    if (fd < 0 || fd >= 1024 * 1024)
+        return NULL;
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    struct files_struct *files = NULL;
+    bpf_core_read(&files, sizeof(files), &task->files);
+    if (!files) return NULL;
+    struct fdtable *fdt = NULL;
+    bpf_core_read(&fdt, sizeof(fdt), &files->fdt);
+    if (!fdt) return NULL;
+    struct file **fdarray = NULL;
+    bpf_core_read(&fdarray, sizeof(fdarray), &fdt->fd);
+    if (!fdarray) return NULL;
+    struct file *filep = NULL;
+    bpf_core_read(&filep, sizeof(filep), &fdarray[fd]);
+    if (!filep) return NULL;
+    void *private_data = NULL;
+    bpf_core_read(&private_data, sizeof(private_data), &filep->private_data);
+    if (!private_data) return NULL;
+    struct socket *sock = (struct socket *)private_data;
+    struct sock *sk = NULL;
+    bpf_core_read(&sk, sizeof(sk), &sock->sk);
+    return sk;
+}
+
+/* Cheap HTTP signature sniff over the first bytes of a payload. */
+static __always_inline bool looks_like_http(const char *d, __u32 n)
+{
+    if (n < 5) return false;
+    if (d[0] == 'G' && d[1] == 'E' && d[2] == 'T' && d[3] == ' ') return true;
+    if (d[0] == 'P' && d[1] == 'O' && d[2] == 'S' && d[3] == 'T') return true;
+    if (d[0] == 'P' && d[1] == 'U' && d[2] == 'T' && d[3] == ' ') return true;
+    if (d[0] == 'H' && d[1] == 'E' && d[2] == 'A' && d[3] == 'D') return true;
+    if (d[0] == 'D' && d[1] == 'E' && d[2] == 'L' && d[3] == 'E') return true; /* DELETE */
+    if (d[0] == 'O' && d[1] == 'P' && d[2] == 'T' && d[3] == 'I') return true; /* OPTIONS */
+    if (d[0] == 'P' && d[1] == 'A' && d[2] == 'T' && d[3] == 'C') return true; /* PATCH */
+    if (d[0] == 'C' && d[1] == 'O' && d[2] == 'N' && d[3] == 'N') return true; /* CONNECT */
+    if (d[0] == 'H' && d[1] == 'T' && d[2] == 'T' && d[3] == 'P' && d[4] == '/') return true; /* response */
+    return false;
+}
+
+/* Sniff, resolve the socket, attach the 4-tuple, and emit a plaintext event. */
+static __always_inline int plain_emit(int fd, const void *buf, __u32 len, __u8 direction)
+{
+    char hdr[32] = {};
+    __u32 slen = len < 16 ? len : 16;
+    bpf_probe_read_user(hdr, slen & 31, buf);
+    if (!looks_like_http(hdr, slen))
+        return 0;
+
+    struct sock *sk = plain_fd_to_sock(fd);
+    if (!sk)
+        return 0; /* not a socket (file/pipe) -> drop */
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct conn_info info = {};
+    fill_conn_info(&info, sk);
+    bpf_map_update_elem(&active_connections, &pid_tgid, &info, BPF_ANY);
+
+    /* Synthetic, per-(pid,fd) stream id, tagged so userspace can tell it apart
+     * from a real SSL pointer. Used only as an opaque key for stream tracking. */
+    __u64 ssl_ptr = PLAINTEXT_FLAG | (((__u64)(__u32)fd) << 32) | (__u32)(pid_tgid >> 32);
+    return emit_event_inner(buf, len, direction, ssl_ptr);
+}
+
+static __always_inline int plain_egress(int fd, const void *buf, __u64 count)
+{
+    if (should_skip_pid()) return 0;
+    if (fd < 0 || !buf || count < 5) return 0;
+    return plain_emit(fd, buf, (__u32)count, 1);
+}
+
+SEC("tracepoint/syscalls/sys_enter_write")
+int tp_sys_enter_write(struct trace_event_raw_sys_enter *ctx)
+{
+    return plain_egress((int)ctx->args[0], (const void *)ctx->args[1], (__u64)ctx->args[2]);
+}
+
+SEC("tracepoint/syscalls/sys_enter_sendto")
+int tp_sys_enter_sendto(struct trace_event_raw_sys_enter *ctx)
+{
+    return plain_egress((int)ctx->args[0], (const void *)ctx->args[1], (__u64)ctx->args[2]);
+}
+
+static __always_inline int plain_ingress_entry(int fd, const void *buf)
+{
+    if (should_skip_pid()) return 0;
+    if (fd < 0 || !buf) return 0;
+    struct plain_args a = {};
+    a.fd = fd;
+    a.buf = (__u64)buf;
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    bpf_map_update_elem(&plain_read_args, &pid_tgid, &a, BPF_ANY);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_read")
+int tp_sys_enter_read(struct trace_event_raw_sys_enter *ctx)
+{
+    return plain_ingress_entry((int)ctx->args[0], (const void *)ctx->args[1]);
+}
+
+SEC("tracepoint/syscalls/sys_enter_recvfrom")
+int tp_sys_enter_recvfrom(struct trace_event_raw_sys_enter *ctx)
+{
+    return plain_ingress_entry((int)ctx->args[0], (const void *)ctx->args[1]);
+}
+
+static __always_inline int plain_ingress_exit(long ret)
+{
+    if (should_skip_pid()) return 0;
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct plain_args *a = bpf_map_lookup_elem(&plain_read_args, &pid_tgid);
+    if (!a) return 0;
+    int fd = a->fd;
+    const void *buf = (const void *)a->buf;
+    bpf_map_delete_elem(&plain_read_args, &pid_tgid);
+    if (ret < 5) return 0;
+    return plain_emit(fd, buf, (__u32)ret, 0);
+}
+
+SEC("tracepoint/syscalls/sys_exit_read")
+int tp_sys_exit_read(struct trace_event_raw_sys_exit *ctx)
+{
+    return plain_ingress_exit(ctx->ret);
+}
+
+SEC("tracepoint/syscalls/sys_exit_recvfrom")
+int tp_sys_exit_recvfrom(struct trace_event_raw_sys_exit *ctx)
+{
+    return plain_ingress_exit(ctx->ret);
 }

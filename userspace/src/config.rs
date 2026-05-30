@@ -26,6 +26,7 @@ pub struct SensorSection {
     pub pid: Option<i32>,
     pub discover_libs: Option<bool>,
     pub go_tls: Option<bool>,
+    pub capture_plaintext: Option<bool>,
     pub max_buffer_bytes: Option<usize>,
     pub max_total_buffer_bytes: Option<usize>,
     pub metrics_port: Option<u16>,
