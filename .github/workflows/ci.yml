@@ -153,22 +153,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang llvm libbpf-dev linux-tools-common \
+            clang llvm libbpf-dev \
             pkg-config libssl-dev libelf-dev zlib1g-dev protobuf-compiler \
             curl openssl python3 \
             nginx-light gnutls-bin golang-go   # protocol drivers: HTTP/2, GnuTLS, Go crypto/tls
-
-      - name: Install bpftool
-        run: |
-          if ! command -v bpftool &>/dev/null; then
-            sudo apt-get install -y "linux-tools-$(uname -r)" 2>/dev/null \
-              || sudo apt-get install -y linux-tools-generic 2>/dev/null || true
-            if ! command -v bpftool &>/dev/null; then
-              BIN=$(find /usr/lib/linux-tools -name bpftool -type f 2>/dev/null | head -1)
-              [ -n "$BIN" ] && sudo ln -sf "$BIN" /usr/local/bin/bpftool || true
-            fi
-          fi
-          bpftool version
 
       - name: Require kernel BTF (CO-RE capture needs it)
         run: |
@@ -180,7 +168,10 @@ jobs:
 
       - name: Build BPF object
         run: |
-          bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
+          # Compile from the committed, arch-specific vmlinux.h — same as the
+          # Dockerfile (no bpftool needed). CO-RE relocates field offsets against
+          # the runner's live kernel BTF at load time (verified in the step above).
+          cp bpf/vmlinux.x86_64.h bpf/vmlinux.h
           clang -O2 -g -Wall -target bpf -D__TARGET_ARCH_x86 \
             -I/usr/include/x86_64-linux-gnu \
             -c bpf/http_trace.bpf.c -o bpf/http_trace.bpf.o
