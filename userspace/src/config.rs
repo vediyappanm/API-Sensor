@@ -102,7 +102,10 @@ ingest = "http://localhost:8080/events"
 batch_size = 100
 "#;
         let cfg: SensorConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.sensor.ingest.as_deref(), Some("http://localhost:8080/events"));
+        assert_eq!(
+            cfg.sensor.ingest.as_deref(),
+            Some("http://localhost:8080/events")
+        );
         assert_eq!(cfg.sensor.batch_size, Some(100));
         assert_eq!(cfg.sensor.bpf, None);
     }

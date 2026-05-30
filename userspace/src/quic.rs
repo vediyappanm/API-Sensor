@@ -51,7 +51,13 @@ pub fn parse_h3_frame(buf: &[u8]) -> Option<(H3Frame<'_>, usize)> {
         return None;
     }
     let payload = &buf[header_len..header_len + payload_len];
-    Some((H3Frame { frame_type, payload }, header_len + payload_len))
+    Some((
+        H3Frame {
+            frame_type,
+            payload,
+        },
+        header_len + payload_len,
+    ))
 }
 
 /// Parse all HTTP/3 frames from a buffer.
@@ -79,108 +85,114 @@ pub fn parse_h3_frames(buf: &[u8]) -> Vec<H3Frame<'_>> {
 
 /// (name, value) pairs — index 0..98
 static QPACK_STATIC_TABLE: &[(&str, &str)] = &[
-    (":authority", ""),                                           // 0
-    (":path", "/"),                                               // 1
-    ("age", "0"),                                                 // 2
-    ("content-disposition", ""),                                  // 3
-    ("content-length", "0"),                                      // 4
-    ("cookie", ""),                                               // 5
-    ("date", ""),                                                 // 6
-    ("etag", ""),                                                 // 7
-    ("if-modified-since", ""),                                    // 8
-    ("if-none-match", ""),                                        // 9
-    ("last-modified", ""),                                        // 10
-    ("link", ""),                                                 // 11
-    ("location", ""),                                             // 12
-    ("referer", ""),                                              // 13
-    ("set-cookie", ""),                                           // 14
-    (":method", "CONNECT"),                                       // 15
-    (":method", "DELETE"),                                        // 16
-    (":method", "GET"),                                           // 17
-    (":method", "HEAD"),                                          // 18
-    (":method", "OPTIONS"),                                       // 19
-    (":method", "POST"),                                          // 20
-    (":method", "PUT"),                                           // 21
-    (":scheme", "http"),                                          // 22
-    (":scheme", "https"),                                         // 23
-    (":status", "103"),                                           // 24
-    (":status", "200"),                                           // 25
-    (":status", "304"),                                           // 26
-    (":status", "404"),                                           // 27
-    (":status", "503"),                                           // 28
-    ("accept", "*/*"),                                            // 29
-    ("accept", "application/dns-message"),                        // 30
-    ("accept-encoding", "gzip, deflate, br"),                     // 31
-    ("accept-ranges", "bytes"),                                   // 32
-    ("access-control-allow-headers", "cache-control"),            // 33
-    ("access-control-allow-headers", "content-type"),             // 34
-    ("access-control-allow-origin", "*"),                         // 35
-    ("cache-control", "max-age=0"),                               // 36
-    ("cache-control", "max-age=2592000"),                         // 37
-    ("cache-control", "max-age=604800"),                          // 38
-    ("cache-control", "no-cache"),                                // 39
-    ("cache-control", "no-store"),                                // 40
-    ("cache-control", "public, max-age=31536000"),                // 41
-    ("content-encoding", "br"),                                   // 42
-    ("content-encoding", "gzip"),                                 // 43
-    ("content-type", "application/dns-message"),                  // 44
-    ("content-type", "application/javascript"),                   // 45
-    ("content-type", "application/json"),                         // 46
-    ("content-type", "application/x-www-form-urlencoded"),        // 47
-    ("content-type", "image/gif"),                                // 48
-    ("content-type", "image/jpeg"),                               // 49
-    ("content-type", "image/png"),                                // 50
-    ("content-type", "text/css"),                                 // 51
-    ("content-type", "text/html; charset=utf-8"),                 // 52
-    ("content-type", "text/plain"),                               // 53
-    ("content-type", "text/plain;charset=utf-8"),                 // 54
-    ("range", "bytes=0-"),                                        // 55
-    ("strict-transport-security", "max-age=31536000"),            // 56
-    ("strict-transport-security",
-     "max-age=31536000; includesubdomains"),                      // 57
-    ("strict-transport-security",
-     "max-age=31536000; includesubdomains; preload"),             // 58
-    ("vary", "accept-encoding"),                                  // 59
-    ("vary", "origin"),                                           // 60
-    ("x-content-type-options", "nosniff"),                        // 61
-    ("x-xss-protection", "1; mode=block"),                        // 62
-    (":status", "100"),                                           // 63
-    (":status", "204"),                                           // 64
-    (":status", "206"),                                           // 65
-    (":status", "302"),                                           // 66
-    (":status", "400"),                                           // 67
-    (":status", "403"),                                           // 68
-    (":status", "421"),                                           // 69
-    (":status", "425"),                                           // 70
-    (":status", "500"),                                           // 71
-    ("accept-language", ""),                                      // 72
-    ("access-control-allow-credentials", "FALSE"),                // 73
-    ("access-control-allow-credentials", "TRUE"),                 // 74
-    ("access-control-allow-headers", "*"),                        // 75
-    ("access-control-allow-methods", "get"),                      // 76
-    ("access-control-allow-methods", "get, post, options"),       // 77
-    ("access-control-allow-methods", "options"),                  // 78
-    ("access-control-expose-headers", "content-length"),          // 79
-    ("access-control-request-headers", "content-type"),           // 80
-    ("access-control-request-method", "get"),                     // 81
-    ("access-control-request-method", "post"),                    // 82
-    ("alt-svc", "clear"),                                         // 83
-    ("authorization", ""),                                        // 84
-    ("content-security-policy",
-     "script-src 'none'; object-src 'none'; base-uri 'none'"),   // 85
-    ("early-data", "1"),                                          // 86
-    ("expect-ct", ""),                                            // 87
-    ("forwarded", ""),                                            // 88
-    ("if-range", ""),                                             // 89
-    ("origin", ""),                                               // 90
-    ("purpose", "prefetch"),                                      // 91
-    ("server", ""),                                               // 92
-    ("timing-allow-origin", "*"),                                 // 93
-    ("upgrade-insecure-requests", "1"),                           // 94
-    ("user-agent", ""),                                           // 95
-    ("x-forwarded-for", ""),                                      // 96
-    ("x-frame-options", "deny"),                                  // 97
-    ("x-frame-options", "sameorigin"),                            // 98
+    (":authority", ""),                                    // 0
+    (":path", "/"),                                        // 1
+    ("age", "0"),                                          // 2
+    ("content-disposition", ""),                           // 3
+    ("content-length", "0"),                               // 4
+    ("cookie", ""),                                        // 5
+    ("date", ""),                                          // 6
+    ("etag", ""),                                          // 7
+    ("if-modified-since", ""),                             // 8
+    ("if-none-match", ""),                                 // 9
+    ("last-modified", ""),                                 // 10
+    ("link", ""),                                          // 11
+    ("location", ""),                                      // 12
+    ("referer", ""),                                       // 13
+    ("set-cookie", ""),                                    // 14
+    (":method", "CONNECT"),                                // 15
+    (":method", "DELETE"),                                 // 16
+    (":method", "GET"),                                    // 17
+    (":method", "HEAD"),                                   // 18
+    (":method", "OPTIONS"),                                // 19
+    (":method", "POST"),                                   // 20
+    (":method", "PUT"),                                    // 21
+    (":scheme", "http"),                                   // 22
+    (":scheme", "https"),                                  // 23
+    (":status", "103"),                                    // 24
+    (":status", "200"),                                    // 25
+    (":status", "304"),                                    // 26
+    (":status", "404"),                                    // 27
+    (":status", "503"),                                    // 28
+    ("accept", "*/*"),                                     // 29
+    ("accept", "application/dns-message"),                 // 30
+    ("accept-encoding", "gzip, deflate, br"),              // 31
+    ("accept-ranges", "bytes"),                            // 32
+    ("access-control-allow-headers", "cache-control"),     // 33
+    ("access-control-allow-headers", "content-type"),      // 34
+    ("access-control-allow-origin", "*"),                  // 35
+    ("cache-control", "max-age=0"),                        // 36
+    ("cache-control", "max-age=2592000"),                  // 37
+    ("cache-control", "max-age=604800"),                   // 38
+    ("cache-control", "no-cache"),                         // 39
+    ("cache-control", "no-store"),                         // 40
+    ("cache-control", "public, max-age=31536000"),         // 41
+    ("content-encoding", "br"),                            // 42
+    ("content-encoding", "gzip"),                          // 43
+    ("content-type", "application/dns-message"),           // 44
+    ("content-type", "application/javascript"),            // 45
+    ("content-type", "application/json"),                  // 46
+    ("content-type", "application/x-www-form-urlencoded"), // 47
+    ("content-type", "image/gif"),                         // 48
+    ("content-type", "image/jpeg"),                        // 49
+    ("content-type", "image/png"),                         // 50
+    ("content-type", "text/css"),                          // 51
+    ("content-type", "text/html; charset=utf-8"),          // 52
+    ("content-type", "text/plain"),                        // 53
+    ("content-type", "text/plain;charset=utf-8"),          // 54
+    ("range", "bytes=0-"),                                 // 55
+    ("strict-transport-security", "max-age=31536000"),     // 56
+    (
+        "strict-transport-security",
+        "max-age=31536000; includesubdomains",
+    ), // 57
+    (
+        "strict-transport-security",
+        "max-age=31536000; includesubdomains; preload",
+    ), // 58
+    ("vary", "accept-encoding"),                           // 59
+    ("vary", "origin"),                                    // 60
+    ("x-content-type-options", "nosniff"),                 // 61
+    ("x-xss-protection", "1; mode=block"),                 // 62
+    (":status", "100"),                                    // 63
+    (":status", "204"),                                    // 64
+    (":status", "206"),                                    // 65
+    (":status", "302"),                                    // 66
+    (":status", "400"),                                    // 67
+    (":status", "403"),                                    // 68
+    (":status", "421"),                                    // 69
+    (":status", "425"),                                    // 70
+    (":status", "500"),                                    // 71
+    ("accept-language", ""),                               // 72
+    ("access-control-allow-credentials", "FALSE"),         // 73
+    ("access-control-allow-credentials", "TRUE"),          // 74
+    ("access-control-allow-headers", "*"),                 // 75
+    ("access-control-allow-methods", "get"),               // 76
+    ("access-control-allow-methods", "get, post, options"), // 77
+    ("access-control-allow-methods", "options"),           // 78
+    ("access-control-expose-headers", "content-length"),   // 79
+    ("access-control-request-headers", "content-type"),    // 80
+    ("access-control-request-method", "get"),              // 81
+    ("access-control-request-method", "post"),             // 82
+    ("alt-svc", "clear"),                                  // 83
+    ("authorization", ""),                                 // 84
+    (
+        "content-security-policy",
+        "script-src 'none'; object-src 'none'; base-uri 'none'",
+    ), // 85
+    ("early-data", "1"),                                   // 86
+    ("expect-ct", ""),                                     // 87
+    ("forwarded", ""),                                     // 88
+    ("if-range", ""),                                      // 89
+    ("origin", ""),                                        // 90
+    ("purpose", "prefetch"),                               // 91
+    ("server", ""),                                        // 92
+    ("timing-allow-origin", "*"),                          // 93
+    ("upgrade-insecure-requests", "1"),                    // 94
+    ("user-agent", ""),                                    // 95
+    ("x-forwarded-for", ""),                               // 96
+    ("x-frame-options", "deny"),                           // 97
+    ("x-frame-options", "sameorigin"),                     // 98
 ];
 
 // ---------------------------------------------------------------------------
@@ -276,7 +288,11 @@ fn decode_prefix_int(buf: &[u8], prefix_bits: u8) -> Option<(u64, usize)> {
     if buf.is_empty() || prefix_bits == 0 || prefix_bits > 8 {
         return None;
     }
-    let mask: u8 = if prefix_bits == 8 { 0xff } else { (1u8 << prefix_bits) - 1 };
+    let mask: u8 = if prefix_bits == 8 {
+        0xff
+    } else {
+        (1u8 << prefix_bits) - 1
+    };
     let mut val = (buf[0] & mask) as u64;
     if val < mask as u64 {
         return Some((val, 1));
@@ -307,39 +323,134 @@ fn decode_huffman(data: &[u8]) -> Option<String> {
     // Covers symbols 0–127 and the printable ASCII range used in HTTP headers.
     // Symbols 128–255 are rare in HTTP headers and omitted for size.
     static HUFFMAN_TABLE: &[(u32, u8)] = &[
-        (0x1ff8, 13), (0x7fffd8, 23), (0xfffffe2, 28), (0xfffffe3, 28),
-        (0xfffffe4, 28), (0xfffffe5, 28), (0xfffffe6, 28), (0xfffffe7, 28),
-        (0xfffffe8, 28), (0xffffea, 24), (0x3ffffffc, 30), (0xfffffe9, 28),
-        (0xfffffea, 28), (0x3ffffffd, 30), (0xfffffeb, 28), (0xfffffec, 28),
-        (0xfffffed, 28), (0xfffffee, 28), (0xfffffef, 28), (0xffffff0, 28),
-        (0xffffff1, 28), (0xffffff2, 28), (0x3ffffffe, 30), (0xffffff3, 28),
-        (0xffffff4, 28), (0xffffff5, 28), (0xffffff6, 28), (0xffffff7, 28),
-        (0xffffff8, 28), (0xffffff9, 28), (0xffffffa, 28), (0xffffffb, 28),
+        (0x1ff8, 13),
+        (0x7fffd8, 23),
+        (0xfffffe2, 28),
+        (0xfffffe3, 28),
+        (0xfffffe4, 28),
+        (0xfffffe5, 28),
+        (0xfffffe6, 28),
+        (0xfffffe7, 28),
+        (0xfffffe8, 28),
+        (0xffffea, 24),
+        (0x3ffffffc, 30),
+        (0xfffffe9, 28),
+        (0xfffffea, 28),
+        (0x3ffffffd, 30),
+        (0xfffffeb, 28),
+        (0xfffffec, 28),
+        (0xfffffed, 28),
+        (0xfffffee, 28),
+        (0xfffffef, 28),
+        (0xffffff0, 28),
+        (0xffffff1, 28),
+        (0xffffff2, 28),
+        (0x3ffffffe, 30),
+        (0xffffff3, 28),
+        (0xffffff4, 28),
+        (0xffffff5, 28),
+        (0xffffff6, 28),
+        (0xffffff7, 28),
+        (0xffffff8, 28),
+        (0xffffff9, 28),
+        (0xffffffa, 28),
+        (0xffffffb, 28),
         (0x14, 6), // ' ' (32)
-        (0x3f8, 10), (0x3f9, 10), (0xffa, 12), (0x1ff9, 13),
-        (0x15, 6), (0xf8, 8), (0x7fa, 11), (0x3fa, 10),
-        (0x3fb, 10), (0xf9, 8), (0x7fb, 11), (0xfa, 8),
-        (0x16, 6), (0x17, 6), (0x18, 6), (0x0, 5),
-        (0x1, 5), (0x2, 5), (0x19, 6), (0x1a, 6),
-        (0x1b, 6), (0x1c, 6), (0x1d, 6), (0x1e, 6),
-        (0x1f, 6), (0x5c, 7), (0xfb, 8), (0x7ffc, 15),
-        (0x20, 6), (0xffb, 12), (0x3fc, 10), (0x1ffa, 13),
-        (0x21, 6), (0x5d, 7), (0x5e, 7), (0x5f, 7),
-        (0x60, 7), (0x61, 7), (0x62, 7), (0x63, 7),
-        (0x64, 7), (0x65, 7), (0x66, 7), (0x67, 7),
-        (0x68, 7), (0x69, 7), (0x6a, 7), (0x6b, 7),
-        (0x6c, 7), (0x6d, 7), (0x6e, 7), (0x6f, 7),
-        (0x70, 7), (0x71, 7), (0x72, 7), (0xfc, 8),
-        (0x73, 7), (0xfd, 8), (0x1ffb, 13), (0x7fff0, 19),
-        (0x1ffc, 13), (0x3ffc, 14), (0x22, 6), (0x7ffd, 15),
-        (0x3, 5), (0x23, 6), (0x4, 5), (0x24, 6),
-        (0x5, 5), (0x25, 6), (0x26, 6), (0x27, 6),
-        (0x6, 5), (0x74, 7), (0x75, 7), (0x28, 6),
-        (0x29, 6), (0x2a, 6), (0x7, 5), (0x2b, 6),
-        (0x76, 7), (0x2c, 6), (0x8, 5), (0x9, 5),
-        (0x2d, 6), (0x77, 7), (0x78, 7), (0x79, 7),
-        (0x7a, 7), (0x7b, 7), (0x7fffe, 19), (0x7fc, 11),
-        (0x3ffd, 14), (0x1ffd, 13), (0xffffffc, 28),
+        (0x3f8, 10),
+        (0x3f9, 10),
+        (0xffa, 12),
+        (0x1ff9, 13),
+        (0x15, 6),
+        (0xf8, 8),
+        (0x7fa, 11),
+        (0x3fa, 10),
+        (0x3fb, 10),
+        (0xf9, 8),
+        (0x7fb, 11),
+        (0xfa, 8),
+        (0x16, 6),
+        (0x17, 6),
+        (0x18, 6),
+        (0x0, 5),
+        (0x1, 5),
+        (0x2, 5),
+        (0x19, 6),
+        (0x1a, 6),
+        (0x1b, 6),
+        (0x1c, 6),
+        (0x1d, 6),
+        (0x1e, 6),
+        (0x1f, 6),
+        (0x5c, 7),
+        (0xfb, 8),
+        (0x7ffc, 15),
+        (0x20, 6),
+        (0xffb, 12),
+        (0x3fc, 10),
+        (0x1ffa, 13),
+        (0x21, 6),
+        (0x5d, 7),
+        (0x5e, 7),
+        (0x5f, 7),
+        (0x60, 7),
+        (0x61, 7),
+        (0x62, 7),
+        (0x63, 7),
+        (0x64, 7),
+        (0x65, 7),
+        (0x66, 7),
+        (0x67, 7),
+        (0x68, 7),
+        (0x69, 7),
+        (0x6a, 7),
+        (0x6b, 7),
+        (0x6c, 7),
+        (0x6d, 7),
+        (0x6e, 7),
+        (0x6f, 7),
+        (0x70, 7),
+        (0x71, 7),
+        (0x72, 7),
+        (0xfc, 8),
+        (0x73, 7),
+        (0xfd, 8),
+        (0x1ffb, 13),
+        (0x7fff0, 19),
+        (0x1ffc, 13),
+        (0x3ffc, 14),
+        (0x22, 6),
+        (0x7ffd, 15),
+        (0x3, 5),
+        (0x23, 6),
+        (0x4, 5),
+        (0x24, 6),
+        (0x5, 5),
+        (0x25, 6),
+        (0x26, 6),
+        (0x27, 6),
+        (0x6, 5),
+        (0x74, 7),
+        (0x75, 7),
+        (0x28, 6),
+        (0x29, 6),
+        (0x2a, 6),
+        (0x7, 5),
+        (0x2b, 6),
+        (0x76, 7),
+        (0x2c, 6),
+        (0x8, 5),
+        (0x9, 5),
+        (0x2d, 6),
+        (0x77, 7),
+        (0x78, 7),
+        (0x79, 7),
+        (0x7a, 7),
+        (0x7b, 7),
+        (0x7fffe, 19),
+        (0x7fc, 11),
+        (0x3ffd, 14),
+        (0x1ffd, 13),
+        (0xffffffc, 28),
     ];
 
     let mut result = Vec::new();
@@ -353,7 +464,9 @@ fn decode_huffman(data: &[u8]) -> Option<String> {
         while bits_left >= 5 {
             let mut found = false;
             for (sym, &(code, len)) in HUFFMAN_TABLE.iter().enumerate() {
-                if len > bits_left { continue; }
+                if len > bits_left {
+                    continue;
+                }
                 let shift = bits_left - len;
                 let mask = (1u32 << len) - 1;
                 if (bits >> shift) & mask == code {
@@ -366,7 +479,9 @@ fn decode_huffman(data: &[u8]) -> Option<String> {
                     break;
                 }
             }
-            if !found { break; }
+            if !found {
+                break;
+            }
         }
     }
 
@@ -410,8 +525,7 @@ pub fn looks_like_http3(buf: &[u8]) -> bool {
         if let Some((payload_len, _)) = decode_varint(&buf[t_len..]) {
             let valid_type = matches!(
                 frame_type,
-                H3_DATA | H3_HEADERS | H3_SETTINGS | H3_GOAWAY |
-                H3_CANCEL_PUSH | H3_PUSH_PROMISE
+                H3_DATA | H3_HEADERS | H3_SETTINGS | H3_GOAWAY | H3_CANCEL_PUSH | H3_PUSH_PROMISE
             );
             let reasonable_len = payload_len < 1_000_000;
             return valid_type && reasonable_len;
@@ -446,12 +560,16 @@ pub fn discover_quic_libs(pid: i32) -> Vec<String> {
     } else {
         crate::http::enumerate_pids()
     };
-    if pids.is_empty() { return Vec::new(); }
+    if pids.is_empty() {
+        return Vec::new();
+    }
 
     let mut libs = std::collections::HashMap::<String, bool>::new();
     for p in &pids {
         let maps_path = format!("/proc/{}/maps", p);
-        let Ok(contents) = std::fs::read_to_string(&maps_path) else { continue };
+        let Ok(contents) = std::fs::read_to_string(&maps_path) else {
+            continue;
+        };
         for line in contents.lines() {
             if let Some(path) = line.split_whitespace().nth(5) {
                 if path.contains("libquiche")
@@ -460,9 +578,11 @@ pub fn discover_quic_libs(pid: i32) -> Vec<String> {
                     || path.contains("liblsquic")
                 {
                     let host_path = crate::types::proc_root_path(*p, path);
-                    if !libs.contains_key(&host_path) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        libs.entry(host_path.clone())
+                    {
                         tracing::debug!(original = %path, resolved = %host_path, pid = p, "QUIC lib discovered");
-                        libs.insert(host_path, true);
+                        e.insert(true);
                     }
                 }
             }
@@ -612,7 +732,9 @@ mod tests {
     #[test]
     fn test_huffman_decode_basic() {
         // "www.example.com" Huffman-encoded (from RFC 7541 example)
-        let encoded = [0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff];
+        let encoded = [
+            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ];
         let decoded = super::decode_huffman(&encoded);
         assert_eq!(decoded, Some("www.example.com".to_string()));
     }

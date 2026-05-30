@@ -9,6 +9,8 @@ use tower::service_fn;
 
 use crate::types::{ContainerContext, TlsEventHeader};
 
+// Generated CRI protobuf code; its enum variants share a prefix by design.
+#[allow(clippy::enum_variant_names)]
 mod cri {
     tonic::include_proto!("runtime.v1");
 }
@@ -117,13 +119,16 @@ impl ContainerResolver {
 
         if let Some(full_id) = container_id_full {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            if !pending.contains(&ev.cgroup_id) {
-                if self.lookup_tx.try_send(ContainerLookupRequest {
-                    cgroup_id: ev.cgroup_id,
-                    container_id_full: full_id,
-                }).is_ok() {
-                    pending.insert(ev.cgroup_id);
-                }
+            if !pending.contains(&ev.cgroup_id)
+                && self
+                    .lookup_tx
+                    .try_send(ContainerLookupRequest {
+                        cgroup_id: ev.cgroup_id,
+                        container_id_full: full_id,
+                    })
+                    .is_ok()
+            {
+                pending.insert(ev.cgroup_id);
             }
         }
 
@@ -208,7 +213,11 @@ fn parse_cgroup_v1(path: &str) -> Option<CgroupInfo> {
         }
     }
     let container_id_short = container_id_full.as_ref().map(|id| short_id(id));
-    Some(CgroupInfo { pod_uid, container_id_full, container_id_short })
+    Some(CgroupInfo {
+        pod_uid,
+        container_id_full,
+        container_id_short,
+    })
 }
 
 fn parse_cgroup_v2(path: &str) -> Option<CgroupInfo> {
@@ -225,7 +234,11 @@ fn parse_cgroup_v2(path: &str) -> Option<CgroupInfo> {
         }
     }
     let container_id_short = container_id_full.as_ref().map(|id| short_id(id));
-    Some(CgroupInfo { pod_uid, container_id_full, container_id_short })
+    Some(CgroupInfo {
+        pod_uid,
+        container_id_full,
+        container_id_short,
+    })
 }
 
 fn extract_pod_uid(segment: &str) -> Option<String> {
@@ -238,7 +251,11 @@ fn extract_pod_uid(segment: &str) -> Option<String> {
             break;
         }
     }
-    if uid.is_empty() { None } else { Some(uid) }
+    if uid.is_empty() {
+        None
+    } else {
+        Some(uid)
+    }
 }
 
 fn extract_container_id(segment: &str) -> Option<String> {
@@ -249,9 +266,13 @@ fn extract_container_id(segment: &str) -> Option<String> {
             break;
         }
     }
-    if s.len() < 12 { return None; }
+    if s.len() < 12 {
+        return None;
+    }
     // Reject anything that isn't a valid hex container ID
-    if !s.chars().all(|c| c.is_ascii_hexdigit()) { return None; }
+    if !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
     Some(s)
 }
 
@@ -290,9 +311,12 @@ async fn fetch_container_metadata_inner(
         container_id: container_id_full.to_string(),
         verbose: true,
     };
-    let resp: cri::ContainerStatusResponse =
-        client.container_status(tonic::Request::new(req)).await?.into_inner();
-    let status = resp.status
+    let resp: cri::ContainerStatusResponse = client
+        .container_status(tonic::Request::new(req))
+        .await?
+        .into_inner();
+    let status = resp
+        .status
         .ok_or_else(|| anyhow::anyhow!("missing container status"))?;
     let labels = status.labels;
 
@@ -300,7 +324,9 @@ async fn fetch_container_metadata_inner(
         pod_name: labels.get("io.kubernetes.pod.name").cloned(),
         pod_namespace: labels.get("io.kubernetes.pod.namespace").cloned(),
         container_name: labels.get("io.kubernetes.container.name").cloned(),
-        service_name: labels.get("app.kubernetes.io/name").cloned()
+        service_name: labels
+            .get("app.kubernetes.io/name")
+            .cloned()
             .or_else(|| labels.get("app").cloned()),
         workload_type: labels.get("app.kubernetes.io/component").cloned(),
     })
@@ -314,7 +340,10 @@ mod tests {
     fn test_parse_cgroup_v1() {
         let path = "/kubepods/burstable/pod123e4567-e89b-12d3-a456-426614174000/abcdef0123456789abcdef0123456789";
         let info = parse_cgroup_v1(path).expect("v1 parse");
-        assert_eq!(info.pod_uid.unwrap(), "123e4567-e89b-12d3-a456-426614174000");
+        assert_eq!(
+            info.pod_uid.unwrap(),
+            "123e4567-e89b-12d3-a456-426614174000"
+        );
         assert_eq!(info.container_id_short.unwrap(), "abcdef012345");
     }
 
@@ -322,7 +351,10 @@ mod tests {
     fn test_parse_cgroup_v2() {
         let path = "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123e4567-e89b-12d3-a456-426614174000.slice/cri-containerd-abcdef0123456789abcdef0123456789.scope";
         let info = parse_cgroup_v2(path).expect("v2 parse");
-        assert_eq!(info.pod_uid.unwrap(), "123e4567-e89b-12d3-a456-426614174000");
+        assert_eq!(
+            info.pod_uid.unwrap(),
+            "123e4567-e89b-12d3-a456-426614174000"
+        );
         assert_eq!(info.container_id_short.unwrap(), "abcdef012345");
     }
 }

@@ -7,20 +7,24 @@ use serde::Serialize;
 #[derive(Debug, Serialize)]
 pub struct ProtoField {
     pub field_number: u32,
-    pub wire_type:    u8,
-    pub value_str:    String,
+    pub wire_type: u8,
+    pub value_str: String,
 }
 
 pub fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
     let mut result = 0u64;
-    let mut shift  = 0u32;
-    let mut i      = 0;
+    let mut shift = 0u32;
+    let mut i = 0;
     loop {
-        if i >= buf.len() || i >= 10 { return None; }
+        if i >= buf.len() || i >= 10 {
+            return None;
+        }
         let byte = buf[i] as u64;
         result |= (byte & 0x7F) << shift;
         i += 1;
-        if byte & 0x80 == 0 { break; }
+        if byte & 0x80 == 0 {
+            break;
+        }
         shift += 7;
     }
     Some((result, i))
@@ -28,12 +32,16 @@ pub fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
 
 pub fn decode_grpc_fields(buf: &[u8]) -> Vec<ProtoField> {
     // Strip 5-byte gRPC frame prefix: [compress_flag(1)] [length(4)]
-    if buf.len() < 5 { return vec![]; }
+    if buf.len() < 5 {
+        return vec![];
+    }
     let _compress = buf[0];
-    let msg_len   = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    let msg_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
     let proto_start = 5;
-    let proto_end   = (proto_start + msg_len).min(buf.len());
-    if proto_end <= proto_start { return vec![]; }
+    let proto_end = (proto_start + msg_len).min(buf.len());
+    if proto_end <= proto_start {
+        return vec![];
+    }
     let proto = &buf[proto_start..proto_end];
 
     let mut fields = Vec::new();
@@ -41,39 +49,48 @@ pub fn decode_grpc_fields(buf: &[u8]) -> Vec<ProtoField> {
     while i < proto.len() {
         let (tag, tag_bytes) = match read_varint(&proto[i..]) {
             Some(v) => v,
-            None    => break,
+            None => break,
         };
         i += tag_bytes;
         let field_number = (tag >> 3) as u32;
-        let wire_type    = (tag & 0x7) as u8;
+        let wire_type = (tag & 0x7) as u8;
 
         let value_str = match wire_type {
             0 => {
                 // Varint
                 let (val, bytes) = match read_varint(&proto[i..]) {
-                    Some(v) => v, None => break,
+                    Some(v) => v,
+                    None => break,
                 };
                 i += bytes;
                 format!("{}", val)
             }
             1 => {
                 // 64-bit
-                if i + 8 > proto.len() { break; }
-                let val = u64::from_le_bytes(proto[i..i+8].try_into().unwrap_or([0;8]));
+                if i + 8 > proto.len() {
+                    break;
+                }
+                let val = u64::from_le_bytes(proto[i..i + 8].try_into().unwrap_or([0; 8]));
                 i += 8;
                 format!("0x{:016x}", val)
             }
             2 => {
                 // Length-delimited
                 let (len, len_bytes) = match read_varint(&proto[i..]) {
-                    Some(v) => v, None => break,
+                    Some(v) => v,
+                    None => break,
                 };
                 i += len_bytes;
                 let len_usize = len as usize;
-                let end = i.saturating_add(len_usize).min(proto.len()).min(i.saturating_add(256));
+                let end = i
+                    .saturating_add(len_usize)
+                    .min(proto.len())
+                    .min(i.saturating_add(256));
                 let data = &proto[i..end];
                 i = i.saturating_add(len_usize);
-                if i > proto.len() { i = proto.len(); }
+                if i > proto.len() {
+                    i = proto.len();
+                }
                 match std::str::from_utf8(data) {
                     Ok(s) if s.chars().all(|c| !c.is_control() || c == '\n') => {
                         format!("\"{}\"", s.chars().take(128).collect::<String>())
@@ -83,16 +100,24 @@ pub fn decode_grpc_fields(buf: &[u8]) -> Vec<ProtoField> {
             }
             5 => {
                 // 32-bit
-                if i + 4 > proto.len() { break; }
-                let val = u32::from_le_bytes(proto[i..i+4].try_into().unwrap_or([0;4]));
+                if i + 4 > proto.len() {
+                    break;
+                }
+                let val = u32::from_le_bytes(proto[i..i + 4].try_into().unwrap_or([0; 4]));
                 i += 4;
                 format!("0x{:08x}", val)
             }
             _ => break,
         };
 
-        fields.push(ProtoField { field_number, wire_type, value_str });
-        if fields.len() >= 64 { break; }
+        fields.push(ProtoField {
+            field_number,
+            wire_type,
+            value_str,
+        });
+        if fields.len() >= 64 {
+            break;
+        }
     }
     fields
 }

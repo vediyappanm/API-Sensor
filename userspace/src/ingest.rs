@@ -36,11 +36,17 @@ pub async fn send_batch_with_client(
             reopen_in_ms = open_until - now,
             "circuit breaker open, skipping batch"
         );
-        return Err(anyhow::anyhow!("circuit breaker open, {} events deferred", events.len()));
+        return Err(anyhow::anyhow!(
+            "circuit breaker open, {} events deferred",
+            events.len()
+        ));
     }
 
     let event_count = events.len() as u64;
-    let body_struct = EventBatch { version: "v1".to_string(), events };
+    let body_struct = EventBatch {
+        version: "v1".to_string(),
+        events,
+    };
     let json_bytes = serde_json::to_vec(&body_struct)?;
 
     let (payload, content_encoding) = if json_bytes.len() > 4096 {
@@ -72,14 +78,23 @@ pub async fn send_batch_with_client(
                     return Ok(());
                 }
                 // Client errors are not retryable — bad key, bad payload, etc.
-                if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+                if status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN
+                {
                     SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
-                    return Err(anyhow::anyhow!("ingest auth error HTTP {} (check API key, not retryable)", status));
+                    return Err(anyhow::anyhow!(
+                        "ingest auth error HTTP {} (check API key, not retryable)",
+                        status
+                    ));
                 }
                 if status.is_client_error() {
                     SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
                     let text = resp.text().await.unwrap_or_default();
-                    return Err(anyhow::anyhow!("ingest HTTP {} (not retryable): {}", status, text));
+                    return Err(anyhow::anyhow!(
+                        "ingest HTTP {} (not retryable): {}",
+                        status,
+                        text
+                    ));
                 }
                 // Server errors — retry if attempts remain
                 if status.is_server_error() && attempt + 1 < MAX_RETRIES {
@@ -116,5 +131,9 @@ pub async fn send_batch_with_client(
         CIRCUIT_OPEN_UNTIL.store(now_epoch_ms() + backoff_ms, Ordering::Relaxed);
         tracing::warn!(failures, backoff_ms, "circuit breaker opened");
     }
-    Err(anyhow::anyhow!("ingest failed after {} retries: {:?}", MAX_RETRIES, last_err))
+    Err(anyhow::anyhow!(
+        "ingest failed after {} retries: {:?}",
+        MAX_RETRIES,
+        last_err
+    ))
 }

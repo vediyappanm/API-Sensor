@@ -18,31 +18,139 @@ pub fn attach_tls_uprobes(
     for lib in tls_libs {
         let lib_lower = lib.to_lowercase();
         let looks_openssl = lib_lower.contains("libssl") || lib_lower.contains("openssl");
-        let looks_gnutls  = lib_lower.contains("gnutls");
+        let looks_gnutls = lib_lower.contains("gnutls");
 
         if provider == "openssl" || (provider == "auto" && looks_openssl) {
-            if try_attach(obj, "ssl_write_entry",   lib, "SSL_write",    false, pid, links) { attached += 1; }
-            if try_attach(obj, "ssl_write_exit",    lib, "SSL_write",    true,  pid, links) { attached += 1; }
-            if try_attach(obj, "ssl_read_entry",    lib, "SSL_read",     false, pid, links) { attached += 1; }
-            if try_attach(obj, "ssl_read_exit",     lib, "SSL_read",     true,  pid, links) { attached += 1; }
-            if try_attach(obj, "ssl_read_ex_entry", lib, "SSL_read_ex",  false, pid, links) { attached += 1; }
-            if try_attach(obj, "ssl_read_ex_exit",  lib, "SSL_read_ex",  true,  pid, links) { attached += 1; }
-            if try_attach(obj, "ssl_write_ex_entry",lib, "SSL_write_ex", false, pid, links) { attached += 1; }
-            if try_attach(obj, "ssl_write_ex_exit", lib, "SSL_write_ex", true,  pid, links) { attached += 1; }
-            if try_attach(obj, "ssl_free_entry",    lib, "SSL_free",     false, pid, links) { attached += 1; }
-            if try_attach(obj, "ssl_set_fd_entry",  lib, "SSL_set_fd",   false, pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_write_entry", lib, "SSL_write", false, pid, links) {
+                attached += 1;
+            }
+            if try_attach(obj, "ssl_write_exit", lib, "SSL_write", true, pid, links) {
+                attached += 1;
+            }
+            if try_attach(obj, "ssl_read_entry", lib, "SSL_read", false, pid, links) {
+                attached += 1;
+            }
+            if try_attach(obj, "ssl_read_exit", lib, "SSL_read", true, pid, links) {
+                attached += 1;
+            }
+            if try_attach(
+                obj,
+                "ssl_read_ex_entry",
+                lib,
+                "SSL_read_ex",
+                false,
+                pid,
+                links,
+            ) {
+                attached += 1;
+            }
+            if try_attach(
+                obj,
+                "ssl_read_ex_exit",
+                lib,
+                "SSL_read_ex",
+                true,
+                pid,
+                links,
+            ) {
+                attached += 1;
+            }
+            if try_attach(
+                obj,
+                "ssl_write_ex_entry",
+                lib,
+                "SSL_write_ex",
+                false,
+                pid,
+                links,
+            ) {
+                attached += 1;
+            }
+            if try_attach(
+                obj,
+                "ssl_write_ex_exit",
+                lib,
+                "SSL_write_ex",
+                true,
+                pid,
+                links,
+            ) {
+                attached += 1;
+            }
+            if try_attach(obj, "ssl_free_entry", lib, "SSL_free", false, pid, links) {
+                attached += 1;
+            }
+            if try_attach(
+                obj,
+                "ssl_set_fd_entry",
+                lib,
+                "SSL_set_fd",
+                false,
+                pid,
+                links,
+            ) {
+                attached += 1;
+            }
         }
         if provider == "gnutls" || (provider == "auto" && looks_gnutls) {
-            if try_attach(obj, "gnutls_send_entry", lib, "gnutls_record_send", false, pid, links) { attached += 1; }
-            if try_attach(obj, "gnutls_send_exit",  lib, "gnutls_record_send", true,  pid, links) { attached += 1; }
-            if try_attach(obj, "gnutls_recv_entry", lib, "gnutls_record_recv", false, pid, links) { attached += 1; }
-            if try_attach(obj, "gnutls_recv_exit",  lib, "gnutls_record_recv", true,  pid, links) { attached += 1; }
+            if try_attach(
+                obj,
+                "gnutls_send_entry",
+                lib,
+                "gnutls_record_send",
+                false,
+                pid,
+                links,
+            ) {
+                attached += 1;
+            }
+            if try_attach(
+                obj,
+                "gnutls_send_exit",
+                lib,
+                "gnutls_record_send",
+                true,
+                pid,
+                links,
+            ) {
+                attached += 1;
+            }
+            if try_attach(
+                obj,
+                "gnutls_recv_entry",
+                lib,
+                "gnutls_record_recv",
+                false,
+                pid,
+                links,
+            ) {
+                attached += 1;
+            }
+            if try_attach(
+                obj,
+                "gnutls_recv_exit",
+                lib,
+                "gnutls_record_recv",
+                true,
+                pid,
+                links,
+            ) {
+                attached += 1;
+            }
         }
         if provider == "auto" && !looks_openssl && !looks_gnutls {
-            if try_attach(obj, "ssl_write_entry", lib, "SSL_write", false, pid, links) { attached += 1; }
-            if try_attach(obj, "ssl_write_exit",  lib, "SSL_write", true,  pid, links) { attached += 1; }
-            if try_attach(obj, "ssl_read_entry",  lib, "SSL_read",  false, pid, links) { attached += 1; }
-            if try_attach(obj, "ssl_read_exit",   lib, "SSL_read",  true,  pid, links) { attached += 1; }
+            if try_attach(obj, "ssl_write_entry", lib, "SSL_write", false, pid, links) {
+                attached += 1;
+            }
+            if try_attach(obj, "ssl_write_exit", lib, "SSL_write", true, pid, links) {
+                attached += 1;
+            }
+            if try_attach(obj, "ssl_read_entry", lib, "SSL_read", false, pid, links) {
+                attached += 1;
+            }
+            if try_attach(obj, "ssl_read_exit", lib, "SSL_read", true, pid, links) {
+                attached += 1;
+            }
         }
     }
     if attached == 0 && !go_tls_enabled {
@@ -188,7 +296,13 @@ fn try_attach(
 ) -> bool {
     match attach_symbol(obj, prog_name, binary, symbol, retprobe, pid, links) {
         Ok(()) => {
-            tracing::debug!(prog = prog_name, symbol, binary, retprobe, "uprobe attached");
+            tracing::debug!(
+                prog = prog_name,
+                symbol,
+                binary,
+                retprobe,
+                "uprobe attached"
+            );
             true
         }
         Err(e) => {
@@ -214,36 +328,94 @@ pub fn attach_quic_uprobes(
     for lib in quic_libs {
         let lib_type = classify_quic_lib(lib);
         let (recv_sym, send_sym) = match lib_type {
-            Some(QuicLibType::Quiche) => (
-                "quiche_conn_stream_recv",
-                "quiche_conn_stream_send",
-            ),
-            Some(QuicLibType::Ngtcp2) => (
-                "ngtcp2_conn_read_stream",
-                "ngtcp2_conn_write_stream",
-            ),
-            Some(QuicLibType::Lsquic) => (
-                "lsquic_stream_read",
-                "lsquic_stream_write",
-            ),
-            Some(QuicLibType::Msquic) => (
-                "MsQuicStreamReceive",
-                "MsQuicStreamSend",
-            ),
+            Some(QuicLibType::Quiche) => ("quiche_conn_stream_recv", "quiche_conn_stream_send"),
+            Some(QuicLibType::Ngtcp2) => ("ngtcp2_conn_read_stream", "ngtcp2_conn_write_stream"),
+            Some(QuicLibType::Lsquic) => ("lsquic_stream_read", "lsquic_stream_write"),
+            Some(QuicLibType::Msquic) => ("MsQuicStreamReceive", "MsQuicStreamSend"),
             None => continue,
         };
-        if try_attach(obj, "quic_stream_recv_entry", lib, recv_sym, false, pid, links) { attached += 1; }
-        if try_attach(obj, "quic_stream_recv_exit",  lib, recv_sym, true,  pid, links) { attached += 1; }
-        if try_attach(obj, "quic_stream_send_entry", lib, send_sym, false, pid, links) { attached += 1; }
-        if try_attach(obj, "quic_stream_send_exit",  lib, send_sym, true,  pid, links) { attached += 1; }
+        if try_attach(
+            obj,
+            "quic_stream_recv_entry",
+            lib,
+            recv_sym,
+            false,
+            pid,
+            links,
+        ) {
+            attached += 1;
+        }
+        if try_attach(
+            obj,
+            "quic_stream_recv_exit",
+            lib,
+            recv_sym,
+            true,
+            pid,
+            links,
+        ) {
+            attached += 1;
+        }
+        if try_attach(
+            obj,
+            "quic_stream_send_entry",
+            lib,
+            send_sym,
+            false,
+            pid,
+            links,
+        ) {
+            attached += 1;
+        }
+        if try_attach(
+            obj,
+            "quic_stream_send_exit",
+            lib,
+            send_sym,
+            true,
+            pid,
+            links,
+        ) {
+            attached += 1;
+        }
 
         // Hook h3-level C FFI body functions. The quiche h3 layer inlines
         // internal Rust methods, so we hook the C FFI functions that the
         // application binary calls via PLT.
         if lib_type == Some(QuicLibType::Quiche) {
-            if try_attach(obj, "h3_recv_body_entry", lib, "quiche_h3_recv_body", false, pid, links) { attached += 1; }
-            if try_attach(obj, "h3_recv_body_exit",  lib, "quiche_h3_recv_body", true,  pid, links) { attached += 1; }
-            if try_attach(obj, "h3_send_body_entry", lib, "quiche_h3_send_body", false, pid, links) { attached += 1; }
+            if try_attach(
+                obj,
+                "h3_recv_body_entry",
+                lib,
+                "quiche_h3_recv_body",
+                false,
+                pid,
+                links,
+            ) {
+                attached += 1;
+            }
+            if try_attach(
+                obj,
+                "h3_recv_body_exit",
+                lib,
+                "quiche_h3_recv_body",
+                true,
+                pid,
+                links,
+            ) {
+                attached += 1;
+            }
+            if try_attach(
+                obj,
+                "h3_send_body_entry",
+                lib,
+                "quiche_h3_send_body",
+                false,
+                pid,
+                links,
+            ) {
+                attached += 1;
+            }
         }
     }
     if attached > 0 {

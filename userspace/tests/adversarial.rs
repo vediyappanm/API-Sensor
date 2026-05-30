@@ -1,9 +1,9 @@
-use api_sec_sensor::http::extract_http_header;
-use api_sec_sensor::http2::{Http2HpackDecoder, parse_http2_frames, contains_http2_preface};
-use api_sec_sensor::websocket::parse_websocket_frame;
 use api_sec_sensor::grpc::decode_grpc_fields;
+use api_sec_sensor::http::extract_http_header;
+use api_sec_sensor::http2::{contains_http2_preface, parse_http2_frames, Http2HpackDecoder};
 use api_sec_sensor::mcp::parse_sse_events;
 use api_sec_sensor::redaction::redact_pii;
+use api_sec_sensor::websocket::parse_websocket_frame;
 
 // ---------------------------------------------------------------------------
 // HTTP/1.1 adversarial tests
@@ -43,7 +43,8 @@ fn http_extremely_long_header_line() {
 
 #[test]
 fn http_smuggling_cl_te_conflict() {
-    let buf = b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    let buf =
+        b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
     let result = extract_http_header(buf);
     assert!(result.is_some());
 }

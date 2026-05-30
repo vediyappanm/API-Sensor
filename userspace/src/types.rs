@@ -2,7 +2,9 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 
-/// BPF event struct version — must match BPF_EVENT_VERSION in http_trace.bpf.c
+/// BPF event struct version — must match BPF_EVENT_VERSION in http_trace.bpf.c.
+/// Documents the wire-format version; verified by review rather than read at runtime.
+#[allow(dead_code)]
 pub const BPF_EVENT_VERSION: u8 = 1;
 
 // ---------------------------------------------------------------------------

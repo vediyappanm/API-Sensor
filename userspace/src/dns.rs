@@ -53,11 +53,9 @@ impl DnsResolver {
 
         // Queue for background resolution (dedup via pending set)
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if !pending.contains(&ip) {
-            if self.lookup_tx.try_send(ip).is_ok() {
-                pending.insert(ip);
-            }
-            // If channel is full, skip — will retry on next event for this IP
+        // If the channel is full, skip — will retry on next event for this IP.
+        if !pending.contains(&ip) && self.lookup_tx.try_send(ip).is_ok() {
+            pending.insert(ip);
         }
 
         None
@@ -65,14 +63,25 @@ impl DnsResolver {
 
     /// Insert a resolution result into the cache.
     pub fn insert(&self, ip: IpAddr, hostname: Option<String>) {
-        let ttl = if hostname.is_some() { CACHE_TTL } else { NEGATIVE_TTL };
+        let ttl = if hostname.is_some() {
+            CACHE_TTL
+        } else {
+            NEGATIVE_TTL
+        };
 
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if cache.len() >= MAX_ENTRIES {
             let now = Instant::now();
             cache.retain(|_, e| now.duration_since(e.resolved_at) < e.ttl);
         }
-        cache.insert(ip, CacheEntry { hostname, resolved_at: Instant::now(), ttl });
+        cache.insert(
+            ip,
+            CacheEntry {
+                hostname,
+                resolved_at: Instant::now(),
+                ttl,
+            },
+        );
 
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.remove(&ip);
@@ -155,7 +164,10 @@ pub fn reverse_dns_lookup(ip: IpAddr) -> Option<String> {
 /// Extract process name from BPF-captured comm field, falling back to
 /// /proc/<pid>/comm when the BPF field is empty.
 pub fn read_process_name(pid: u32, bpf_comm: &[u8; 16]) -> Option<String> {
-    let end = bpf_comm.iter().position(|&b| b == 0).unwrap_or(bpf_comm.len());
+    let end = bpf_comm
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(bpf_comm.len());
     if end > 0 {
         let name = String::from_utf8_lossy(&bpf_comm[..end]).into_owned();
         if !name.is_empty() {
@@ -219,7 +231,10 @@ mod tests {
         let resolver = DnsResolver::new(tx);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         resolver.insert(ip, Some("my-service.local".to_string()));
-        assert_eq!(resolver.lookup_and_queue("10.0.0.1"), Some("my-service.local".to_string()));
+        assert_eq!(
+            resolver.lookup_and_queue("10.0.0.1"),
+            Some("my-service.local".to_string())
+        );
     }
 
     #[test]
