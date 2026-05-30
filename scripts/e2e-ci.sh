@@ -98,8 +98,13 @@ class H(BaseHTTPRequestHandler):
         try:
             n=int(self.headers.get('Content-Length',0)); raw=self.rfile.read(n)
             if self.headers.get('Content-Encoding')=='gzip': raw=gzip.decompress(raw)
-            for e in json.loads(raw).get('events',[]):
-                with lk: seen.append(e); json.dump(seen, open(path,'w'))
+            evs=json.loads(raw).get('events',[])
+            with lk:
+                seen.extend(evs)
+                # Atomic write: continuous traffic rewrites this file constantly;
+                # tmp+rename means an external reader never sees a truncated file.
+                with open(path+'.tmp','w') as f: json.dump(seen,f)
+                os.replace(path+'.tmp', path)
         except Exception: pass
         self.send_response(200); self.end_headers(); self.wfile.write(b'{}')
     def log_message(self,*a): pass
@@ -216,18 +221,26 @@ if [[ -n "$GO_BIN" ]]; then
     [[ "$GD" -gt 0 ]] && ok "Go crypto/tls: captured $GD events" || fail "Go TLS: 0 events captured"
 else skip "Go crypto/tls (go toolchain unavailable)"; fi
 
-# --- PII redaction on egress -------------------------------------------------
+# --- Delivered events reached the ingest stub --------------------------------
+step "Ingest delivery"
+RECV=0
+for _ in 1 2 3 4 5 6 7 8; do
+    RECV=$(python3 -c "import json;print(len(json.load(open('$EVENTS_FILE'))))" 2>/dev/null || echo 0)
+    [[ "${RECV:-0}" -gt 0 ]] && break
+    sleep 1
+done
+[[ "${RECV:-0}" -gt 0 ]] && ok "ingest received $RECV events" || fail "ingest received 0 events"
+
+# --- PII redaction on the egress path (meaningful only on a non-empty file) --
 step "PII redaction (delivered events)"
 BLOB=$(cat "$EVENTS_FILE" 2>/dev/null || echo "")
 echo "$BLOB" | grep -q "alice@example.com" && fail "raw email leaked" || ok "email redacted"
 echo "$BLOB" | grep -q "123-45-6789" && fail "raw SSN leaked" || ok "SSN redacted"
 echo "$BLOB" | grep -q "4111111111111111" && fail "raw credit card leaked" || ok "credit card redacted"
 
-# --- Delivered event structure -----------------------------------------------
-step "Delivered event structure"
-RECV=$(python3 -c "import json;print(len(json.load(open('$EVENTS_FILE'))))" 2>/dev/null || echo 0)
+# --- Delivered event schema --------------------------------------------------
+step "Delivered event schema"
 if [[ "${RECV:-0}" -gt 0 ]]; then
-    ok "ingest received $RECV events"
     python3 - "$EVENTS_FILE" <<'PY' && ok "event schema valid" || fail "event schema invalid"
 import json,sys
 e=json.load(open(sys.argv[1]))[0]
@@ -235,7 +248,7 @@ for k in ('version','protocol','request','response'): assert k in e, k
 assert 'method' in e['request'] and 'path' in e['request']
 assert 'status_code' in e['response']
 PY
-else fail "ingest received 0 events"; fi
+else fail "no events to validate schema"; fi
 
 # --- Summary -----------------------------------------------------------------
 echo ""
