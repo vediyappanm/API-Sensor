@@ -134,3 +134,73 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t api-sensor:test -f Dockerfile .
+
+  # Real end-to-end capture test: builds the BPF object + sensor, loads them on
+  # the runner's live kernel (ubuntu-latest has a 6.x kernel + BTF + sudo),
+  # attaches uprobes to libssl, drives local HTTPS traffic, and asserts the full
+  # path works: BPF load -> capture -> parse -> PII redaction -> ingest delivery.
+  # Hermetic (no external network). This is the gate that exercises the actual
+  # capture path — unlike the unit/adversarial tests which run parsers in isolation.
+  e2e-capture:
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang llvm libbpf-dev linux-tools-common \
+            pkg-config libssl-dev libelf-dev zlib1g-dev protobuf-compiler \
+            curl openssl python3
+
+      - name: Install bpftool
+        run: |
+          if ! command -v bpftool &>/dev/null; then
+            sudo apt-get install -y "linux-tools-$(uname -r)" 2>/dev/null \
+              || sudo apt-get install -y linux-tools-generic 2>/dev/null || true
+            if ! command -v bpftool &>/dev/null; then
+              BIN=$(find /usr/lib/linux-tools -name bpftool -type f 2>/dev/null | head -1)
+              [ -n "$BIN" ] && sudo ln -sf "$BIN" /usr/local/bin/bpftool || true
+            fi
+          fi
+          bpftool version
+
+      - name: Require kernel BTF (CO-RE capture needs it)
+        run: |
+          if [ ! -f /sys/kernel/btf/vmlinux ]; then
+            echo "::error::runner kernel $(uname -r) lacks BTF — cannot run the CO-RE capture test"
+            exit 1
+          fi
+          echo "kernel $(uname -r) has BTF"
+
+      - name: Build BPF object
+        run: |
+          bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
+          clang -O2 -g -Wall -target bpf -D__TARGET_ARCH_x86 \
+            -I/usr/include/x86_64-linux-gnu \
+            -c bpf/http_trace.bpf.c -o bpf/http_trace.bpf.o
+          test -f bpf/http_trace.bpf.o
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            userspace/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('userspace/Cargo.lock') }}
+
+      - name: Build release sensor
+        working-directory: userspace
+        run: cargo build --release
+
+      - name: Run hermetic e2e capture test
+        run: sudo -E ./scripts/e2e-ci.sh
+        env:
+          SENSOR_BIN: ${{ github.workspace }}/userspace/target/release/api-sec-sensor
+          BPF_OBJ: ${{ github.workspace }}/bpf/http_trace.bpf.o
