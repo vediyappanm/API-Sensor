@@ -19,3 +19,5 @@ data:
     sample_default = {{ .Values.sensor.sampleDefault }}
     sample_health = {{ .Values.sensor.sampleHealth }}
     discover_libs = true
+    go_tls = {{ .Values.sensor.goTls }}
+    capture_plaintext = {{ .Values.sensor.capturePlaintext }}

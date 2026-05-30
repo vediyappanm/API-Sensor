@@ -420,13 +420,26 @@ async fn main() -> Result<()> {
 
     // --- Kick off static TLS discovery in background (I/O-heavy, no BPF access) ---
     // This runs concurrently with ring buffer polling so events are captured immediately.
-    let static_tls_discovery = if args.go_tls {
+    //
+    // Static/bundled OpenSSL & BoringSSL (e.g. Node.js, statically-linked binaries)
+    // is located by scanning ELF symbols — independent of Go — so it runs whenever
+    // library discovery is enabled. Only the Go crypto/tls binary scan (Capstone
+    // disassembly) stays gated behind `go_tls`; previously both were coupled to it,
+    // which silently dropped Node.js / static-OpenSSL coverage unless `--go-tls`
+    // happened to be set.
+    let detect_go = args.go_tls;
+    let run_discovery = args.discover_libs || args.go_tls;
+    let static_tls_discovery = if run_discovery {
         let scan_mode = if args.pid > 0 { "targeted" } else { "global" };
-        tracing::info!(pid = args.pid, mode = scan_mode, "Go TLS + static TLS: starting background discovery");
+        tracing::info!(pid = args.pid, mode = scan_mode, go_tls = detect_go, "static TLS discovery starting (OpenSSL/BoringSSL; Go if enabled)");
         let target_pid = args.pid;
         Some(tokio::task::spawn_blocking(move || {
             let static_tls = discover_static_tls_candidates(target_pid);
-            let go_binaries = crate::go_tls::detect_go_binaries(target_pid);
+            let go_binaries = if detect_go {
+                crate::go_tls::detect_go_binaries(target_pid)
+            } else {
+                Vec::new()
+            };
             DiscoveryResults { static_tls, go_binaries }
         }))
     } else {
@@ -713,7 +726,7 @@ async fn main() -> Result<()> {
 
         // Final guard
         if links.is_empty() {
-            anyhow::bail!("no probes attached; --go-tls enabled but no TLS library or Go binary found");
+            anyhow::bail!("no probes attached; check --tls-libs/--discover-libs/--go-tls and that target processes use a supported TLS library");
         }
     }
 
@@ -741,9 +754,35 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Drop tx to signal batch task to flush remaining events, then await it
+    // --- Graceful drain ---
+    // Close the event channel so the batch task drains everything still buffered
+    // and performs its final flush. The `events` ring-buffer callback holds a
+    // *clone* of `tx` (see `sender` above), so the channel only closes once BOTH
+    // senders are gone — we must drop `ringbuf` (which owns the clone) as well as
+    // `tx`. Dropping only `tx` leaves the channel open, the batch task's
+    // final-flush branch never fires, and tail events are lost.
+    drop(ringbuf);
     drop(tx);
-    let _ = tokio::time::timeout(Duration::from_secs(5), batch_handle).await;
+
+    // Bound the drain so a dead/slow ingest endpoint can't hold shutdown past the
+    // Kubernetes termination grace period. The batch task's retry + circuit
+    // breaker still apply inside this window; whatever can't be flushed in time is
+    // dropped (a persistent on-disk buffer would close that gap — tracked
+    // separately). Tunable via SHUTDOWN_DRAIN_TIMEOUT_SECS (default 10s); keep it
+    // below the pod's terminationGracePeriodSeconds.
+    let drain_timeout_secs: u64 = std::env::var("SHUTDOWN_DRAIN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(10);
+    match tokio::time::timeout(Duration::from_secs(drain_timeout_secs), batch_handle).await {
+        Ok(Ok(())) => tracing::info!("graceful drain complete — buffered events flushed"),
+        Ok(Err(e)) => tracing::error!(error = %e, "batch task aborted during drain"),
+        Err(_) => tracing::warn!(
+            timeout_secs = drain_timeout_secs,
+            "shutdown drain timed out — some buffered events may not have been flushed"
+        ),
+    }
 
     // Flush OpenTelemetry spans before exit
     #[cfg(feature = "otel")]

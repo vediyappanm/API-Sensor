@@ -23,6 +23,13 @@ sensor:
   metricsPort: 9090
   sampleDefault: "100"
   sampleHealth: "5"
+  # Capture Go crypto/tls AND statically-linked / bundled OpenSSL+BoringSSL
+  # (e.g. Node.js). Without this only dynamically-linked libssl/libgnutls is
+  # seen, so Go services and Node.js are missed.
+  goTls: true
+  # Capture plaintext (non-TLS) HTTP via socket syscall tracepoints. Adds
+  # system-wide syscall hooks (some per-node overhead) — set false to disable.
+  capturePlaintext: true
 
 apiKeySecret:
   name: api-sentinel-sensor
