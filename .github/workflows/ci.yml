@@ -135,10 +135,12 @@ jobs:
       - name: Build Docker image
         run: docker build -t api-sensor:test -f Dockerfile .
 
-  # Real end-to-end capture test: builds the BPF object + sensor, loads them on
-  # the runner's live kernel (ubuntu-latest has a 6.x kernel + BTF + sudo),
-  # attaches uprobes to libssl, drives local HTTPS traffic, and asserts the full
-  # path works: BPF load -> capture -> parse -> PII redaction -> ingest delivery.
+  # Real, multi-protocol end-to-end capture test. Builds the BPF object + sensor,
+  # loads them on the runner's live kernel (ubuntu-latest has a 6.x kernel + BTF +
+  # sudo), and drives REAL local traffic across every major capture surface —
+  # OpenSSL (HTTP/1.1 + HTTP/2 via nginx), plaintext HTTP, GnuTLS, and Go
+  # crypto/tls — asserting the full path for each: BPF load -> uprobe/tracepoint
+  # capture -> parse/protocol detect -> PII redaction -> ingest delivery.
   # Hermetic (no external network). This is the gate that exercises the actual
   # capture path — unlike the unit/adversarial tests which run parsers in isolation.
   e2e-capture:
@@ -153,7 +155,8 @@ jobs:
           sudo apt-get install -y \
             clang llvm libbpf-dev linux-tools-common \
             pkg-config libssl-dev libelf-dev zlib1g-dev protobuf-compiler \
-            curl openssl python3
+            curl openssl python3 \
+            nginx-light gnutls-bin golang-go   # protocol drivers: HTTP/2, GnuTLS, Go crypto/tls
 
       - name: Install bpftool
         run: |
