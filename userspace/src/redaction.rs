@@ -29,6 +29,7 @@ pub enum PiiType {
     StripeKey,
     GoogleApiKey,
     GenericApiKey,
+    HighEntropySecret,
 }
 
 #[allow(dead_code)]
@@ -106,6 +107,7 @@ pub fn pii_token(pii_type: &PiiType, original: &str) -> String {
         PiiType::StripeKey => format!("PII_STRIPE_{hash:016x}"),
         PiiType::GoogleApiKey => format!("PII_GOOGLEKEY_{hash:016x}"),
         PiiType::GenericApiKey => format!("PII_APIKEY_{hash:016x}"),
+        PiiType::HighEntropySecret => format!("PII_SECRET_{hash:016x}"),
     }
 }
 
@@ -226,6 +228,91 @@ fn luhn_check(digits: &str) -> bool {
     sum % 10 == 0
 }
 
+/// Candidate runs for the generic high-entropy secret catch-all: contiguous
+/// base64/url-safe/hex token characters, 24–256 long.
+static SECRET_CANDIDATE_RE: OnceLock<Regex> = OnceLock::new();
+
+fn secret_candidate_re() -> &'static Regex {
+    // base64url *body* chars only — deliberately excludes structural separators
+    // (`/ = . + : ? &`) so a candidate is one opaque token, not a field name,
+    // path, or an already-redacted `PII_*` run glued to its neighbours.
+    SECRET_CANDIDATE_RE.get_or_init(|| Regex::new(r"[A-Za-z0-9_-]{24,256}").unwrap())
+}
+
+/// Conservative heuristic for "this opaque token is probably a credential".
+/// Deliberately tuned for LOW false positives — the named patterns above catch
+/// known formats; this is the safety net for unknown ones (the failure mode
+/// that originally leaked a Telegram bot token). Excludes our own `PII_*`
+/// tokens, pure-hex digests (git SHAs / etags / checksums), and UUIDs, which
+/// are high-entropy but rarely secret and would be noisy to redact.
+fn looks_like_secret(t: &str) -> bool {
+    let len = t.len();
+    if !(24..=256).contains(&len) {
+        return false;
+    }
+    if t.contains("PII_") {
+        return false; // overlaps an already-redacted token; don't re-redact
+    }
+    let has_lower = t.bytes().any(|b| b.is_ascii_lowercase());
+    let has_upper = t.bytes().any(|b| b.is_ascii_uppercase());
+    let has_digit = t.bytes().any(|b| b.is_ascii_digit());
+    // Require a letter and (a digit or mixed case) — excludes pure-alpha slugs.
+    if !((has_lower || has_upper) && (has_digit || (has_lower && has_upper))) {
+        return false;
+    }
+    // Pure hex → digest/checksum, not a secret. Exclude.
+    if t.bytes()
+        .all(|b| b.is_ascii_hexdigit() || b == b'-' || b == b'_')
+    {
+        // hex (optionally with separators): SHA/UUID/etag — skip.
+        if t.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+        if is_uuid(t) {
+            return false;
+        }
+    }
+    shannon_entropy(t) >= 4.0
+}
+
+/// UUID v1–v5 canonical form: 8-4-4-4-12 hex.
+fn is_uuid(t: &str) -> bool {
+    let b = t.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    b.iter().enumerate().all(|(i, &c)| {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            c == b'-'
+        } else {
+            c.is_ascii_hexdigit()
+        }
+    })
+}
+
+/// Final pass of [`redact_pii`]: replace freestanding high-entropy tokens that
+/// look like credentials but matched no named pattern.
+fn redact_high_entropy(text: &str) -> String {
+    let re = secret_candidate_re();
+    let snapshot = text.to_string();
+    let ranges: Vec<(usize, usize, String)> = re
+        .find_iter(&snapshot)
+        .filter(|m| looks_like_secret(m.as_str()))
+        .map(|m| {
+            (
+                m.start(),
+                m.end(),
+                pii_token(&PiiType::HighEntropySecret, m.as_str()),
+            )
+        })
+        .collect();
+    let mut result = snapshot;
+    for (start, end, token) in ranges.into_iter().rev() {
+        result.replace_range(start..end, &token);
+    }
+    result
+}
+
 pub fn redact_pii(text: &str) -> String {
     let patterns = PII_PATTERNS.get_or_init(init_pii_patterns);
     let mut result = text.to_string();
@@ -257,7 +344,10 @@ pub fn redact_pii(text: &str) -> String {
             result.replace_range(start..end, &token);
         }
     }
-    result
+    // Catch-all: redact any remaining high-entropy, credential-shaped tokens
+    // that matched no named pattern above (defense against unknown secret
+    // formats). Runs last so named tokens (already `PII_*`) are skipped.
+    redact_high_entropy(&result)
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +686,46 @@ mod tests {
         let input = "/users/12345/orders/678";
         let output = redact_pii(input);
         assert_eq!(input, output);
+    }
+
+    #[test]
+    fn test_high_entropy_secret_redacted() {
+        // An unknown-format, credential-shaped token (no named pattern) must
+        // still be redacted by the catch-all.
+        let input = "/callback?state=Zk9pX2qL3mWnB7vR8sT1uY4eC6dA0fG2hJ5kP";
+        let output = redact_pii(input);
+        assert!(!output.contains("Zk9pX2qL3mWnB7vR8sT1uY4eC6dA0fG2hJ5kP"));
+        assert!(output.contains("PII_SECRET_"));
+        // Surrounding structure preserved.
+        assert!(output.starts_with("/callback?state="));
+    }
+
+    #[test]
+    fn test_high_entropy_no_false_positive_uuid() {
+        let input = "/orders/550e8400-e29b-41d4-a716-446655440000/items";
+        assert_eq!(redact_pii(input), input);
+    }
+
+    #[test]
+    fn test_high_entropy_no_false_positive_sha256() {
+        // 64-char hex digest (e.g. content hash / git object) — must NOT redact.
+        let input = "/blobs/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(redact_pii(input), input);
+    }
+
+    #[test]
+    fn test_high_entropy_no_false_positive_normal_path() {
+        let input = "/api/v1/users/profile/settings/notifications/email";
+        assert_eq!(redact_pii(input), input);
+    }
+
+    #[test]
+    fn test_high_entropy_does_not_double_redact_named_token() {
+        // A named secret is redacted once; the catch-all must skip the PII_ token.
+        let input = "key=AIzaSyA1234567890abcdefghijklmnopqrstuv";
+        let output = redact_pii(input);
+        assert!(output.contains("PII_GOOGLEKEY_"));
+        assert!(!output.contains("PII_SECRET_"));
     }
 
     #[test]
