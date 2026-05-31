@@ -845,6 +845,7 @@ pub fn build_ws_event(
         dest_hostname: net_ctx.dest_hostname,
         metadata: None,
         anomaly_features: None,
+        orphan_response: false,
     }
 }
 
@@ -871,6 +872,10 @@ pub fn build_event(
     // Anomaly features are computed from the raw (pre-redaction) request so
     // injection payloads and entropy reflect the actual wire content.
     let anomaly = compute_anomaly_features(&req.path, req.body.as_deref());
+
+    // A synthetic UNKNOWN-method request means we saw the response but never the
+    // request (attached mid-connection) — flag it so consumers can filter.
+    let orphan_response = req.method == "UNKNOWN";
 
     let redacted_path = redact_pii(&req.path);
     let (path, query) = split_query(&redacted_path);
@@ -923,6 +928,7 @@ pub fn build_event(
         dest_hostname: net_ctx.dest_hostname,
         metadata: None,
         anomaly_features: Some(anomaly),
+        orphan_response,
     }
 }
 
@@ -1177,6 +1183,11 @@ mod tests {
         // Should correlate with a synthetic UNKNOWN request since original was evicted
         if !out.is_empty() {
             assert_eq!(out[0].request.method, "UNKNOWN");
+            // …and it must be flagged as an orphan response for consumers.
+            assert!(
+                out[0].orphan_response,
+                "synthetic UNKNOWN request should set orphan_response=true"
+            );
         }
     }
 

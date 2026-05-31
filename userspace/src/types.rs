@@ -148,6 +148,18 @@ pub struct ApiTrafficEvent {
     pub metadata: Option<EventMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anomaly_features: Option<AnomalyFeatures>,
+    /// True when this event is a response captured without its matching request
+    /// (a synthetic `UNKNOWN`-method request was substituted). Happens when the
+    /// sensor attaches mid-connection — the request was already on the wire
+    /// before the uprobe was in place. Lets consumers filter/flag low-fidelity
+    /// events instead of trusting `method:"UNKNOWN"` silently. Omitted when false.
+    #[serde(skip_serializing_if = "is_false", default)]
+    pub orphan_response: bool,
+}
+
+/// serde `skip_serializing_if` predicate for `bool` fields that default false.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize)]
