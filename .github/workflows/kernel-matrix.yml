@@ -1,0 +1,103 @@
+name: kernel-matrix (CO-RE relocatability)
+
+# Portability matrix for the BPF program across the supported kernel fleet.
+#
+# GitHub runners can only boot ONE kernel, so we cannot run the sensor on RHEL
+# 5.14, Amazon Linux 6.1, etc. directly. What we CAN do — and what actually
+# catches the real portability risk — is prove the program's CO-RE relocations
+# RESOLVE against each target kernel's real BTF: `bpftool gen min_core_btf`
+# walks every field/type the program references and fails if the target kernel
+# is missing any. If it succeeds, the program is relocatable on that kernel
+# (the same check btfgen / Inspektor Gadget use). BTFs are pulled from BTFHub.
+#
+# This is a portability SIGNAL, not a full runtime certification — booting each
+# distro in a VM (QEMU/cloud image) + running scripts/e2e-ci.sh is the eventual
+# gold standard and is intentionally not wired here yet. See docs/PORTABILITY.md.
+#
+# IMPORTANT — relocatability is NECESSARY, NOT SUFFICIENT. `min_core_btf` only
+# proves the struct fields/types the program reads exist in the target kernel.
+# It does NOT check that runtime features the program *uses* exist — most
+# notably `BPF_MAP_TYPE_RINGBUF` (mainline 5.8). So a backported 4.18-family
+# kernel (RHEL 8 / CentOS 8) can pass this check yet still fail to LOAD at
+# runtime because it has no ring buffer. The 4.18 row below is included as an
+# explicit demonstration of that seam, NOT as a supported target. The real
+# runtime floor is **5.8 mainline / RHEL 9+** (preflight in compat.rs enforces
+# it). Treat a green relocatability cell on a < 5.8 kernel as "types match",
+# never as "it runs".
+#
+# Manual + weekly; non-blocking (does not gate PRs until the fleet is certified).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+
+jobs:
+  relocatability:
+    runs-on: ubuntu-latest
+    continue-on-error: true # scaffold: a missing BTFHub path must not fail the world
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-20.04
+            dir: ubuntu/20.04/x86_64
+          - name: rhel-9 (5.14)
+            dir: rhel/9/x86_64
+          - name: rocky-9 (5.14)
+            dir: rockylinux/9/x86_64
+          - name: amazonlinux-2023
+            dir: amzn/2023/x86_64
+          - name: debian-12
+            dir: debian/12/x86_64
+          # SEAM DEMO, not a supported target: 4.18 has BTF but NO mainline
+          # ring buffer, so it can pass relocatability yet fail to load. Proves
+          # min_core_btf is necessary-not-sufficient. Real floor is 5.8 / RHEL9+.
+          - name: centos-8 (4.18 — ringbuf-absent seam demo, NOT supported)
+            dir: centos/8/x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install BPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev python3 curl
+          KERNEL_VER=$(uname -r)
+          sudo apt-get install -y "linux-tools-${KERNEL_VER}" 2>/dev/null \
+            || sudo apt-get install -y linux-tools-generic 2>/dev/null || true
+          if ! command -v bpftool &>/dev/null; then
+            BIN=$(find /usr/lib/linux-tools -name bpftool -type f 2>/dev/null | head -1)
+            [ -n "$BIN" ] && sudo ln -sf "$BIN" /usr/local/bin/bpftool
+          fi
+          bpftool version
+
+      - name: Build BPF object (from committed vmlinux.x86_64.h)
+        run: |
+          cp bpf/vmlinux.x86_64.h bpf/vmlinux.h
+          clang -O2 -g -Wall -target bpf -D__TARGET_ARCH_x86 \
+            -I/usr/include/x86_64-linux-gnu \
+            -c bpf/http_trace.bpf.c -o bpf/http_trace.bpf.o
+          test -f bpf/http_trace.bpf.o
+
+      - name: Fetch a real kernel BTF from BTFHub (${{ matrix.dir }})
+        id: btf
+        run: |
+          set -euo pipefail
+          DIR="${{ matrix.dir }}"
+          echo "Listing BTFHub dir: $DIR"
+          URL=$(curl -fsSL "https://api.github.com/repos/aquasecurity/btfhub-archive/contents/${DIR}" \
+            | python3 -c "import sys,json; fs=json.load(sys.stdin); print(next(f['download_url'] for f in fs if f['name'].endswith('.btf.tar.xz')))")
+          echo "Downloading $URL"
+          curl -fsSL "$URL" -o btf.tar.xz
+          tar xf btf.tar.xz
+          BTF=$(ls *.btf | head -1)
+          echo "Using target BTF: $BTF"
+          echo "btf_file=$BTF" >> "$GITHUB_OUTPUT"
+
+      - name: Assert CO-RE relocations resolve against this kernel
+        run: |
+          set -euo pipefail
+          # If every field/type the program reads exists in the target kernel's
+          # BTF, min_core_btf produces a tailored BTF; otherwise it errors.
+          bpftool gen min_core_btf "${{ steps.btf.outputs.btf_file }}" /tmp/tailored.btf bpf/http_trace.bpf.o
+          test -s /tmp/tailored.btf
+          echo "✅ ${{ matrix.name }}: all CO-RE relocations resolve against this kernel BTF"

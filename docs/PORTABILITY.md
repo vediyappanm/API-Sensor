@@ -30,19 +30,32 @@ the ring buffer.
 
 The 5.8 floor comes from the BPF **ring buffer** (`BPF_MAP_TYPE_RINGBUF`,
 introduced in 5.8) plus the CO-RE helper set. This is the same baseline as Falco
-`modern_bpf` and Cilium, and covers essentially the entire modern fleet:
+`modern_bpf` and Cilium, and **by design** covers essentially the entire modern
+fleet. Be precise about what "supported" means per row:
 
-| Distro / platform | Kernel | BTF | Status |
-|---|---|---|---|
-| Ubuntu 20.04+ | 5.4 HWE 5.8+, 5.15, 6.x | yes | ✅ supported |
-| RHEL / Rocky / Alma 9 | 5.14 | yes | ✅ supported |
-| Debian 11+ | 5.10+ | yes | ✅ supported |
-| Amazon Linux 2022/2023 | 5.15+ | yes | ✅ supported |
-| EKS / GKE / AKS node images | 5.10+ | yes | ✅ supported |
-| Container-Optimized OS | 5.10+ | yes | ✅ supported |
+- **✅ verified** — actually run and asserted (full e2e capture) by this project.
+- **🟡 expected** — meets the architectural requirements (kernel ≥ 5.8 + BTF +
+  x86_64) and *should* work, but is **not yet exercised in CI**. Don't read 🟡 as
+  a guarantee; it's a design expectation pending the multi-kernel rig below.
+
+| Distro / platform | Kernel | BTF | Arch | Status |
+|---|---|---|---|---|
+| Ubuntu (this build) | 6.8 | yes | x86_64 | ✅ verified |
+| Ubuntu 20.04+ | 5.4 HWE 5.8+, 5.15, 6.x | yes | x86_64 | 🟡 expected |
+| RHEL / Rocky / Alma 9 | 5.14 | yes | x86_64 | 🟡 expected |
+| Debian 11+ | 5.10+ | yes | x86_64 | 🟡 expected |
+| Amazon Linux 2022/2023 | 5.15+ | yes | x86_64 | 🟡 expected |
+| EKS / GKE / AKS node images | 5.10+ | yes | x86_64 | 🟡 expected |
+| Container-Optimized OS | 5.10+ | yes | x86_64 | 🟡 expected |
+| any arm64 node | ≥ 5.8 | yes | arm64 | ⚠️ not built (see Architecture) |
 
 On these kernels the sensor runs with `CAP_BPF` + `CAP_PERFMON` (+ `CAP_SYS_PTRACE`
 for `/proc/<pid>/maps` discovery) rather than full `--privileged`.
+
+> **Honest scope:** only the 6.8/x86_64 row is verified end-to-end. Every 🟡 row
+> is an *expectation* from the CO-RE design, not a tested claim, until the
+> multi-kernel CI matrix lands. arm64 does not build from a clean clone yet
+> (the committed `vmlinux.aarch64.h` is missing).
 
 The startup **preflight** (`userspace/src/compat.rs`) detects the kernel version,
 architecture, and BTF presence and fails fast with an actionable message if the
@@ -56,8 +69,9 @@ the BTF that CO-RE needs at load time. The industry-standard fix (Tracee,
 Inspektor Gadget, BTFHub) is to **ship a tailored BTF with the binary** and feed
 it to libbpf via `btf_custom_path`.
 
-The sensor already **detects** this case and prints the remediation. Supplying a
-custom BTF is wired through the `BTF_CUSTOM_PATH` environment variable:
+The sensor **detects** this case, prints the remediation, and — when you supply
+a BTF via `BTF_CUSTOM_PATH` — **feeds it to libbpf at load time** so CO-RE
+relocates against it:
 
 ```bash
 # Generate a minimal, program-tailored BTF for the target kernel (≈1 KB):
@@ -68,13 +82,24 @@ bpftool gen min_core_btf /sys/kernel/btf/vmlinux tailored.btf bpf/http_trace.bpf
 BTF_CUSTOM_PATH=/path/to/tailored.btf ./api-sec-sensor --bpf … --ingest …
 ```
 
-**Status:** detection + clear remediation + the `BTF_CUSTOM_PATH` hook are in
-place. Full turnkey support — embedding btfgen-minimized BTFs for a matrix of
-kernels and auto-selecting by `os-release` + `uname` + arch, plus a
-perf-buffer fallback for the < 5.8 ring-buffer gap — is the next increment and
-**must be certified on a multi-kernel test rig** before being relied on in
-production. It is intentionally not bundled yet: shipping megabytes of
-unverifiable BTF blobs into a production image is worse than a clear error.
+`BTF_CUSTOM_PATH` is applied in `open_and_load_bpf` (`userspace/src/main.rs`):
+because libbpf-rs 0.23 exposes no setter for `btf_custom_path`, the sensor opens
+the object via raw `libbpf_sys::bpf_object__open_mem` with the option set, then
+wraps it with `OpenObject::from_ptr`. This is **verified on kernel 6.8** by
+loading the program with a `bpftool gen min_core_btf` BTF (and a negative
+control: a malformed BTF makes the load fail, proving the supplied BTF is
+actually consumed rather than ignored).
+
+**Status:** detection + remediation + a **functioning** `BTF_CUSTOM_PATH` load
+path are in place and unit/loader-verified on 6.8. What is **not** yet done:
+(1) bundling btfgen-minimized BTFs for a matrix of kernels and auto-selecting by
+`os-release` + `uname` + arch, and (2) a **perf-buffer fallback for the < 5.8
+ring-buffer gap** — below 5.8 the sensor still hard-stops at preflight (there is
+no perf-buffer path in the BPF program today; it uses `BPF_MAP_TYPE_RINGBUF`
+exclusively). The BTF-less path also **must be certified on a multi-kernel test
+rig** (RHEL 7 / Ubuntu 18.04) before being relied on in production. BTF blobs
+are intentionally not bundled yet: shipping megabytes of unverifiable BTF into a
+production image is worse than a clear error.
 
 ## Graceful degradation
 
@@ -108,8 +133,28 @@ bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.aarch64.h
 
 - **Verified on kernel 6.8 (this build):** CO-RE load, ring buffer, all uprobes,
   kprobe attach + graceful degradation, preflight gating, reproducible Docker
-  build, end-to-end HTTPS capture + PII redaction (see `scripts/e2e-test.sh`).
+  build, end-to-end HTTPS capture + PII redaction (32/32 in `scripts/e2e-test.sh`),
+  the `BTF_CUSTOM_PATH` custom-BTF load path (positive + negative control), and
+  metrics-port rebind across TIME_WAIT (`SO_REUSEADDR`).
 - **Needs a multi-kernel CI matrix to certify:** behavior on RHEL 9 (5.14),
   Amazon Linux (5.15), and the Tier-2 BTF-less path on RHEL 7 / Ubuntu 18.04.
-  Recommended: a CI job that boots VM images (or BTFHub-sourced BTFs) across the
-  support matrix and runs `scripts/e2e-test.sh` on each.
+  A starter matrix workflow lives at `.github/workflows/kernel-matrix.yml`
+  (BTFHub-sourced BTFs); it checks **CO-RE relocatability** (`bpftool gen
+  min_core_btf`), which is **necessary but not sufficient** — it proves the
+  struct fields the program reads exist on the target kernel, but NOT that
+  runtime features it *uses* exist. In particular it does **not** verify
+  `BPF_MAP_TYPE_RINGBUF` (mainline 5.8): a backported 4.18 kernel (RHEL 8 /
+  CentOS 8) can pass relocatability and still fail to load for lack of a ring
+  buffer. The real runtime floor stays **5.8 mainline / RHEL 9+** (enforced by
+  the preflight). arm64 needs `bpf/vmlinux.aarch64.h` committed from an arm64
+  node plus an arm64 runner.
+- **Ring-buffer saturation / dropped-event coverage is NOT done.** The userspace
+  hot path sustains ~265k events/sec (`tests/load_test.rs`), but that does not
+  exercise the scarier failure: under a traffic burst the kernel ring buffer can
+  fill, `bpf_ringbuf_reserve` fails, and events are **dropped** — a detection
+  gap. The drop is *counted* (BPF `ringbuf_drop_counter` →
+  `apisec_ringbuf_drops_total`, asserted < 5% in `scripts/e2e-test.sh`), and the
+  ingest side has a circuit breaker, but there is **no burst/soak test that
+  deliberately saturates the ring buffer** and asserts drops are bounded and
+  observable. This is the cheapest remaining gap (pure software, no hardware) and
+  should land before relying on the sensor under heavy load.
