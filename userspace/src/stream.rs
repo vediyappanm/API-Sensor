@@ -12,7 +12,7 @@ use crate::http2::{contains_http2_preface, parse_http2_frames, Http2HpackDecoder
 use crate::mcp::{is_mcp_jsonrpc, is_mcp_response, parse_jsonrpc_mcp, parse_sse_events};
 use crate::metrics::*;
 use crate::quic;
-use crate::redaction::redact_pii;
+use crate::redaction::{compute_anomaly_features, redact_pii};
 use crate::types::*;
 use crate::websocket::{parse_websocket_frame, ws_opcode_name};
 
@@ -868,6 +868,10 @@ pub fn build_event(
         _ => 0,
     };
 
+    // Anomaly features are computed from the raw (pre-redaction) request so
+    // injection payloads and entropy reflect the actual wire content.
+    let anomaly = compute_anomaly_features(&req.path, req.body.as_deref());
+
     let redacted_path = redact_pii(&req.path);
     let (path, query) = split_query(&redacted_path);
     let net_ctx = req.net_ctx;
@@ -918,7 +922,7 @@ pub fn build_event(
         source_hostname: net_ctx.source_hostname,
         dest_hostname: net_ctx.dest_hostname,
         metadata: None,
-        anomaly_features: None,
+        anomaly_features: Some(anomaly),
     }
 }
 

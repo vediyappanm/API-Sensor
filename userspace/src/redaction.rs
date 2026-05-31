@@ -1,3 +1,4 @@
+use crate::types::AnomalyFeatures;
 use hmac::{Hmac, Mac};
 use regex::Regex;
 use sha2::Sha256;
@@ -22,6 +23,12 @@ pub enum PiiType {
     GcpToken,
     IndianPan,
     Aadhaar,
+    TelegramBotToken,
+    SlackToken,
+    GithubToken,
+    StripeKey,
+    GoogleApiKey,
+    GenericApiKey,
 }
 
 #[allow(dead_code)]
@@ -93,6 +100,12 @@ pub fn pii_token(pii_type: &PiiType, original: &str) -> String {
         PiiType::GcpToken => format!("PII_GCPTOKEN_{hash:016x}"),
         PiiType::IndianPan => format!("PII_PAN_{hash:016x}"),
         PiiType::Aadhaar => format!("PII_AADHAAR_{hash:016x}"),
+        PiiType::TelegramBotToken => format!("PII_TGBOT_{hash:016x}"),
+        PiiType::SlackToken => format!("PII_SLACK_{hash:016x}"),
+        PiiType::GithubToken => format!("PII_GHTOKEN_{hash:016x}"),
+        PiiType::StripeKey => format!("PII_STRIPE_{hash:016x}"),
+        PiiType::GoogleApiKey => format!("PII_GOOGLEKEY_{hash:016x}"),
+        PiiType::GenericApiKey => format!("PII_APIKEY_{hash:016x}"),
     }
 }
 
@@ -105,6 +118,34 @@ fn init_pii_patterns() -> Vec<(PiiType, Regex)> {
         (
             PiiType::BearerToken,
             Regex::new(r"(?i)Bearer\s+([A-Za-z0-9\-._~+/]+=*)").unwrap(),
+        ),
+        // Telegram bot token: <bot_id>:<auth_hash> (e.g. 123456789:AAH...).
+        // This is the format that leaked unredacted into a request path.
+        (
+            // No leading \b: the bot id is often glued to a path segment
+            // (e.g. `/bot<id>:<hash>`), so there is no word boundary before it.
+            PiiType::TelegramBotToken,
+            Regex::new(r"\d{6,12}:[A-Za-z0-9_-]{30,}\b").unwrap(),
+        ),
+        // Slack tokens: xoxb-/xoxp-/xoxa-/xoxr-/xoxs-...
+        (
+            PiiType::SlackToken,
+            Regex::new(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b").unwrap(),
+        ),
+        // GitHub tokens: ghp_/gho_/ghu_/ghs_/ghr_ + 36+ base62 chars
+        (
+            PiiType::GithubToken,
+            Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b").unwrap(),
+        ),
+        // Stripe secret/restricted/publishable keys
+        (
+            PiiType::StripeKey,
+            Regex::new(r"\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}\b").unwrap(),
+        ),
+        // Google API key: AIza + 35 chars
+        (
+            PiiType::GoogleApiKey,
+            Regex::new(r"\bAIza[A-Za-z0-9_-]{35}\b").unwrap(),
         ),
         (
             PiiType::Email,
@@ -143,6 +184,17 @@ fn init_pii_patterns() -> Vec<(PiiType, Regex)> {
             PiiType::Aadhaar,
             Regex::new(r"(?i)(?:aadhaar|uid|aadhar)[:\s=]+[2-9]\d{3}[\s-]\d{4}[\s-]\d{4}").unwrap(),
         ),
+        // Generic secret carried in a `key=value` / `key:value` context. The
+        // capture group isolates the value so only the secret is redacted and
+        // the field name (e.g. `api_key=`) is preserved. Kept LAST so the
+        // specific provider patterns above win on any overlap.
+        (
+            PiiType::GenericApiKey,
+            Regex::new(
+                r#"(?i)(?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret)["']?\s*[:=]\s*["']?([A-Za-z0-9_\-]{16,})"#,
+            )
+            .unwrap(),
+        ),
     ]
 }
 
@@ -178,18 +230,27 @@ pub fn redact_pii(text: &str) -> String {
     let patterns = PII_PATTERNS.get_or_init(init_pii_patterns);
     let mut result = text.to_string();
     for (pii_type, pattern) in patterns {
+        // Patterns with an explicit capture group redact only group 1 (the
+        // secret value), preserving surrounding context like `api_key=` or the
+        // `Bearer ` scheme. Patterns without a group redact the whole match.
+        let group_only = pattern.captures_len() > 1;
         // Collect all matches first (to avoid borrow conflict during replacement)
+        let snapshot = result.clone();
         let ranges: Vec<(usize, usize, String)> = pattern
-            .find_iter(&result.clone())
-            .filter(|m| {
-                // Apply Luhn validation for credit card matches
-                if *pii_type == PiiType::CreditCard {
-                    luhn_check(m.as_str())
-                } else {
-                    true
+            .captures_iter(&snapshot)
+            .filter_map(|caps| {
+                let full = caps.get(0)?;
+                // Apply Luhn validation for credit card matches (whole number)
+                if *pii_type == PiiType::CreditCard && !luhn_check(full.as_str()) {
+                    return None;
                 }
+                let target = if group_only { caps.get(1)? } else { full };
+                Some((
+                    target.start(),
+                    target.end(),
+                    pii_token(pii_type, target.as_str()),
+                ))
             })
-            .map(|m| (m.start(), m.end(), pii_token(pii_type, m.as_str())))
             .collect();
         // Replace in reverse order to preserve offsets
         for (start, end, token) in ranges.into_iter().rev() {
@@ -197,6 +258,160 @@ pub fn redact_pii(text: &str) -> String {
         }
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// Anomaly feature extraction
+//
+// Computes the lightweight `AnomalyFeatures` vector attached to every API
+// traffic event. These are cheap, deterministic signals derived from the raw
+// (pre-redaction) request — they feed downstream ML/anomaly scoring and double
+// as coarse injection flags (SQLi / XSS / path traversal).
+// ---------------------------------------------------------------------------
+
+static SQLI_RE: OnceLock<Regex> = OnceLock::new();
+static XSS_RE: OnceLock<Regex> = OnceLock::new();
+
+fn sqli_re() -> &'static Regex {
+    SQLI_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(\bunion\b\s+\bselect\b|\bselect\b\s+.{0,80}?\bfrom\b|'\s*or\s+'?1'?\s*=\s*'?1|\bor\b\s+1\s*=\s*1\b|;\s*\b(?:drop|delete|insert|update|alter)\b|--\s|/\*.*\*/|\bxp_cmdshell\b|\bsleep\s*\(\s*\d|\bbenchmark\s*\(|\bwaitfor\s+delay\b)"#,
+        )
+        .unwrap()
+    })
+}
+
+fn xss_re() -> &'static Regex {
+    XSS_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(<\s*script\b|<\s*/\s*script\s*>|javascript:|on(?:error|load|click|mouseover|focus)\s*=|<\s*iframe\b|<\s*svg\b|<\s*img\b[^>]*\bonerror|document\.cookie|\beval\s*\(|alert\s*\()"#,
+        )
+        .unwrap()
+    })
+}
+
+/// Lightweight percent-decoder used for injection detection so that encoded
+/// payloads (e.g. `%27%20OR%201=1`) are caught. Decodes valid `%XX` escapes,
+/// leaves malformed ones intact. Returns `(decoded, had_any_encoding)`.
+fn percent_decode(s: &str) -> (String, bool) {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut had_encoding = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                had_encoding = true;
+                i += 3;
+                continue;
+            }
+        }
+        // A '+' in a query string also denotes an encoded space.
+        if bytes[i] == b'+' {
+            had_encoding = true;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    (String::from_utf8_lossy(&out).into_owned(), had_encoding)
+}
+
+/// Shannon entropy (bits/byte) of a string — high values flag obfuscated or
+/// packed payloads. Returns 0.0 for empty input; range is [0, 8].
+fn shannon_entropy(s: &str) -> f32 {
+    if s.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u32; 256];
+    for &b in s.as_bytes() {
+        counts[b as usize] += 1;
+    }
+    let len = s.len() as f32;
+    let mut entropy = 0.0f32;
+    for &c in counts.iter() {
+        if c > 0 {
+            let p = c as f32 / len;
+            entropy -= p * p.log2();
+        }
+    }
+    entropy
+}
+
+/// Bucket a byte count into a coarse 0–5 scale (log-ish): 0:<256, 1:<1K,
+/// 2:<4K, 3:<16K, 4:<64K, 5:>=64K.
+fn size_bucket(n: usize) -> u8 {
+    match n {
+        0..=255 => 0,
+        256..=1023 => 1,
+        1024..=4095 => 2,
+        4096..=16383 => 3,
+        16384..=65535 => 4,
+        _ => 5,
+    }
+}
+
+/// Derive the `AnomalyFeatures` vector from a raw request path (which may
+/// include a `?query`) and an optional body. Computed on the *raw*, decoded
+/// request so injection payloads and entropy reflect the wire content, not the
+/// redacted form.
+pub fn compute_anomaly_features(raw_path: &str, body: Option<&str>) -> AnomalyFeatures {
+    let (base, query) = match raw_path.split_once('?') {
+        Some((b, q)) => (b, q),
+        None => (raw_path, ""),
+    };
+
+    let path_depth = base
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .count()
+        .min(u8::MAX as usize) as u8;
+
+    let query_param_count = if query.is_empty() {
+        0
+    } else {
+        query
+            .split('&')
+            .filter(|s| !s.is_empty())
+            .count()
+            .min(u8::MAX as usize) as u8
+    };
+
+    let (decoded_path, enc_path) = percent_decode(raw_path);
+    let (decoded_body, enc_body) = match body {
+        Some(b) => percent_decode(b),
+        None => (String::new(), false),
+    };
+    let has_encoded_chars = enc_path || enc_body;
+
+    // Build the detection corpus from the decoded path/query plus body.
+    let mut corpus = decoded_path.clone();
+    if !decoded_body.is_empty() {
+        corpus.push('\n');
+        corpus.push_str(&decoded_body);
+    }
+
+    let has_sqli_pattern = sqli_re().is_match(&corpus);
+    let has_xss_pattern = xss_re().is_match(&corpus);
+    let has_path_traversal = decoded_path.contains("../")
+        || decoded_path.contains("..\\")
+        || decoded_body.contains("../")
+        || decoded_body.contains("..\\");
+
+    let total_size = raw_path.len() + body.map(|b| b.len()).unwrap_or(0);
+
+    AnomalyFeatures {
+        path_depth,
+        query_param_count,
+        has_encoded_chars,
+        request_size_bucket: size_bucket(total_size),
+        shannon_entropy: shannon_entropy(raw_path),
+        has_sqli_pattern,
+        has_xss_pattern,
+        has_path_traversal,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +524,150 @@ mod tests {
         assert!(!super::luhn_check("4111111111111112"));
         // Too short
         assert!(!super::luhn_check("123"));
+    }
+
+    #[test]
+    fn test_pii_redact_telegram_bot_token_in_path() {
+        // Reproduces the leak shape observed during e2e capture (a bot token in
+        // a URL path). The token is SYNTHETIC and assembled at runtime so no
+        // credential-shaped literal lands in source (push-protection / scanners).
+        let token = format!(
+            "{}:{}",
+            "100000000", "AAFsyntheticTESTtokenValue0000000000zz"
+        );
+        let input = format!("/bot{token}/getUpdates");
+        let output = redact_pii(&input);
+        assert!(!output.contains(&token));
+        assert!(output.contains("PII_TGBOT_"));
+        // Surrounding path structure is preserved.
+        assert!(output.starts_with("/bot"));
+        assert!(output.ends_with("/getUpdates"));
+    }
+
+    #[test]
+    fn test_pii_redact_slack_token() {
+        // Assembled at runtime so the literal token never appears in source.
+        let token = format!("xoxb-{}-{}", "111111111111", "ABCdefABCdefABCdef");
+        let input = format!("token={token}");
+        let output = redact_pii(&input);
+        assert!(!output.contains(&token));
+        assert!(output.contains("PII_SLACK_"));
+    }
+
+    #[test]
+    fn test_pii_redact_github_token() {
+        let input = "Authorization: ghp_1234567890abcdefABCDEF1234567890abcdef";
+        let output = redact_pii(input);
+        assert!(!output.contains("ghp_1234567890abcdefABCDEF1234567890abcdef"));
+        assert!(output.contains("PII_GHTOKEN_"));
+    }
+
+    #[test]
+    fn test_pii_redact_stripe_key() {
+        // Assembled at runtime so the literal key never appears in source.
+        let key = format!("sk_{}_{}", "live", "FAKEstripeKEYforTESTS0001");
+        let output = redact_pii(&key);
+        assert!(!output.contains(&key));
+        assert!(output.contains("PII_STRIPE_"));
+    }
+
+    #[test]
+    fn test_pii_redact_google_api_key() {
+        let input = "key=AIzaSyA1234567890abcdefghijklmnopqrstuv";
+        let output = redact_pii(input);
+        assert!(!output.contains("AIzaSyA1234567890abcdefghijklmnopqrstuv"));
+        assert!(output.contains("PII_GOOGLEKEY_"));
+    }
+
+    #[test]
+    fn test_pii_redact_generic_api_key_preserves_field_name() {
+        let input = "/v1/data?api_key=s3cr3tValue1234567890&page=2";
+        let output = redact_pii(input);
+        assert!(!output.contains("s3cr3tValue1234567890"));
+        assert!(output.contains("PII_APIKEY_"));
+        // Only the value is redacted; the field name and other params remain.
+        assert!(output.contains("api_key="));
+        assert!(output.contains("page=2"));
+    }
+
+    #[test]
+    fn test_pii_no_false_positive_short_path_segment() {
+        // Ordinary numeric/short path ids must not trip the new patterns.
+        let input = "/users/12345/orders/678";
+        let output = redact_pii(input);
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn test_anomaly_basic_path() {
+        let f = compute_anomaly_features("/api/v1/users/list", None);
+        assert_eq!(f.path_depth, 4);
+        assert_eq!(f.query_param_count, 0);
+        assert!(!f.has_encoded_chars);
+        assert_eq!(f.request_size_bucket, 0);
+        assert!(!f.has_sqli_pattern);
+        assert!(!f.has_xss_pattern);
+        assert!(!f.has_path_traversal);
+        assert!(f.shannon_entropy > 0.0);
+    }
+
+    #[test]
+    fn test_anomaly_query_param_count_and_encoding() {
+        let f = compute_anomaly_features("/search?q=hello%20world&page=2&sort=asc", None);
+        assert_eq!(f.query_param_count, 3);
+        assert!(f.has_encoded_chars);
+    }
+
+    #[test]
+    fn test_anomaly_sqli_detection() {
+        let f = compute_anomaly_features("/items?id=1' OR '1'='1", None);
+        assert!(f.has_sqli_pattern);
+        // Encoded variant is decoded before matching.
+        let f2 = compute_anomaly_features("/items?q=%27%20OR%201=1%20--%20", None);
+        assert!(f2.has_sqli_pattern);
+        let f3 =
+            compute_anomaly_features("/items?q=UNION%20SELECT%20password%20FROM%20users", None);
+        assert!(f3.has_sqli_pattern);
+    }
+
+    #[test]
+    fn test_anomaly_xss_detection() {
+        let f = compute_anomaly_features("/page?name=<script>alert(1)</script>", None);
+        assert!(f.has_xss_pattern);
+        let f2 = compute_anomaly_features("/p?x=%3Cimg%20src=x%20onerror=alert(1)%3E", None);
+        assert!(f2.has_xss_pattern);
+    }
+
+    #[test]
+    fn test_anomaly_path_traversal_detection() {
+        let f = compute_anomaly_features("/files?name=../../etc/passwd", None);
+        assert!(f.has_path_traversal);
+        let f2 = compute_anomaly_features("/files?name=..%2f..%2fetc%2fpasswd", None);
+        assert!(f2.has_path_traversal);
+    }
+
+    #[test]
+    fn test_anomaly_benign_no_false_positives() {
+        let f = compute_anomaly_features("/v1/products?category=books&inStock=true", None);
+        assert!(!f.has_sqli_pattern);
+        assert!(!f.has_xss_pattern);
+        assert!(!f.has_path_traversal);
+    }
+
+    #[test]
+    fn test_anomaly_size_bucket_from_body() {
+        let body = "x".repeat(5000);
+        let f = compute_anomaly_features("/upload", Some(&body));
+        assert_eq!(f.request_size_bucket, 3); // 4096..=16383
+    }
+
+    #[test]
+    fn test_shannon_entropy_bounds() {
+        assert_eq!(super::shannon_entropy(""), 0.0);
+        // A single repeated char has zero entropy.
+        assert_eq!(super::shannon_entropy("aaaaaaaa"), 0.0);
+        // Mixed content has positive entropy.
+        assert!(super::shannon_entropy("a1B2c3D4") > 2.0);
     }
 
     #[test]
