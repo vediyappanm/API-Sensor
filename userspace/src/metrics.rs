@@ -148,15 +148,27 @@ pub async fn start_metrics_server(port: u16) {
         .route("/healthz", get(health_handler))
         .route("/readyz", get(ready_handler));
     let addr = format!("0.0.0.0:{port}");
-    match tokio::net::TcpListener::bind(&addr).await {
-        Ok(listener) => {
-            tracing::info!(addr = %addr, "metrics server started");
-            if let Err(e) = axum::serve(listener, app).await {
-                tracing::error!(error = %e, "metrics server error");
-            }
-        }
+    // Build the listener via TcpSocket so we can set SO_REUSEADDR: a sensor
+    // restart (or crash-loop) within the previous socket's TIME_WAIT window
+    // would otherwise fail to rebind the metrics port with EADDRINUSE.
+    let listener = match bind_reuse(port).await {
+        Ok(l) => l,
         Err(e) => {
             tracing::error!(addr = %addr, error = %e, "cannot bind metrics server");
+            return;
         }
+    };
+    tracing::info!(addr = %addr, "metrics server started");
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!(error = %e, "metrics server error");
     }
+}
+
+/// Bind `0.0.0.0:<port>` with `SO_REUSEADDR` so the metrics endpoint can rebind
+/// across a fast restart (TIME_WAIT) instead of failing with EADDRINUSE.
+async fn bind_reuse(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    let sock = tokio::net::TcpSocket::new_v4()?;
+    sock.set_reuseaddr(true)?;
+    sock.bind(std::net::SocketAddr::from(([0, 0, 0, 0], port)))?;
+    sock.listen(1024)
 }
