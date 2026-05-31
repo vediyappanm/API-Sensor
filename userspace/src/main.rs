@@ -45,6 +45,61 @@ use crate::stream::ShardedStreamState;
 use crate::types::*;
 
 // ---------------------------------------------------------------------------
+// BPF object open/load
+// ---------------------------------------------------------------------------
+
+/// Open and load the BPF object, honoring `$BTF_CUSTOM_PATH` for BTF-less
+/// kernels (RHEL 7 / Ubuntu 18.04 / `CONFIG_DEBUG_INFO_BTF=n`).
+///
+/// libbpf-rs 0.23's `ObjectBuilder` exposes no setter for `btf_custom_path`, so
+/// when a custom BTF is supplied we open via raw `libbpf_sys` with the option
+/// set, then wrap the pointer with the public `OpenObject::from_ptr`. Without a
+/// custom BTF this is exactly the previous safe path. This is the wiring that
+/// makes the `BTF_CUSTOM_PATH` documented in docs/PORTABILITY.md actually take
+/// effect at load time (previously it was only inspected by the preflight).
+fn open_and_load_bpf(obj_data: &[u8], custom_btf: Option<&str>) -> Result<libbpf_rs::Object> {
+    let Some(btf_path) = custom_btf else {
+        return Ok(ObjectBuilder::default().open_memory(obj_data)?.load()?);
+    };
+
+    use libbpf_rs::libbpf_sys;
+    use std::ffi::{c_void, CString};
+    use std::ptr::NonNull;
+
+    // Kept alive across the open call; libbpf copies the path internally.
+    let btf_c = CString::new(btf_path)
+        .map_err(|_| anyhow::anyhow!("BTF_CUSTOM_PATH contains an interior NUL byte"))?;
+
+    // SAFETY: `opts` is a C-ABI POD; zeroing then setting `sz` is the libbpf
+    // contract for forward/backward-compatible option structs.
+    let mut opts: libbpf_sys::bpf_object_open_opts = unsafe { std::mem::zeroed() };
+    opts.sz = std::mem::size_of::<libbpf_sys::bpf_object_open_opts>() as libbpf_sys::size_t;
+    opts.btf_custom_path = btf_c.as_ptr();
+
+    // SAFETY: `obj_data` is a valid byte slice; `opts` outlives the call.
+    let raw = unsafe {
+        libbpf_sys::bpf_object__open_mem(
+            obj_data.as_ptr() as *const c_void,
+            obj_data.len() as libbpf_sys::size_t,
+            &opts,
+        )
+    };
+    let ptr = NonNull::new(raw).ok_or_else(|| {
+        anyhow::anyhow!(
+            "libbpf failed to open BPF object with custom BTF '{btf_path}' \
+             (check the BTF matches the running kernel)"
+        )
+    })?;
+
+    // SAFETY: `ptr` is a freshly opened, not-yet-loaded bpf_object from libbpf.
+    let open_obj = unsafe { libbpf_rs::OpenObject::from_ptr(ptr)? };
+    let loaded = open_obj.load()?;
+    drop(btf_c);
+    tracing::info!(btf = %btf_path, "loaded BPF object using custom BTF (CO-RE relocated against supplied BTF)");
+    Ok(loaded)
+}
+
+// ---------------------------------------------------------------------------
 // Tracing / OpenTelemetry initialization
 // ---------------------------------------------------------------------------
 
@@ -391,7 +446,9 @@ async fn main() -> Result<()> {
     tokio::spawn(start_metrics_server(args.metrics_port));
 
     let obj_data = fs::read(&args.bpf)?;
-    let mut obj = ObjectBuilder::default().open_memory(&obj_data)?.load()?;
+    // Honors $BTF_CUSTOM_PATH (the same value the preflight validated above) so
+    // CO-RE relocates against a supplied BTF on BTF-less kernels.
+    let mut obj = open_and_load_bpf(&obj_data, custom_btf.as_deref())?;
 
     let mut links = Vec::new();
     let mut tls_libs = args.tls_libs.clone();
