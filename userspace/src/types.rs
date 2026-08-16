@@ -215,6 +215,7 @@ pub struct ParsedRequest {
     pub headers: HashMap<String, String>,
     pub ts_ms: u64,
     pub net_ctx: NetContext,
+    pub body: Vec<u8>,
 }
 
 #[derive(Debug, Serialize)]

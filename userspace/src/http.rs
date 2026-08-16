@@ -11,12 +11,14 @@ pub struct HttpRequestParsed {
     pub path: String,
     pub host: Option<String>,
     pub headers: HashMap<String, String>,
+    pub body: Vec<u8>,
 }
 
 #[derive(Debug)]
 pub struct HttpResponseParsed {
     pub status_code: i32,
     pub headers: HashMap<String, String>,
+    pub body: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -77,6 +79,7 @@ pub fn extract_http_header(buf: &[u8]) -> Option<(HttpMessage, Vec<u8>)> {
                 path: "/".to_string(),
                 host: None,
                 headers: HashMap::new(),
+                body: Vec::new(),
             }), remaining));
         }
     };
@@ -87,8 +90,8 @@ pub fn extract_http_header(buf: &[u8]) -> Option<(HttpMessage, Vec<u8>)> {
         let _ = parts.next();
         let status = parts.next().unwrap_or("0").parse::<i32>().unwrap_or(0);
         let headers = parse_headers(lines);
-        let remaining = advance_past_body(&headers, buf, body_start);
-        return Some((HttpMessage::Response(HttpResponseParsed { status_code: status, headers }), remaining));
+        let (body, remaining) = split_body(&headers, buf, body_start);
+        return Some((HttpMessage::Response(HttpResponseParsed { status_code: status, headers, body }), remaining));
     }
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("GET").to_string();
@@ -101,39 +104,44 @@ pub fn extract_http_header(buf: &[u8]) -> Option<(HttpMessage, Vec<u8>)> {
             path: "/".to_string(),
             host: None,
             headers: HashMap::new(),
+            body: Vec::new(),
         }), remaining));
     }
     let path    = parts.next().unwrap_or("/").to_string();
     let headers = parse_headers(lines);
     let host    = headers.get("host").cloned();
-    let remaining = advance_past_body(&headers, buf, body_start);
-    Some((HttpMessage::Request(HttpRequestParsed { method, path, host, headers }), remaining))
+    let (body, remaining) = split_body(&headers, buf, body_start);
+    Some((HttpMessage::Request(HttpRequestParsed { method, path, host, headers, body }), remaining))
 }
 
-fn advance_past_body(
+/// Split the bytes after the header block into (body, remaining-after-body).
+/// Only a fully-present body (per content-length / chunked framing) is
+/// returned; a partial body yields an empty body and leaves the bytes in
+/// `remaining` so the caller can wait for the rest.
+fn split_body(
     headers: &HashMap<String, String>,
     buf: &[u8],
     body_start: usize,
-) -> Vec<u8> {
+) -> (Vec<u8>, Vec<u8>) {
     let body_slice = &buf[body_start..];
 
     if headers.get("transfer-encoding").map(|v| v.contains("chunked")).unwrap_or(false) {
-        if let Some((_decoded, consumed)) = decode_chunked_body(body_slice) {
-            return body_slice[consumed..].to_vec();
+        if let Some((decoded, consumed)) = decode_chunked_body(body_slice) {
+            return (decoded, body_slice[consumed..].to_vec());
         }
-        return body_slice.to_vec();
+        return (Vec::new(), body_slice.to_vec());
     }
 
     if let Some(len_str) = headers.get("content-length") {
         if let Ok(content_len) = len_str.trim().parse::<usize>() {
             if body_slice.len() >= content_len {
-                return body_slice[content_len..].to_vec();
+                return (body_slice[..content_len].to_vec(), body_slice[content_len..].to_vec());
             }
-            return body_slice.to_vec();
+            return (Vec::new(), body_slice.to_vec());
         }
     }
 
-    body_slice.to_vec()
+    (Vec::new(), body_slice.to_vec())
 }
 
 pub fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> HashMap<String, String> {

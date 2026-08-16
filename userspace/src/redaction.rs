@@ -371,7 +371,7 @@ mod tests {
         // token (GitHub push protection flags sk_test_ + 24 alphanumerics).
         let key = format!("sk_{}_{}", "test", "AAAABBBBCCCCDDDD00001111");
         let output = redact_pii(&format!("Authorization: Bearer {key}"));
-        assert!(!output.contains(key));
+        assert!(!output.contains(&key));
         assert!(output.contains("PII_STRIPE_"));
     }
 

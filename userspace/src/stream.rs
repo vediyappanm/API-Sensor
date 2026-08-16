@@ -24,6 +24,22 @@ use crate::websocket::parse_websocket_frame;
 const MAX_PENDING_PER_CONN: usize = 100;
 const MAX_H2_PENDING_STREAMS: usize = 200;
 
+/// Cap on captured request/response body bytes shipped per event. Bodies are
+/// evidence, not archives — the kernel already truncates at 32 KiB, and this
+/// keeps batch size and PII-scan cost bounded.
+pub const MAX_BODY_CAPTURE_BYTES: usize = 8192;
+
+/// Redact PII from a captured body and cap its length. Returns None for an
+/// empty body so the wire field stays null rather than "".
+fn redact_and_cap_body(raw: &[u8]) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    let capped = &raw[..raw.len().min(MAX_BODY_CAPTURE_BYTES)];
+    let text = String::from_utf8_lossy(capped);
+    Some(redact_pii(&text))
+}
+
 fn skip_unpaired_response() {
     UNPAIRED_RESPONSES.fetch_add(1, Ordering::Relaxed);
 }
@@ -374,6 +390,7 @@ impl StreamState {
                                 headers: headers.clone(),
                                 ts_ms,
                                 net_ctx,
+                                body: Vec::new(),
                             });
                         }
                     }
@@ -388,6 +405,7 @@ impl StreamState {
                     let resp = HttpResponseParsed {
                         status_code: status.parse::<i32>().unwrap_or(0),
                         headers: headers.clone(),
+                        body: Vec::new(),
                     };
                     let event = build_event(
                         self.account_id, ts_ms, request, resp, latency_ms, "HTTP/3", "ebpf",
@@ -463,6 +481,7 @@ impl StreamState {
                                 headers: req.headers,
                                 ts_ms,
                                 net_ctx,
+                                body: req.body,
                             });
                         }
                     }
@@ -597,6 +616,7 @@ impl StreamState {
                             headers: headers.clone(),
                             ts_ms,
                             net_ctx: net_ctx.clone().unwrap_or_default(),
+                            body: Vec::new(),
                         });
                     }
                     // Don't clear the buffer here — multiplexed streams may
@@ -616,20 +636,22 @@ impl StreamState {
                     continue;
                 };
                 let latency_ms = ts_ms.saturating_sub(request.ts_ms);
-                let resp = HttpResponseParsed {
-                    status_code: status.parse::<i32>().unwrap_or(0),
-                    headers: headers.clone(),
-                };
                 let is_grpc = headers
                     .get("content-type")
                     .map(|v| v.starts_with("application/grpc"))
                     .unwrap_or(false);
 
-                // gRPC protobuf body decode — feed only this stream's DATA
-                // payloads; the raw connection buffer starts with frame
-                // headers, not the 5-byte gRPC message prefix.
+                // This stream's response DATA payloads. For plain HTTP/2 REST
+                // this is the response body; for gRPC it's protobuf bytes we
+                // decode into fields instead of shipping raw.
+                let data = extract_data_frames(&conn_state.buffer, stream_id);
+                let resp = HttpResponseParsed {
+                    status_code: status.parse::<i32>().unwrap_or(0),
+                    headers: headers.clone(),
+                    body: if is_grpc { Vec::new() } else { data.clone() },
+                };
+
                 let grpc_body = if is_grpc {
-                    let data = extract_data_frames(&conn_state.buffer, stream_id);
                     let fields = decode_grpc_fields(&data);
                     if !fields.is_empty() {
                         serde_json::to_string(&fields).ok()
@@ -844,6 +866,10 @@ pub fn build_event(
         .map(|(k, v)| (k, redact_pii(&v)))
         .collect();
 
+    // Bodies are evidence: capture what the kernel gave us, redacted and capped.
+    let req_body = redact_and_cap_body(&req.body);
+    let resp_body = redact_and_cap_body(&resp.body);
+
     ApiTrafficEvent {
         version: "v1".to_string(),
         event_type: "api_traffic".to_string(),
@@ -858,12 +884,12 @@ pub fn build_event(
             scheme: "https".to_string(),
             headers: redacted_req_headers,
             query,
-            body: None,
+            body: req_body,
         },
         response: ApiResponse {
             status_code: resp.status_code,
             headers: redacted_resp_headers,
-            body: None,
+            body: resp_body,
             latency_ms: Some(latency_ms),
         },
         collection_id: None,
@@ -1046,6 +1072,52 @@ mod tests {
         assert!(
             arr[0]["value_str"].as_str().unwrap().contains("test"),
             "decoded value should contain 'test': {body}"
+        );
+    }
+
+    #[test]
+    fn http1_captures_and_redacts_request_and_response_bodies() {
+        let state = test_state();
+        let body = "{\"email\":\"alice@example.com\"}";
+        let req = format!(
+            "POST /api/login HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body
+        );
+        assert!(state.handle_event(&tls_event(0), req.as_bytes()).is_empty());
+
+        let resp_body = "{\"status\":\"ok\"}";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            resp_body.len(), resp_body
+        );
+        let events = state.handle_event(&tls_event(1), resp.as_bytes());
+        assert_eq!(events.len(), 1);
+
+        let rb = events[0].request.body.as_deref().expect("request body captured");
+        assert!(!rb.contains("alice@example.com"), "email must be redacted: {rb}");
+        assert!(rb.contains("PII_EMAIL_"), "expected redaction token: {rb}");
+
+        let respb = events[0].response.body.as_deref().expect("response body captured");
+        assert!(respb.contains("ok"), "response body should be captured: {respb}");
+    }
+
+    #[test]
+    fn oversized_request_body_is_capped() {
+        let state = test_state();
+        let big = "a".repeat(20_000);
+        let req = format!(
+            "POST /upload HTTP/1.1\r\nHost: h\r\nContent-Length: {}\r\n\r\n{}",
+            big.len(), big
+        );
+        assert!(state.handle_event(&tls_event(0), req.as_bytes()).is_empty());
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let events = state.handle_event(&tls_event(1), resp);
+        assert_eq!(events.len(), 1);
+        let rb = events[0].request.body.as_deref().expect("request body captured");
+        assert!(
+            rb.len() <= MAX_BODY_CAPTURE_BYTES,
+            "body must be capped to {MAX_BODY_CAPTURE_BYTES}, got {}",
+            rb.len()
         );
     }
 
