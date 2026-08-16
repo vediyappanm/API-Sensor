@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub static EVENTS_CAPTURED:    AtomicU64 = AtomicU64::new(0);
 pub static EVENTS_DROPPED:     AtomicU64 = AtomicU64::new(0);
+pub static UNPAIRED_RESPONSES: AtomicU64 = AtomicU64::new(0);
 pub static EVENTS_SENT:        AtomicU64 = AtomicU64::new(0);
 pub static SEND_ERRORS:        AtomicU64 = AtomicU64::new(0);
 pub static RINGBUF_DROPS:      AtomicU64 = AtomicU64::new(0);
@@ -34,6 +35,10 @@ apisec_events_captured_total {captured}
 # HELP apisec_events_dropped_total Events dropped
 # TYPE apisec_events_dropped_total counter
 apisec_events_dropped_total {dropped}
+
+# HELP apisec_unpaired_responses_total HTTP responses with no matching request
+# TYPE apisec_unpaired_responses_total counter
+apisec_unpaired_responses_total {}
 
 # HELP apisec_events_sent_total Individual events sent to ingest
 # TYPE apisec_events_sent_total counter
@@ -73,6 +78,7 @@ apisec_channel_watermark_pct {}
 # TYPE apisec_uptime_seconds gauge
 apisec_uptime_seconds {uptime}
 ",
+        UNPAIRED_RESPONSES.load(Ordering::Relaxed),
         EVENTS_SENT.load(Ordering::Relaxed),
         SEND_ERRORS.load(Ordering::Relaxed),
         ACTIVE_CONNECTIONS.load(Ordering::Relaxed),

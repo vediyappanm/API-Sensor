@@ -41,6 +41,16 @@ fn bpf_ts_to_wall_ms(bpf_ns: u64) -> u64 {
     (mono_ms + wall_mono_offset_ms()).max(0) as u64
 }
 
+/// `observed_at` is wall-clock epoch ms when >= 1e12 (after 2001-09-09).
+/// Smaller values are treated as BPF ktime and converted.
+fn wall_ms_for_event(observed_at: u64) -> u64 {
+    if observed_at >= 1_000_000_000_000 {
+        observed_at
+    } else {
+        bpf_ts_to_wall_ms(observed_at)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
@@ -111,9 +121,9 @@ fn event_to_value(ev: ApiTrafficEvent) -> Value {
     m.insert("LogVersion".into(), json!("v4"));
     m.insert("Id".into(), json!(make_event_id(ev.observed_at, ev.source_port.unwrap_or(0))));
 
-    // SessionStats.StartTime: observed_at is BPF ktime_get_ns (monotonic ns since boot).
-    // Convert to wall-clock ms by anchoring to SystemTime at process start.
-    let wall_ms = bpf_ts_to_wall_ms(ev.observed_at);
+    // SessionStats.StartTime: prefer wall-clock epoch ms from userspace.
+    // Legacy events stored BPF ktime (ns or ms since boot) and need conversion.
+    let wall_ms = wall_ms_for_event(ev.observed_at);
     m.insert("SessionStats.StartTime".into(), json!(format_iso8601(wall_ms)));
     m.insert("SessionStats.TimeToLastDownstreamTxByte".into(),
         json!(ev.response.latency_ms.unwrap_or(0)));
@@ -384,5 +394,11 @@ mod tests {
         assert_eq!(l7_proto_name("HTTP/1.1"), "HTTP11");
         assert_eq!(l7_proto_name("HTTP/2"),   "HTTP2");
         assert_eq!(l7_proto_name("gRPC"),     "GRPC");
+    }
+
+    #[test]
+    fn wall_ms_for_event_keeps_epoch_ms() {
+        let epoch_ms = 1_787_000_000_000;
+        assert_eq!(wall_ms_for_event(epoch_ms), epoch_ms);
     }
 }

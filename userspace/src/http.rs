@@ -93,6 +93,8 @@ pub fn extract_http_header(buf: &[u8]) -> Option<(HttpMessage, Vec<u8>)> {
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("GET").to_string();
     if !is_http_method(&method) {
+        // Consume the bytes so the stream buffer can advance, but do not
+        // invent a fake GET /. Callers must not queue this as a request.
         let remaining = buf[body_start..].to_vec();
         return Some((HttpMessage::Request(HttpRequestParsed {
             method: "UNKNOWN".to_string(),
@@ -145,11 +147,16 @@ pub fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> HashMap<String
     headers
 }
 
-fn is_http_method(method: &str) -> bool {
+pub fn is_http_method(method: &str) -> bool {
     matches!(
         method,
         "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE" | "CONNECT"
     )
+}
+
+/// True when method/path are real HTTP, not the sensor's unpaired-response placeholder.
+pub fn is_usable_http_request(method: &str, path: &str) -> bool {
+    is_http_method(method) && !path.is_empty()
 }
 
 pub fn discover_tls_libs(pid: i32) -> Vec<String> {
@@ -222,5 +229,28 @@ mod tests {
         let (body, consumed) = decode_chunked_body(chunked).unwrap();
         assert_eq!(&body, b"hello world");
         assert_eq!(consumed, chunked.len());
+    }
+
+    #[test]
+    fn usable_request_rejects_unknown_placeholder() {
+        assert!(is_usable_http_request("GET", "/api/sensors/"));
+        assert!(is_usable_http_request("POST", "/v2/"));
+        assert!(!is_usable_http_request("UNKNOWN", "/"));
+        assert!(!is_usable_http_request("TEXT", "/ws"));
+        assert!(!is_usable_http_request("GET", ""));
+    }
+
+    #[test]
+    fn invalid_first_line_is_unknown_placeholder_not_queued_as_http() {
+        let buf = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        let (msg, _) = extract_http_header(buf).unwrap();
+        match msg {
+            HttpMessage::Request(req) => {
+                assert_eq!(req.method, "UNKNOWN");
+                assert_eq!(req.path, "/");
+                assert!(!is_usable_http_request(&req.method, &req.path));
+            }
+            other => panic!("expected placeholder request, got {other:?}"),
+        }
     }
 }

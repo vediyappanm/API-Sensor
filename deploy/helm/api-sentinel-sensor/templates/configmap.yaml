@@ -8,6 +8,9 @@ metadata:
 data:
   INGEST_URL: {{ .Values.sensor.ingestUrl | quote }}
   ACCOUNT_ID: {{ .Values.sensor.accountId | quote }}
+  TENANT_ID: {{ .Values.sensor.tenantId | quote }}
+  POLICY_VERSION: {{ .Values.sensor.policyVersion | quote }}
+  CRI_SOCKET: {{ .Values.sensor.criSocket | quote }}
   BATCH_SIZE: {{ .Values.sensor.batchSize | quote }}
   ROLE: {{ .Values.sensor.role | quote }}
   MAX_BUFFER_BYTES: {{ .Values.sensor.maxBufferBytes | quote }}

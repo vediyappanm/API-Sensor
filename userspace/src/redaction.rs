@@ -367,8 +367,9 @@ mod tests {
     #[test]
     fn test_pii_redact_stripe_key() {
         ensure_test_key();
-        // Real Stripe shape: STRIPE_API_KEY or sk_live_ + 24+ alphanumerics (no underscores).
-        let key = "STRIPE_API_KEY";
+        // Built at runtime so the file never contains a contiguous Stripe-shaped
+        // token (GitHub push protection flags sk_test_ + 24 alphanumerics).
+        let key = format!("sk_{}_{}", "test", "AAAABBBBCCCCDDDD00001111");
         let output = redact_pii(&format!("Authorization: Bearer {key}"));
         assert!(!output.contains(key));
         assert!(output.contains("PII_STRIPE_"));

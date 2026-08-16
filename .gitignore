@@ -5,3 +5,4 @@ bpf/vmlinux.h
 *.d
 *.swp
 *.tmp
+api-sec-sensor

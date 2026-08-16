@@ -9,3 +9,6 @@ pub mod grpc;
 pub mod mcp;
 pub mod redaction;
 pub mod types;
+pub mod metrics;
+pub mod container;
+pub mod stream;

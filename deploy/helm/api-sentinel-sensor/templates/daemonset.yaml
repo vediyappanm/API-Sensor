@@ -30,6 +30,8 @@ spec:
             - --ingest=$(INGEST_URL)
             - --api-key=$(API_KEY)
             - --account-id=$(ACCOUNT_ID)
+            - --tenant-id=$(TENANT_ID)
+            - --policy-version=$(POLICY_VERSION)
             - --batch-size=$(BATCH_SIZE)
             - --role=$(ROLE)
             - --max-buffer-bytes=$(MAX_BUFFER_BYTES)
@@ -47,6 +49,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.apiKeySecret.name }}
                   key: {{ .Values.apiKeySecret.key }}
+            - name: PII_HASH_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.piiHashKeySecret.name }}
+                  key: {{ .Values.piiHashKeySecret.key }}
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
@@ -88,6 +95,8 @@ spec:
             - name: cgroup
               mountPath: /sys/fs/cgroup
               readOnly: true
+            - name: cri-sock
+              mountPath: {{ .Values.sensor.criSocket }}
       volumes:
         - name: debugfs
           hostPath:
@@ -98,6 +107,10 @@ spec:
         - name: cgroup
           hostPath:
             path: /sys/fs/cgroup
+        - name: cri-sock
+          hostPath:
+            path: {{ .Values.sensor.criSocket }}
+            type: Socket
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

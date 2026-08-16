@@ -6,6 +6,8 @@ BPF_CFLAGS := -O2 -g -Wall -target bpf -D__TARGET_ARCH_$(BPF_ARCH_DEFINE)
 VMLINUX ?= /sys/kernel/btf/vmlinux
 VMLINUX_HDR ?= bpf/vmlinux.h
 
+.PHONY: all userspace clean verify-env
+
 all: bpf/http_trace.bpf.o userspace
 
 $(VMLINUX_HDR):

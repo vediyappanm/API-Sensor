@@ -208,6 +208,50 @@ fn extract_settings_max_frame_size(buffer: &[u8]) -> usize {
     H2_DEFAULT_MAX_FRAME_SIZE
 }
 
+/// Concatenated DATA-frame (type 0x00) payloads for `stream_id`, with the
+/// PADDED flag's pad-length octet and trailing padding stripped. This is the
+/// byte stream a gRPC message actually lives in — never the raw connection
+/// buffer, whose 9-byte frame headers are not protobuf.
+pub fn extract_data_frames(buffer: &[u8], stream_id: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let max_frame_size = extract_settings_max_frame_size(buffer);
+    let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    let mut i = buffer
+        .windows(preface.len())
+        .position(|w| w == preface)
+        .map(|p| p + preface.len())
+        .unwrap_or(0);
+    while i + 9 <= buffer.len() {
+        let frame_len = ((buffer[i] as usize) << 16)
+            | ((buffer[i + 1] as usize) << 8)
+            | (buffer[i + 2] as usize);
+        let frame_type = buffer[i + 3];
+        let flags = buffer[i + 4];
+        let sid = u32::from_be_bytes([
+            buffer[i + 5], buffer[i + 6], buffer[i + 7], buffer[i + 8],
+        ]) & 0x7fff_ffff;
+        if frame_len > max_frame_size || i + 9 + frame_len > buffer.len() {
+            // Garbage head (e.g. the truncated HTTP2_PREFACE token) or a
+            // truncated trailing frame — slide one byte to resync, matching
+            // the other frame walkers in this module.
+            i += 1;
+            continue;
+        }
+        if frame_type == 0x00 && sid == stream_id {
+            let mut payload = &buffer[i + 9..i + 9 + frame_len];
+            if flags & 0x08 != 0 && !payload.is_empty() {
+                // PADDED: first octet is pad length, padding trails the data.
+                let pad = payload[0] as usize;
+                payload = &payload[1..];
+                payload = &payload[..payload.len().saturating_sub(pad)];
+            }
+            out.extend_from_slice(payload);
+        }
+        i += 9 + frame_len;
+    }
+    out
+}
+
 /// Returns per-stream decoded headers: Vec<(stream_id, headers)>.
 pub fn parse_http2_frames(
     decoder: &mut Http2HpackDecoder,
@@ -428,6 +472,50 @@ pub fn equals_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    fn frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len();
+        let mut f = vec![
+            ((len >> 16) & 0xff) as u8,
+            ((len >> 8) & 0xff) as u8,
+            (len & 0xff) as u8,
+            ftype,
+            flags,
+        ];
+        f.extend_from_slice(&stream_id.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    #[test]
+    fn extract_data_frames_concatenates_one_stream_and_strips_padding() {
+        let mut buf = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        buf.extend(frame(0x01, 0x04, 1, &[0x88])); // HEADERS, not DATA
+        buf.extend(frame(0x00, 0x00, 1, b"hello "));
+        // PADDED DATA: pad_len=3, then payload, then 3 pad bytes
+        let mut padded = vec![3u8];
+        padded.extend_from_slice(b"world");
+        padded.extend_from_slice(&[0, 0, 0]);
+        buf.extend(frame(0x00, 0x08, 1, &padded));
+        buf.extend(frame(0x00, 0x01, 3, b"other-stream")); // different stream
+        buf.extend(&[0x00, 0x00, 0x10, 0x00]); // truncated trailing frame header
+
+        assert_eq!(extract_data_frames(&buf, 1), b"hello world");
+        assert_eq!(extract_data_frames(&buf, 3), b"other-stream");
+        assert!(extract_data_frames(&buf, 5).is_empty());
+    }
+
+    #[test]
+    fn extract_data_frames_resyncs_past_garbage_head() {
+        // Buffers routinely start with the truncated HTTP2_PREFACE token
+        // ("PRI * HTTP/2.0", 14 bytes) or mid-connection garbage rather than
+        // the full 24-byte preface. The walker must resync to the first real
+        // frame boundary instead of misreading "PRI" as a frame length.
+        let mut buf = HTTP2_PREFACE.to_vec();
+        buf.extend(frame(0x01, 0x04, 1, &[0x88]));
+        buf.extend(frame(0x00, 0x01, 1, b"grpc-bytes"));
+        assert_eq!(extract_data_frames(&buf, 1), b"grpc-bytes");
+    }
+
     #[test]
     fn test_contains_http2_preface() {
         let mut buf = Vec::new();
@@ -477,3 +565,4 @@ mod tests {
         assert!(dec.error_count == 0 || dec.error_count < Http2HpackDecoder::RESET_THRESHOLD);
     }
 }
+

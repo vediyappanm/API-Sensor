@@ -15,6 +15,8 @@ sensor:
   bpfObjectPath: /opt/sensor/http_trace.bpf.o
   ingestUrl: http://api-sentinel-ingest:8080/v1/events
   accountId: "1000000"
+  tenantId: "default"
+  policyVersion: "1"
   batchSize: "200"
   role: server
   maxBufferBytes: "65536"
@@ -22,10 +24,22 @@ sensor:
   metricsPort: 9090
   sampleDefault: "100"
   sampleHealth: "5"
+  # containerd CRI socket on the node — required for pod/namespace enrichment.
+  # k3s nodes use /run/k3s/containerd/containerd.sock.
+  criSocket: /run/containerd/containerd.sock
 
 apiKeySecret:
   name: api-sentinel-sensor
   key: api-key
+
+# HMAC key for deterministic PII tokens. The sensor refuses to start without
+# it. Create alongside the API key:
+#   kubectl create secret generic api-sentinel-sensor \
+#     --from-literal=api-key=<KEY> \
+#     --from-literal=pii-hash-key=$(openssl rand -hex 32)
+piiHashKeySecret:
+  name: api-sentinel-sensor
+  key: pii-hash-key
 
 serviceAccount:
   create: true

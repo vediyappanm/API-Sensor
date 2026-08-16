@@ -7,18 +7,42 @@ use std::sync::atomic::Ordering;
 use crate::container::ContainerResolver;
 use crate::dns::{self, DnsResolver};
 use crate::grpc::decode_grpc_fields;
-use crate::http::{HttpMessage, HttpResponseParsed, extract_http_header, split_query};
-use crate::http2::{Http2HpackDecoder, contains_http2_preface, parse_http2_frames};
+use crate::http::{
+    HttpMessage, HttpResponseParsed, extract_http_header, is_usable_http_request, split_query,
+};
+use crate::http2::{
+    Http2HpackDecoder, contains_http2_preface, extract_data_frames, parse_http2_frames,
+};
 use crate::identity::extract_identity;
 use crate::mcp::{is_mcp_response, parse_sse_events};
 use crate::metrics::*;
 use crate::quic;
 use crate::redaction::redact_pii;
 use crate::types::*;
-use crate::websocket::{parse_websocket_frame, ws_opcode_name};
+use crate::websocket::parse_websocket_frame;
 
 const MAX_PENDING_PER_CONN: usize = 100;
 const MAX_H2_PENDING_STREAMS: usize = 200;
+
+fn skip_unpaired_response() {
+    UNPAIRED_RESPONSES.fetch_add(1, Ordering::Relaxed);
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn pop_usable_request(queue: &mut VecDeque<ParsedRequest>) -> Option<ParsedRequest> {
+    while let Some(req) = queue.pop_front() {
+        if is_usable_http_request(&req.method, &req.path) {
+            return Some(req);
+        }
+    }
+    None
+}
 
 // ---------------------------------------------------------------------------
 // ShardedStreamState
@@ -287,7 +311,10 @@ impl StreamState {
 
     fn handle_event(&mut self, ev: &TlsEventHeader, payload: &[u8]) -> Vec<ApiTrafficEvent> {
         let mut output = Vec::new();
-        let ts_ms = ev.ts_ns / 1_000_000;
+        // Wall clock at userspace emit time. BPF ktime is monotonic-since-boot
+        // and was previously double-converted in output.rs, stamping every
+        // event with node boot time (Live Feed looked frozen).
+        let ts_ms = wall_clock_ms();
         let born_ms = *self.conn_born_ms.entry((ev.pid, ev.ssl_ptr)).or_insert(ts_ms);
         let conn_key = ConnKey { pid: ev.pid, ssl_ptr: ev.ssl_ptr, born_ms };
         let stream_key = StreamKey { pid: ev.pid, ssl_ptr: ev.ssl_ptr, direction: ev.direction };
@@ -332,6 +359,9 @@ impl StreamState {
             for headers in header_sets {
                 if is_request_dir {
                     if let Some(method) = headers.get(":method") {
+                        if !is_usable_http_request(method, headers.get(":path").map(String::as_str).unwrap_or("/")) {
+                            continue;
+                        }
                         let path = headers.get(":path").cloned().unwrap_or_else(|| "/".to_string());
                         let host = headers.get(":authority").cloned();
                         let net_ctx = self.net_context_from_event(ev);
@@ -348,16 +378,12 @@ impl StreamState {
                         }
                     }
                 } else if let Some(status) = headers.get(":status") {
-                    let request = self.pending.entry(conn_key.clone()).or_default()
-                        .pop_front()
-                        .unwrap_or_else(|| ParsedRequest {
-                            method: "UNKNOWN".to_string(),
-                            path: "/".to_string(),
-                            host: None,
-                            headers: HashMap::new(),
-                            ts_ms,
-                            net_ctx: NetContext::default(),
-                        });
+                    let Some(request) = pop_usable_request(
+                        self.pending.entry(conn_key.clone()).or_default(),
+                    ) else {
+                        skip_unpaired_response();
+                        continue;
+                    };
                     let latency_ms = ts_ms.saturating_sub(request.ts_ms);
                     let resp = HttpResponseParsed {
                         status_code: status.parse::<i32>().unwrap_or(0),
@@ -372,24 +398,15 @@ impl StreamState {
             return output;
         }
 
-        // WebSocket check — if connection is upgraded, parse WS frames
+        // WebSocket: count frames but do not emit them as HTTP. Per-frame
+        // TEXT/PING/PONG with a hardcoded /ws path flooded Live Feed and
+        // created a feedback loop with /api/stream/live.
         if self.ws_connections.contains(&conn_key) {
             let mut pos = 0;
             while pos < payload.len() {
                 match parse_websocket_frame(&payload[pos..]) {
-                    Some((frame, consumed)) => {
-                        if consumed == 0 { break; } // prevent infinite loop
-                        let opcode_name = ws_opcode_name(frame.opcode).to_string();
-                        let payload_str = String::from_utf8_lossy(&frame.payload).into_owned();
-                        let redacted_payload = redact_pii(&payload_str);
-                        let net_ctx = self.net_context_from_event(ev);
-                        output.push(build_ws_event(
-                            self.account_id,
-                            ts_ms,
-                            opcode_name,
-                            redacted_payload,
-                            net_ctx,
-                        ));
+                    Some((_frame, consumed)) => {
+                        if consumed == 0 { break; }
                         PROTO_WEBSOCKET.fetch_add(1, Ordering::Relaxed);
                         pos += consumed;
                     }
@@ -435,7 +452,7 @@ impl StreamState {
         for msg in parsed {
             match msg {
                 HttpMessage::Request(req) => {
-                    if is_request_dir {
+                    if is_request_dir && is_usable_http_request(&req.method, &req.path) {
                         let net_ctx = self.net_context_from_event(ev);
                         let queue = self.pending.entry(conn_key.clone()).or_default();
                         if queue.len() < MAX_PENDING_PER_CONN {
@@ -463,18 +480,12 @@ impl StreamState {
 
                     let is_mcp = is_mcp_response(&resp.headers);
 
-                    let request = self.pending
-                        .entry(conn_key.clone())
-                        .or_default()
-                        .pop_front()
-                        .unwrap_or_else(|| ParsedRequest {
-                            method: "UNKNOWN".to_string(),
-                            path: "/".to_string(),
-                            host: None,
-                            headers: HashMap::new(),
-                            ts_ms,
-                            net_ctx: NetContext::default(),
-                        });
+                    let Some(request) = pop_usable_request(
+                        self.pending.entry(conn_key.clone()).or_default(),
+                    ) else {
+                        skip_unpaired_response();
+                        continue;
+                    };
                     let latency_ms = ts_ms.saturating_sub(request.ts_ms);
                     let protocol = if is_mcp { "MCP" } else { "HTTP/1.1" };
                     let mut event = build_event(
@@ -574,6 +585,9 @@ impl StreamState {
             if is_request_dir {
                 if let Some(method) = headers.get(":method") {
                     let path = headers.get(":path").cloned().unwrap_or_else(|| "/".to_string());
+                    if !is_usable_http_request(method, &path) {
+                        continue;
+                    }
                     let host = headers.get(":authority").cloned();
                     if conn_state.pending_requests.len() < MAX_H2_PENDING_STREAMS {
                         conn_state.pending_requests.insert(stream_id, ParsedRequest {
@@ -593,15 +607,14 @@ impl StreamState {
                     // grow without bound either.
                 }
             } else if let Some(status) = headers.get(":status") {
-                let request = conn_state.pending_requests.remove(&stream_id)
-                    .unwrap_or_else(|| ParsedRequest {
-                        method: "UNKNOWN".to_string(),
-                        path: "/".to_string(),
-                        host: None,
-                        headers: HashMap::new(),
-                        ts_ms,
-                        net_ctx: NetContext::default(),
-                    });
+                let Some(request) = conn_state
+                    .pending_requests
+                    .remove(&stream_id)
+                    .filter(|req| is_usable_http_request(&req.method, &req.path))
+                else {
+                    skip_unpaired_response();
+                    continue;
+                };
                 let latency_ms = ts_ms.saturating_sub(request.ts_ms);
                 let resp = HttpResponseParsed {
                     status_code: status.parse::<i32>().unwrap_or(0),
@@ -612,9 +625,12 @@ impl StreamState {
                     .map(|v| v.starts_with("application/grpc"))
                     .unwrap_or(false);
 
-                // gRPC protobuf body decode
+                // gRPC protobuf body decode — feed only this stream's DATA
+                // payloads; the raw connection buffer starts with frame
+                // headers, not the 5-byte gRPC message prefix.
                 let grpc_body = if is_grpc {
-                    let fields = decode_grpc_fields(&conn_state.buffer);
+                    let data = extract_data_frames(&conn_state.buffer, stream_id);
+                    let fields = decode_grpc_fields(&data);
                     if !fields.is_empty() {
                         serde_json::to_string(&fields).ok()
                     } else {
@@ -732,6 +748,8 @@ fn reserve_memory(max_total: usize, additional: usize) -> bool {
 // Event builders
 // ---------------------------------------------------------------------------
 
+// Kept for a future WS-session event; per-frame HTTP emission was removed.
+#[allow(dead_code)]
 pub fn build_ws_event(
     account_id: u64,
     ts_ms: u64,
@@ -865,5 +883,185 @@ pub fn build_event(
         user_role: Some(identity.user_role),
         session_id: Some(identity.session_id),
         auth_session_id: Some(identity.auth_session_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> ShardedStreamState {
+        crate::redaction::init_pii_hash_key_for_tests(&[0x11u8; 32]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (dtx, _drx) = tokio::sync::mpsc::channel(8);
+        ShardedStreamState::new(
+            1,
+            TrafficRole::Server,
+            65_536,
+            Arc::new(ContainerResolver::new(tx, "test-node".into())),
+            10_485_760,
+            Arc::new(DnsResolver::new(dtx)),
+        )
+    }
+
+    fn tls_event(direction: u8) -> TlsEventHeader {
+        TlsEventHeader {
+            ts_ns: 1_700_000_000_000_000,
+            pid: 42,
+            tid: 42,
+            ssl_ptr: 0x1000,
+            data_len: 0,
+            direction,
+            ip_family: 4,
+            _pad16: 0,
+            comm: *b"nginx\0\0\0\0\0\0\0\0\0\0\0",
+            cgroup_id: 0,
+            netns_ino: 1,
+            src_port: 43210,
+            dst_port: 443,
+            src_ip4: u32::from_be_bytes([10, 244, 0, 59]),
+            dst_ip4: u32::from_be_bytes([10, 244, 0, 1]),
+            src_ip6: [0; 16],
+            dst_ip6: [0; 16],
+        }
+    }
+
+    #[test]
+    fn unpaired_http1_response_is_not_emitted_as_unknown() {
+        let state = test_state();
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let events = state.handle_event(&tls_event(1), resp);
+        assert!(
+            events.is_empty(),
+            "unpaired response must not emit UNKNOWN /: {events:?}"
+        );
+    }
+
+    #[test]
+    fn paired_http1_request_response_keeps_method_and_path() {
+        let state = test_state();
+        let req = b"GET /api/sensors/ HTTP/1.1\r\nHost: sentinel.wecrew.in\r\n\r\n";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]";
+        assert!(state.handle_event(&tls_event(0), req).is_empty());
+        let events = state.handle_event(&tls_event(1), resp);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request.method, "GET");
+        assert_eq!(events[0].request.path, "/api/sensors/");
+        assert_eq!(events[0].response.status_code, 200);
+    }
+
+    #[test]
+    fn garbage_request_then_response_is_not_emitted_as_unknown() {
+        let state = test_state();
+        let garbage = b"FOO /x HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+        let _ = state.handle_event(&tls_event(0), garbage);
+        let events = state.handle_event(&tls_event(1), resp);
+        assert!(
+            events.iter().all(|e| e.request.method != "UNKNOWN"),
+            "garbage request must not become UNKNOWN /: {events:?}"
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn websocket_frames_are_not_emitted_as_http() {
+        let state = test_state();
+        let req = b"GET /api/stream/live HTTP/1.1\r\nHost: sentinel.wecrew.in\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        let resp = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        assert!(state.handle_event(&tls_event(0), req).is_empty());
+        let upgrade = state.handle_event(&tls_event(1), resp);
+        assert_eq!(upgrade.len(), 1);
+        assert_eq!(upgrade[0].request.method, "GET");
+        assert_eq!(upgrade[0].request.path, "/api/stream/live");
+        assert_eq!(upgrade[0].response.status_code, 101);
+
+        // Unmasked TEXT frame: FIN+text, len=5, "hello"
+        let frame = [0x81u8, 0x05, b'h', b'e', b'l', b'l', b'o'];
+        let events = state.handle_event(&tls_event(0), &frame);
+        assert!(
+            events.is_empty(),
+            "WS frames must not appear as TEXT /ws: {events:?}"
+        );
+    }
+
+    /// 9-byte HTTP/2 frame header + payload.
+    fn h2_frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len();
+        let mut f = vec![
+            ((len >> 16) & 0xff) as u8,
+            ((len >> 8) & 0xff) as u8,
+            (len & 0xff) as u8,
+            ftype,
+            flags,
+        ];
+        f.extend_from_slice(&stream_id.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// HPACK literal-without-indexing (4-bit prefix) with an indexed name.
+    fn hpack_literal(name_index: u8, value: &str) -> Vec<u8> {
+        let mut b = if name_index < 15 {
+            vec![name_index]
+        } else {
+            vec![0x0f, name_index - 15]
+        };
+        b.push(value.len() as u8); // raw string, no Huffman
+        b.extend_from_slice(value.as_bytes());
+        b
+    }
+
+    #[test]
+    fn grpc_response_body_decodes_data_frame_payload_not_frame_headers() {
+        let state = test_state();
+
+        // Request: :method POST (static idx 3), :path literal (name idx 4),
+        // content-type literal (name idx 31).
+        let mut req_hpack = vec![0x83u8];
+        req_hpack.extend(hpack_literal(4, "/pkg.Svc/Method"));
+        req_hpack.extend(hpack_literal(31, "application/grpc"));
+        let mut req = HTTP2_PREFACE.to_vec();
+        req.extend(h2_frame(0x01, 0x05, 1, &req_hpack)); // HEADERS END_STREAM|END_HEADERS
+        assert!(state.handle_event(&tls_event(0), &req).is_empty());
+
+        // Response: HEADERS (:status 200 = static idx 8, grpc content-type)
+        // then a DATA frame carrying the gRPC message:
+        // [compress=0][len=6][protobuf: field 1, wire type 2, "test"]
+        let mut resp_hpack = vec![0x88u8];
+        resp_hpack.extend(hpack_literal(31, "application/grpc"));
+        let grpc_msg = [0x00, 0x00, 0x00, 0x00, 0x06, 0x0a, 0x04, b't', b'e', b's', b't'];
+        let mut resp = h2_frame(0x01, 0x04, 1, &resp_hpack); // HEADERS END_HEADERS
+        resp.extend(h2_frame(0x00, 0x01, 1, &grpc_msg)); // DATA END_STREAM
+
+        let events = state.handle_event(&tls_event(1), &resp);
+        assert_eq!(events.len(), 1, "expected one paired gRPC event: {events:?}");
+        assert_eq!(events[0].protocol, "gRPC");
+        let body = events[0].response.body.as_deref().expect("gRPC body decoded");
+        let fields: serde_json::Value = serde_json::from_str(body).unwrap();
+        let arr = fields.as_array().expect("JSON array of proto fields");
+        assert_eq!(arr.len(), 1, "exactly the one real proto field, got {body}");
+        assert_eq!(arr[0]["field_number"], 1);
+        assert_eq!(arr[0]["wire_type"], 2);
+        assert!(
+            arr[0]["value_str"].as_str().unwrap().contains("test"),
+            "decoded value should contain 'test': {body}"
+        );
+    }
+
+    #[test]
+    fn emitted_event_uses_wall_clock_not_boot_time() {
+        let state = test_state();
+        let req = b"GET /live-clock HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        assert!(state.handle_event(&tls_event(0), req).is_empty());
+        let events = state.handle_event(&tls_event(1), resp);
+        assert_eq!(events.len(), 1);
+        // 2024-01-01 epoch ms; boot-time conversion produced ~2026-08-09.
+        assert!(
+            events[0].observed_at > 1_704_067_200_000,
+            "observed_at should be wall-clock ms, got {}",
+            events[0].observed_at
+        );
     }
 }
