@@ -159,7 +159,8 @@ fn extract_session_from_cookie(cookie: &str) -> Option<String> {
             if SESSION_KEYS.contains(&k.trim().to_lowercase().as_str()) {
                 let v = v.trim();
                 if !v.is_empty() {
-                    return Some(format!("sid-{}", &v[..v.len().min(32)]));
+                    // Hash the whole value: never ship (or byte-slice) the raw session cookie.
+                    return Some(format!("sid-{}", crate::redaction::fingerprint(v)));
                 }
             }
         }
@@ -217,7 +218,25 @@ mod tests {
     #[test]
     fn test_extract_session_from_cookie() {
         let cookie = "theme=dark; sessionid=abc123def456; lang=en";
+        crate::redaction::init_pii_hash_key_for_tests(&[0x11u8; 32]);
         let sid = extract_session_from_cookie(cookie).unwrap();
-        assert_eq!(sid, "sid-abc123def456");
+        // The raw session cookie must never be shipped; a keyed fingerprint stands in for it.
+        assert_eq!(sid, format!("sid-{}", crate::redaction::fingerprint("abc123def456")));
+        assert!(!sid.contains("abc123def456"));
+    }
+
+    #[test]
+    fn multibyte_session_cookie_does_not_panic_and_is_never_shipped_raw() {
+        // 12 x '€' (3 bytes each) = 36 bytes: byte 32 is mid-character, which used to
+        // panic `&v[..32]` inside the ring-buffer callback on attacker-controlled input.
+        crate::redaction::init_pii_hash_key_for_tests(&[0x11u8; 32]);
+        let mut hdrs = HashMap::new();
+        hdrs.insert("cookie".to_string(), format!("sessionid={}", "€".repeat(12)));
+        let info = extract_identity(&hdrs);
+        assert!(info.session_id.starts_with("sid-"));
+        assert!(!info.session_id.contains('€'), "{}", info.session_id);
+        assert_eq!(info.session_id, extract_identity(&hdrs).session_id, "must be stable per session");
+        hdrs.insert("cookie".to_string(), format!("sessionid={}", "€".repeat(13)));
+        assert_ne!(info.session_id, extract_identity(&hdrs).session_id);
     }
 }

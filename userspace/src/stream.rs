@@ -17,7 +17,8 @@ use crate::identity::extract_identity;
 use crate::mcp::{is_mcp_response, parse_sse_events};
 use crate::metrics::*;
 use crate::quic;
-use crate::redaction::redact_pii;
+use crate::metrics::PENDING_EXPIRED;
+use crate::redaction::{redact_body, redact_header_value, redact_pii, redact_url};
 use crate::types::*;
 use crate::websocket::parse_websocket_frame;
 
@@ -37,7 +38,7 @@ fn redact_and_cap_body(raw: &[u8]) -> Option<String> {
     }
     let capped = &raw[..raw.len().min(MAX_BODY_CAPTURE_BYTES)];
     let text = String::from_utf8_lossy(capped);
-    Some(redact_pii(&text))
+    Some(redact_body(&text))
 }
 
 fn skip_unpaired_response() {
@@ -49,15 +50,6 @@ fn wall_clock_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-fn pop_usable_request(queue: &mut VecDeque<ParsedRequest>) -> Option<ParsedRequest> {
-    while let Some(req) = queue.pop_front() {
-        if is_usable_http_request(&req.method, &req.path) {
-            return Some(req);
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +131,7 @@ struct StreamState {
     container_resolver: Arc<ContainerResolver>,
     dns_resolver: Arc<DnsResolver>,
     buffers: HashMap<StreamKey, (Vec<u8>, u64)>,
-    pending: HashMap<ConnKey, VecDeque<ParsedRequest>>,
+    pending: HashMap<ConnKey, PendingQueue>,
     http2_state: HashMap<ConnKey, Http2Conn>,
     http3_connections: HashSet<ConnKey>,
     ws_connections: HashSet<ConnKey>,
@@ -153,7 +145,7 @@ struct StreamState {
 pub struct Http2Conn {
     pub buffer: Vec<u8>,
     pub seen_preface: bool,
-    pub pending_requests: HashMap<u32, ParsedRequest>,
+    pub pending_requests: PendingStreams,
     pub last_event_ts: u64,
     pub hpack: Http2HpackDecoder,
 }
@@ -164,6 +156,169 @@ fn release_memory(amount: usize) {
     TOTAL_BUFFER_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(amount))
     }).ok();
+}
+
+/// Bytes held by queued, not-yet-answered requests, charged against the global memory ceiling.
+///
+/// Releases on `Drop`, so every way a queue can disappear (connection eviction, TTL,
+/// `HashMap::retain`, `clear`) hands its bytes back with no bookkeeping at the call site.
+/// Before this, only raw stream buffers were charged; queued requests (headers plus a
+/// whole captured body each) grew outside the ceiling and were never aged out.
+#[derive(Default)]
+pub struct PendingBytes(usize);
+
+impl PendingBytes {
+    fn add(&mut self, max_total: usize, n: usize) -> bool {
+        if reserve_memory(max_total, n) {
+            self.0 += n;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sub(&mut self, n: usize) {
+        let n = n.min(self.0);
+        self.0 -= n;
+        release_memory(n);
+    }
+}
+
+impl Drop for PendingBytes {
+    fn drop(&mut self) {
+        release_memory(self.0);
+    }
+}
+
+/// HTTP/1.x and HTTP/3 requests awaiting their response on one connection (FIFO).
+#[derive(Default)]
+pub struct PendingQueue {
+    items: VecDeque<ParsedRequest>,
+    bytes: PendingBytes,
+}
+
+impl PendingQueue {
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Queue a request. Returns false, and counts a drop, when the per-connection queue is
+    /// full or the global memory ceiling would be exceeded.
+    pub fn push(&mut self, mut req: ParsedRequest, max_total: usize) -> bool {
+        // Only the first MAX_BODY_CAPTURE_BYTES are ever shipped; do not retain the rest.
+        req.body.truncate(MAX_BODY_CAPTURE_BYTES);
+        // truncate() keeps the original allocation; release it so real heap matches what is charged.
+        req.body.shrink_to_fit();
+        let size = req.approx_bytes();
+        if self.items.len() >= MAX_PENDING_PER_CONN || !self.bytes.add(max_total, size) {
+            EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.items.push_back(req);
+        true
+    }
+
+    /// Oldest request that is a usable HTTP request, discarding (and un-charging) junk.
+    pub fn pop_usable(&mut self) -> Option<ParsedRequest> {
+        while let Some(req) = self.items.pop_front() {
+            self.bytes.sub(req.approx_bytes());
+            if is_usable_http_request(&req.method, &req.path) {
+                return Some(req);
+            }
+        }
+        None
+    }
+
+    /// Drop requests older than `ttl_ms` whose response was never seen.
+    pub fn expire(&mut self, now_ms: u64, ttl_ms: u64) -> usize {
+        let mut expired = 0;
+        while self
+            .items
+            .front()
+            .map_or(false, |r| now_ms.saturating_sub(r.ts_ms) >= ttl_ms)
+        {
+            if let Some(r) = self.items.pop_front() {
+                self.bytes.sub(r.approx_bytes());
+                expired += 1;
+            }
+        }
+        expired
+    }
+
+    #[cfg(test)]
+    pub fn accounted(&self) -> usize {
+        self.bytes.0
+    }
+
+    #[cfg(test)]
+    pub fn recount(&self) -> usize {
+        self.items.iter().map(ParsedRequest::approx_bytes).sum()
+    }
+}
+
+/// HTTP/2 requests awaiting their response, keyed by stream id.
+#[derive(Default)]
+pub struct PendingStreams {
+    map: HashMap<u32, ParsedRequest>,
+    bytes: PendingBytes,
+}
+
+impl PendingStreams {
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Insert (replacing any request already on that stream). Returns false, and counts a
+    /// drop, when the connection is at `cap` streams or the memory ceiling would be exceeded.
+    pub fn insert(&mut self, stream_id: u32, mut req: ParsedRequest, max_total: usize, cap: usize) -> bool {
+        req.body.truncate(MAX_BODY_CAPTURE_BYTES);
+        // truncate() keeps the original allocation; release it so real heap matches what is charged.
+        req.body.shrink_to_fit();
+        if let Some(old) = self.map.remove(&stream_id) {
+            self.bytes.sub(old.approx_bytes());
+        }
+        let size = req.approx_bytes();
+        if self.map.len() >= cap || !self.bytes.add(max_total, size) {
+            EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.map.insert(stream_id, req);
+        true
+    }
+
+    pub fn remove(&mut self, stream_id: &u32) -> Option<ParsedRequest> {
+        let req = self.map.remove(stream_id)?;
+        self.bytes.sub(req.approx_bytes());
+        Some(req)
+    }
+
+    /// Drop requests older than `ttl_ms` whose response was never seen.
+    pub fn expire(&mut self, now_ms: u64, ttl_ms: u64) -> usize {
+        let stale: Vec<u32> = self
+            .map
+            .iter()
+            .filter(|(_, r)| now_ms.saturating_sub(r.ts_ms) >= ttl_ms)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &stale {
+            self.remove(id);
+        }
+        stale.len()
+    }
+
+    #[cfg(test)]
+    pub fn accounted(&self) -> usize {
+        self.bytes.0
+    }
+
+    #[cfg(test)]
+    pub fn recount(&self) -> usize {
+        self.map.values().map(ParsedRequest::approx_bytes).sum()
+    }
 }
 
 impl StreamState {
@@ -211,6 +366,18 @@ impl StreamState {
         let new_h2_size: usize = self.http2_state.values().map(|c| c.buffer.len()).sum();
         freed_bytes += old_h2_size.saturating_sub(new_h2_size);
 
+        // Requests whose response never arrived would otherwise sit (and hold memory) until
+        // the connection closes. Their bytes are released by PendingBytes as they are dropped.
+        let mut expired = 0usize;
+        for queue in self.pending.values_mut() {
+            expired += queue.expire(now_ms, STREAM_TTL_MS);
+        }
+        for conn in self.http2_state.values_mut() {
+            expired += conn.pending_requests.expire(now_ms, STREAM_TTL_MS);
+        }
+        if expired > 0 {
+            PENDING_EXPIRED.fetch_add(expired as u64, Ordering::Relaxed);
+        }
         self.pending.retain(|_, queue| !queue.is_empty());
 
         if self.buffers.len() > MAX_STREAM_ENTRIES {
@@ -381,9 +548,9 @@ impl StreamState {
                         let path = headers.get(":path").cloned().unwrap_or_else(|| "/".to_string());
                         let host = headers.get(":authority").cloned();
                         let net_ctx = self.net_context_from_event(ev);
-                        let queue = self.pending.entry(conn_key.clone()).or_default();
-                        if queue.len() < MAX_PENDING_PER_CONN {
-                            queue.push_back(ParsedRequest {
+                        let max_total = self.max_total_buffer_bytes;
+                        self.pending.entry(conn_key.clone()).or_default().push(
+                            ParsedRequest {
                                 method: method.clone(),
                                 path,
                                 host,
@@ -391,13 +558,12 @@ impl StreamState {
                                 ts_ms,
                                 net_ctx,
                                 body: Vec::new(),
-                            });
-                        }
+                            },
+                            max_total,
+                        );
                     }
                 } else if let Some(status) = headers.get(":status") {
-                    let Some(request) = pop_usable_request(
-                        self.pending.entry(conn_key.clone()).or_default(),
-                    ) else {
+                    let Some(request) = self.pending.entry(conn_key.clone()).or_default().pop_usable() else {
                         skip_unpaired_response();
                         continue;
                     };
@@ -472,9 +638,8 @@ impl StreamState {
                 HttpMessage::Request(req) => {
                     if is_request_dir && is_usable_http_request(&req.method, &req.path) {
                         let net_ctx = self.net_context_from_event(ev);
-                        let queue = self.pending.entry(conn_key.clone()).or_default();
-                        if queue.len() < MAX_PENDING_PER_CONN {
-                            queue.push_back(ParsedRequest {
+                        self.pending.entry(conn_key.clone()).or_default().push(
+                            ParsedRequest {
                                 method: req.method,
                                 path: req.path,
                                 host: req.host,
@@ -482,8 +647,9 @@ impl StreamState {
                                 ts_ms,
                                 net_ctx,
                                 body: req.body,
-                            });
-                        }
+                            },
+                            max_total,
+                        );
                     }
                 }
                 HttpMessage::Response(resp) => {
@@ -499,9 +665,7 @@ impl StreamState {
 
                     let is_mcp = is_mcp_response(&resp.headers);
 
-                    let Some(request) = pop_usable_request(
-                        self.pending.entry(conn_key.clone()).or_default(),
-                    ) else {
+                    let Some(request) = self.pending.entry(conn_key.clone()).or_default().pop_usable() else {
                         skip_unpaired_response();
                         continue;
                     };
@@ -554,6 +718,7 @@ impl StreamState {
         } else {
             None
         };
+        let max_total = self.max_total_buffer_bytes;
         let conn_state = self.http2_state.entry(conn_key).or_default();
         conn_state.last_event_ts = ts_ms;
         if data_has_preface {
@@ -590,15 +755,6 @@ impl StreamState {
             }
         }
 
-        // Bound pending requests to prevent unbounded growth
-        if conn_state.pending_requests.len() > MAX_H2_PENDING_STREAMS {
-            let excess = conn_state.pending_requests.len() - MAX_H2_PENDING_STREAMS;
-            let keys: Vec<u32> = conn_state.pending_requests.keys().copied().take(excess).collect();
-            for k in keys {
-                conn_state.pending_requests.remove(&k);
-            }
-        }
-
         let stream_frames = parse_http2_frames(&mut conn_state.hpack, &conn_state.buffer);
         for (stream_id, headers) in stream_frames {
             if is_request_dir {
@@ -608,8 +764,9 @@ impl StreamState {
                         continue;
                     }
                     let host = headers.get(":authority").cloned();
-                    if conn_state.pending_requests.len() < MAX_H2_PENDING_STREAMS {
-                        conn_state.pending_requests.insert(stream_id, ParsedRequest {
+                    conn_state.pending_requests.insert(
+                        stream_id,
+                        ParsedRequest {
                             method: method.clone(),
                             path,
                             host,
@@ -617,8 +774,10 @@ impl StreamState {
                             ts_ms,
                             net_ctx: net_ctx.clone().unwrap_or_default(),
                             body: Vec::new(),
-                        });
-                    }
+                        },
+                        max_total,
+                        MAX_H2_PENDING_STREAMS,
+                    );
                     // Don't clear the buffer here — multiplexed streams may
                     // have additional HEADERS / DATA frames in this same chunk
                     // that we still need to parse. The buffer is drained at
@@ -674,7 +833,8 @@ impl StreamState {
                 );
                 // gRPC body belongs in response, not request
                 if let Some(body) = grpc_body {
-                    event.response.body = Some(body);
+                    // Assigned after build_event's redaction, so it must be redacted here.
+                    event.response.body = Some(redact_body(&body));
                 }
                 output.push(event);
             }
@@ -793,7 +953,7 @@ pub fn build_ws_event(
             scheme: "wss".to_string(),
             headers: HashMap::new(),
             query: HashMap::new(),
-            body: Some(payload),
+            body: Some(redact_body(&payload)),
         },
         response: ApiResponse {
             status_code: 0,
@@ -851,19 +1011,19 @@ pub fn build_event(
     let identity = extract_identity(&req.headers);
 
     // Apply PII redaction to path and header values
-    let redacted_path = redact_pii(&req.path);
+    let redacted_path = redact_url(&req.path);
     let (path, query) = split_query(&redacted_path);
     let net_ctx = req.net_ctx.clone();
 
     let redacted_req_headers: HashMap<String, String> = req.headers
         .into_iter()
-        .map(|(k, v)| (k, redact_pii(&v)))
+        .map(|(k, v)| { let r = redact_header_value(&k, &v); (k, r) })
         .collect();
 
     // Redact response headers too (may contain Set-Cookie, tokens, etc.)
     let redacted_resp_headers: HashMap<String, String> = resp.headers
         .into_iter()
-        .map(|(k, v)| (k, redact_pii(&v)))
+        .map(|(k, v)| { let r = redact_header_value(&k, &v); (k, r) })
         .collect();
 
     // Bodies are evidence: capture what the kernel gave us, redacted and capped.
@@ -905,7 +1065,7 @@ pub fn build_event(
         dest_hostname: net_ctx.dest_hostname,
         metadata: None,
         anomaly_features: Some(anomaly),
-        user_id: Some(identity.user_id),
+        user_id: Some(redact_pii(&identity.user_id)),
         user_role: Some(identity.user_role),
         session_id: Some(identity.session_id),
         auth_session_id: Some(identity.auth_session_id),
@@ -1135,5 +1295,184 @@ mod tests {
             "observed_at should be wall-clock ms, got {}",
             events[0].observed_at
         );
+    }
+
+    // ---- Secret-leak regression tests: bytes in -> serialized event out -----------------
+
+    const LEAK_SECRETS: &[&str] = &[
+        "hunter2-correct-horse", "s3ssion-value-abcdef0123456789", "zZ9-api-key-0001",
+        "dXNlcjpwYXNzd29yZA==", "refresh-opaque-1a2b3c", "my$ecretPassw0rd",
+    ];
+
+    fn assert_no_secret(event: &ApiTrafficEvent) {
+        let wire = serde_json::to_string(event).unwrap();
+        for s in LEAK_SECRETS {
+            assert!(!wire.contains(s), "secret {s:?} reached the wire: {wire}");
+        }
+    }
+
+    #[test]
+    fn http1_secrets_in_headers_url_and_bodies_never_reach_the_wire() {
+        let state = test_state();
+        let body = "{\"user\":\"alice\",\"password\":\"hunter2-correct-horse\",\"note\":\"ok\"}";
+        let req = format!(
+            "POST /orders?api_key=zZ9-api-key-0001&page=2 HTTP/1.1\r\nHost: shop.example.com\r\n\
+             Authorization: Basic dXNlcjpwYXNzd29yZA==\r\nCookie: sessionid=s3ssion-value-abcdef0123456789; theme=dark\r\n\
+             X-Api-Key: zZ9-api-key-0001\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body
+        );
+        assert!(state.handle_event(&tls_event(0), req.as_bytes()).is_empty());
+
+        let resp_body = "{\"access_token\":\"refresh-opaque-1a2b3c\",\"expires_in\":3600}";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nSet-Cookie: sid=my$ecretPassw0rd; Path=/; HttpOnly\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            resp_body.len(), resp_body
+        );
+        let events = state.handle_event(&tls_event(1), resp.as_bytes());
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+
+        assert_no_secret(e);
+        // ...while the information an analyst needs is still there.
+        assert_eq!(e.request.method, "POST");
+        assert_eq!(e.request.path, "/orders");
+        assert_eq!(e.request.query.get("page").map(String::as_str), Some("2"));
+        assert_eq!(e.request.host.as_deref(), Some("shop.example.com"));
+        assert!(e.request.body.as_deref().unwrap().contains("\"user\":\"alice\""));
+        assert!(e.response.body.as_deref().unwrap().contains("\"expires_in\":3600"));
+        assert!(e.response.headers.values().any(|v| v.contains("Path=/; HttpOnly")));
+        assert!(e.session_id.as_deref().unwrap().starts_with("sid-"));
+    }
+
+    #[test]
+    fn jwt_email_claim_is_not_shipped_as_the_user_id() {
+        let state = test_state();
+        let req = "GET /me HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer \
+                   eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6ImFsaWNlQGV4YW1wbGUuY29tIiwicm9sZSI6ImFkbWluIiwianRpIjoidG9rLTEifQ.c2ln\r\n\r\n";
+        assert!(state.handle_event(&tls_event(0), req.as_bytes()).is_empty());
+        let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let events = state.handle_event(&tls_event(1), resp.as_bytes());
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        let uid = e.user_id.as_deref().unwrap();
+        assert!(!uid.contains("alice@example.com"), "raw email shipped as user_id: {uid}");
+        assert!(uid.starts_with("PII_EMAIL_"), "{uid}");
+        assert_eq!(e.user_role.as_deref(), Some("admin"));
+        assert!(!serde_json::to_string(e).unwrap().contains("alice@example.com"));
+    }
+
+    #[test]
+    fn grpc_body_is_redacted_even_though_it_is_attached_after_build_event() {
+        let state = test_state();
+        let mut req_hpack = vec![0x83u8];
+        req_hpack.extend(hpack_literal(4, "/pkg.Svc/Method"));
+        req_hpack.extend(hpack_literal(31, "application/grpc"));
+        let mut req = HTTP2_PREFACE.to_vec();
+        req.extend(h2_frame(0x01, 0x05, 1, &req_hpack));
+        assert!(state.handle_event(&tls_event(0), &req).is_empty());
+
+        let mut resp_hpack = vec![0x88u8];
+        resp_hpack.extend(hpack_literal(31, "application/grpc"));
+        // protobuf field 1, wire type 2, string "alice@example.com"
+        let text = b"alice@example.com";
+        let mut msg = vec![0x00, 0x00, 0x00, 0x00, (2 + text.len()) as u8, 0x0a, text.len() as u8];
+        msg.extend_from_slice(text);
+        let mut resp = h2_frame(0x01, 0x04, 1, &resp_hpack);
+        resp.extend(h2_frame(0x00, 0x01, 1, &msg));
+        let events = state.handle_event(&tls_event(1), &resp);
+        assert_eq!(events.len(), 1);
+        let wire = serde_json::to_string(&events[0]).unwrap();
+        assert!(!wire.contains("alice@example.com"), "gRPC body skipped redaction: {wire}");
+        assert!(wire.contains("PII_EMAIL_"), "{wire}");
+    }
+
+    // ---- Pending-request accounting ---------------------------------------------------
+
+    fn req_with(ts_ms: u64, body_len: usize) -> ParsedRequest {
+        ParsedRequest {
+            method: "POST".into(),
+            path: "/x".into(),
+            host: Some("h".into()),
+            headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+            ts_ms,
+            net_ctx: NetContext::default(),
+            body: vec![b'x'; body_len],
+        }
+    }
+
+    const PLENTY: usize = usize::MAX / 4;
+
+    #[test]
+    fn queue_bookkeeping_matches_its_contents_through_push_pop_and_expiry() {
+        let mut q = PendingQueue::default();
+        for i in 0..10u64 {
+            assert!(q.push(req_with(1_000 + i, 100), PLENTY));
+        }
+        assert_eq!(q.accounted(), q.recount());
+        assert!(q.pop_usable().is_some());
+        assert_eq!(q.accounted(), q.recount());
+        // everything older than 5s at t=7_000 expires (ts 1_000..1_009)
+        assert_eq!(q.expire(7_000, 5_000), 9);
+        assert!(q.is_empty());
+        assert_eq!((q.accounted(), q.recount()), (0, 0));
+    }
+
+    #[test]
+    fn fresh_requests_survive_expiry_and_stale_ones_do_not() {
+        let mut q = PendingQueue::default();
+        q.push(req_with(1_000, 10), PLENTY);
+        q.push(req_with(9_000, 10), PLENTY);
+        assert_eq!(q.expire(10_000, 5_000), 1);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.accounted(), q.recount());
+    }
+
+    #[test]
+    fn stored_bodies_are_capped_so_unused_bytes_are_not_retained() {
+        let mut q = PendingQueue::default();
+        assert!(q.push(req_with(1, 1_000_000), PLENTY));
+        let held = q.pop_usable().unwrap();
+        assert_eq!(held.body.len(), MAX_BODY_CAPTURE_BYTES);
+        assert_eq!(held.body.capacity(), MAX_BODY_CAPTURE_BYTES, "capacity must be released too");
+    }
+
+    #[test]
+    fn push_is_refused_and_counted_when_the_ceiling_is_reached() {
+        let before = EVENTS_DROPPED.load(Ordering::Relaxed);
+        let mut q = PendingQueue::default();
+        assert!(!q.push(req_with(1, 10), 1), "ceiling of 1 byte must refuse");
+        assert!(q.is_empty());
+        assert_eq!(q.accounted(), 0);
+        assert!(EVENTS_DROPPED.load(Ordering::Relaxed) > before);
+    }
+
+    #[test]
+    fn push_is_refused_when_the_per_connection_queue_is_full() {
+        let mut q = PendingQueue::default();
+        for _ in 0..MAX_PENDING_PER_CONN {
+            assert!(q.push(req_with(1, 1), PLENTY));
+        }
+        assert!(!q.push(req_with(1, 1), PLENTY));
+        assert_eq!(q.len(), MAX_PENDING_PER_CONN);
+        assert_eq!(q.accounted(), q.recount());
+    }
+
+    #[test]
+    fn h2_streams_replace_expire_and_stay_consistent() {
+        let mut s = PendingStreams::default();
+        assert!(s.insert(1, req_with(1_000, 50), PLENTY, 10));
+        assert!(s.insert(1, req_with(1_100, 70), PLENTY, 10), "same stream id replaces");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.accounted(), s.recount());
+        assert!(s.insert(3, req_with(9_000, 50), PLENTY, 10));
+        assert_eq!(s.expire(10_000, 5_000), 1);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.accounted(), s.recount());
+        assert!(s.remove(&3).is_some());
+        assert_eq!((s.accounted(), s.recount()), (0, 0));
+        // cap
+        for id in 0..4u32 { assert!(s.insert(id * 2 + 1, req_with(1, 1), PLENTY, 4)); }
+        assert!(!s.insert(99, req_with(1, 1), PLENTY, 4));
     }
 }

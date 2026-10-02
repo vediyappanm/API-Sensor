@@ -218,6 +218,22 @@ pub struct ParsedRequest {
     pub body: Vec<u8>,
 }
 
+impl ParsedRequest {
+    /// Estimated heap footprint, used to charge queued requests against the memory ceiling.
+    /// Deliberately a slight over-estimate (per-entry String/HashMap overhead is counted).
+    pub fn approx_bytes(&self) -> usize {
+        const ENTRY_OVERHEAD: usize = 64; // two String headers + hash bucket
+        const NET_CTX_OVERHEAD: usize = 384; // ip/hostname/container/process strings
+        std::mem::size_of::<Self>()
+            + NET_CTX_OVERHEAD
+            + self.method.len()
+            + self.path.len()
+            + self.host.as_ref().map_or(0, |h| h.len())
+            + self.headers.iter().map(|(k, v)| k.len() + v.len() + ENTRY_OVERHEAD).sum::<usize>()
+            + self.body.len()
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct EventBatch {
     pub version: String,

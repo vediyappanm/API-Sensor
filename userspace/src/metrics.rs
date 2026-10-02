@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub static EVENTS_CAPTURED:    AtomicU64 = AtomicU64::new(0);
 pub static EVENTS_DROPPED:     AtomicU64 = AtomicU64::new(0);
 pub static UNPAIRED_RESPONSES: AtomicU64 = AtomicU64::new(0);
+/// Requests discarded because their response never arrived within the stream TTL.
+pub static PENDING_EXPIRED:    AtomicU64 = AtomicU64::new(0);
 pub static EVENTS_SENT:        AtomicU64 = AtomicU64::new(0);
 pub static SEND_ERRORS:        AtomicU64 = AtomicU64::new(0);
 pub static RINGBUF_DROPS:      AtomicU64 = AtomicU64::new(0);
@@ -26,6 +28,8 @@ async fn metrics_handler() -> impl IntoResponse {
     let dropped  = EVENTS_DROPPED.load(Ordering::Relaxed);
     let drop_rate = if captured > 0 { dropped * 10000 / captured } else { 0 };
     let uptime = now_secs().saturating_sub(START_TIME_SECS.load(Ordering::Relaxed));
+    let expired = PENDING_EXPIRED.load(Ordering::Relaxed);
+    let buffer_bytes = crate::types::TOTAL_BUFFER_BYTES.load(Ordering::Relaxed);
 
     format!(
 "# HELP apisec_events_captured_total TLS events captured
@@ -35,6 +39,14 @@ apisec_events_captured_total {captured}
 # HELP apisec_events_dropped_total Events dropped
 # TYPE apisec_events_dropped_total counter
 apisec_events_dropped_total {dropped}
+
+# HELP apisec_buffer_bytes Bytes accounted against the memory ceiling (stream buffers + queued requests)
+# TYPE apisec_buffer_bytes gauge
+apisec_buffer_bytes {buffer_bytes}
+
+# HELP apisec_pending_expired_total Requests dropped because no response was seen within the TTL
+# TYPE apisec_pending_expired_total counter
+apisec_pending_expired_total {expired}
 
 # HELP apisec_unpaired_responses_total HTTP responses with no matching request
 # TYPE apisec_unpaired_responses_total counter
