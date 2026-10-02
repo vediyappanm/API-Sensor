@@ -16,9 +16,9 @@ impl Http2HpackDecoder {
     pub const RESET_THRESHOLD: u32 = 3;
 
     pub fn new() -> Self {
-        let mut d = Decoder::new();
-        d.set_max_table_size(8192);
-        Self { inner: d, error_count: 0 }
+        // Table size stays at the protocol default (4096): the peer's encoder starts there and
+        // announces any change in-band. A larger local limit lets the tables drift apart.
+        Self { inner: Decoder::new(), error_count: 0 }
     }
 
     pub fn decode(&mut self, block: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ()> {
@@ -33,7 +33,17 @@ impl Http2HpackDecoder {
             }
             return Err(());
         }
-        match self.inner.decode(block) {
+        let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.inner.decode(block)));
+        let decoded = match decoded {
+            Ok(r) => r,
+            Err(_) => {
+                // The decoder's state is unknown after a panic: start clean.
+                tracing::warn!("HPACK decoder panicked; resetting");
+                *self = Self::new();
+                return Err(());
+            }
+        };
+        match decoded {
             Ok(headers) => {
                 self.error_count = 0;
                 Ok(headers)
@@ -250,6 +260,277 @@ pub fn extract_data_frames(buffer: &[u8], stream_id: u32) -> Vec<u8> {
         i += 9 + frame_len;
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Incremental, per-direction HTTP/2 parser
+//
+// HTTP/2 keeps SEPARATE HPACK dynamic tables for each direction (each side's encoder and
+// the peer's decoder), and frames are only meaningful inside one direction's byte stream.
+// The previous code put both directions in one buffer, re-parsed the whole buffer with one
+// stateful decoder on every event, and so decoded the same header block repeatedly (each
+// pass inserting into the dynamic table again) and mixed request and response bytes. Here
+// every direction owns its buffer and decoder, and every frame is consumed exactly once.
+// ---------------------------------------------------------------------------
+
+/// Largest frame payload that will be buffered. The protocol default is 16 KiB and
+/// endpoints rarely raise it; a larger length is treated as a desync rather than waited for
+/// (a corrupt length would otherwise stall the stream waiting for megabytes that never come).
+pub const H2_MAX_ACCEPTED_FRAME: usize = 1 << 20;
+
+/// Something completed by the bytes fed to an [`Http2Direction`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum H2Item {
+    Headers { stream_id: u32, headers: HashMap<String, String>, end_stream: bool },
+    Data { stream_id: u32, data: Vec<u8>, end_stream: bool },
+    Reset { stream_id: u32 },
+}
+
+struct HeaderBlock {
+    stream_id: u32,
+    bytes: Vec<u8>,
+    end_stream: bool,
+    /// PUSH_PROMISE blocks must be decoded (they change the dynamic table) but are not shown.
+    promise: bool,
+}
+
+pub struct Http2Direction {
+    buf: Vec<u8>,
+    hpack: Http2HpackDecoder,
+    preface_done: bool,
+    continuation: Option<HeaderBlock>,
+    max_frame: usize,
+    /// SETTINGS_MAX_FRAME_SIZE this side announced; it bounds the frames the OTHER side sends.
+    pub announced_max_frame: Option<usize>,
+    broken: bool,
+}
+
+impl Http2Direction {
+    /// `expect_preface` is true for the client-to-server direction, which begins with the
+    /// 24-byte connection preface.
+    pub fn new(expect_preface: bool) -> Self {
+        Self {
+            buf: Vec::new(),
+            hpack: Http2HpackDecoder::new(),
+            preface_done: !expect_preface,
+            continuation: None,
+            max_frame: H2_DEFAULT_MAX_FRAME_SIZE,
+            announced_max_frame: None,
+            broken: false,
+        }
+    }
+
+    /// Bytes currently held (an incomplete trailing frame).
+    pub fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// Raise/lower the frame size this direction will accept (learned from the peer's SETTINGS).
+    pub fn set_max_frame(&mut self, size: usize) {
+        self.max_frame = size.clamp(H2_DEFAULT_MAX_FRAME_SIZE, H2_MAX_ACCEPTED_FRAME);
+    }
+
+    fn fail(&mut self) {
+        // A framing violation means we lost sync (dropped capture, or not HTTP/2 at all). There is
+        // no safe way to find the next frame boundary or repair the HPACK table, so stop
+        // interpreting this direction rather than guess and fabricate headers.
+        self.broken = true;
+        self.buf.clear();
+        self.continuation = None;
+        crate::metrics::H2_PARSE_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Feed bytes of this direction; returns everything they completed. Each frame is consumed
+    /// exactly once, so HPACK state advances exactly once per header block.
+    pub fn feed(&mut self, data: &[u8]) -> Vec<H2Item> {
+        let mut out = Vec::new();
+        if self.broken {
+            return out;
+        }
+        self.buf.extend_from_slice(data);
+
+        if !self.preface_done {
+            if self.buf.len() >= HTTP2_PREFACE.len() {
+                if self.buf.starts_with(HTTP2_PREFACE) {
+                    self.buf.drain(..HTTP2_PREFACE.len());
+                    self.preface_done = true;
+                } else {
+                    self.fail();
+                    return out;
+                }
+            } else if HTTP2_PREFACE.starts_with(&self.buf) {
+                return out; // preface split across reads: wait for the rest
+            } else {
+                self.fail();
+                return out;
+            }
+        }
+
+        let mut pos = 0usize;
+        while self.buf.len() - pos >= 9 {
+            let b = &self.buf[pos..];
+            let len = ((b[0] as usize) << 16) | ((b[1] as usize) << 8) | (b[2] as usize);
+            if len > self.max_frame {
+                self.fail();
+                return out;
+            }
+            if b.len() < 9 + len {
+                break; // incomplete frame: keep it for the next read
+            }
+            let ftype = b[3];
+            let flags = b[4];
+            let stream_id = u32::from_be_bytes([b[5], b[6], b[7], b[8]]) & 0x7fff_ffff;
+            let payload = b[9..9 + len].to_vec();
+            pos += 9 + len;
+            self.on_frame(ftype, flags, stream_id, payload, &mut out);
+            if self.broken {
+                return out;
+            }
+        }
+        self.buf.drain(..pos);
+        out
+    }
+
+    /// Strip the PADDED length octet and trailing padding. None = malformed.
+    fn unpad(flags: u8, payload: &[u8]) -> Option<&[u8]> {
+        if flags & 0x08 == 0 {
+            return Some(payload);
+        }
+        let pad = *payload.first()? as usize;
+        let rest = &payload[1..];
+        if pad > rest.len() {
+            return None;
+        }
+        Some(&rest[..rest.len() - pad])
+    }
+
+    fn on_frame(&mut self, ftype: u8, flags: u8, stream_id: u32, payload: Vec<u8>, out: &mut Vec<H2Item>) {
+        // While a header block is open only its CONTINUATION frames may arrive (RFC 9113 §6.10).
+        if let Some(mut open) = self.continuation.take() {
+            if ftype != 0x09 || stream_id != open.stream_id {
+                self.fail();
+                return;
+            }
+            open.bytes.extend_from_slice(&payload);
+            if flags & 0x04 != 0 {
+                self.finish_block(open, out);
+            } else {
+                self.continuation = Some(open);
+            }
+            return;
+        }
+
+        match ftype {
+            0x00 => {
+                // DATA
+                if stream_id == 0 {
+                    return self.fail();
+                }
+                let Some(data) = Self::unpad(flags, &payload) else { return self.fail() };
+                out.push(H2Item::Data { stream_id, data: data.to_vec(), end_stream: flags & 0x01 != 0 });
+            }
+            0x01 => {
+                // HEADERS
+                if stream_id == 0 {
+                    return self.fail();
+                }
+                let Some(mut frag) = Self::unpad(flags, &payload) else { return self.fail() };
+                if flags & 0x20 != 0 {
+                    // PRIORITY: 4-byte stream dependency + 1-byte weight precede the block
+                    if frag.len() < 5 {
+                        return self.fail();
+                    }
+                    frag = &frag[5..];
+                }
+                let block = HeaderBlock { stream_id, bytes: frag.to_vec(), end_stream: flags & 0x01 != 0, promise: false };
+                if flags & 0x04 != 0 {
+                    self.finish_block(block, out);
+                } else {
+                    self.continuation = Some(block);
+                }
+            }
+            0x03 => {
+                if stream_id != 0 {
+                    out.push(H2Item::Reset { stream_id });
+                }
+            }
+            0x04 => {
+                // SETTINGS (not an ACK): remember what this side tells the peer about frame size
+                if flags & 0x01 == 0 && payload.len() % 6 == 0 {
+                    for s in payload.chunks_exact(6) {
+                        let id = u16::from_be_bytes([s[0], s[1]]);
+                        let val = u32::from_be_bytes([s[2], s[3], s[4], s[5]]) as usize;
+                        if id == 0x0005 {
+                            self.announced_max_frame = Some(val.clamp(H2_DEFAULT_MAX_FRAME_SIZE, (1 << 24) - 1));
+                        }
+                    }
+                }
+            }
+            0x05 => {
+                // PUSH_PROMISE: promised stream id (4 bytes) then a header block that mutates the
+                // HPACK table, so it must be decoded even though its headers are not reported.
+                let Some(frag) = Self::unpad(flags, &payload) else { return self.fail() };
+                if frag.len() < 4 {
+                    return self.fail();
+                }
+                let block = HeaderBlock { stream_id, bytes: frag[4..].to_vec(), end_stream: false, promise: true };
+                if flags & 0x04 != 0 {
+                    self.finish_block(block, out);
+                } else {
+                    self.continuation = Some(block);
+                }
+            }
+            0x09 => self.fail(), // CONTINUATION with no open header block
+            _ => {}               // PRIORITY, PING, GOAWAY, WINDOW_UPDATE, unknown: nothing to report
+        }
+    }
+
+    fn finish_block(&mut self, block: HeaderBlock, out: &mut Vec<H2Item>) {
+        match self.hpack.decode(&block.bytes) {
+            Ok(fields) => {
+                if block.promise {
+                    return;
+                }
+                let mut headers = HashMap::new();
+                for (name, value) in fields {
+                    let name = String::from_utf8_lossy(&name).to_ascii_lowercase();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    insert_header(&mut headers, name, String::from_utf8_lossy(&value).into_owned());
+                }
+                out.push(H2Item::Headers { stream_id: block.stream_id, headers, end_stream: block.end_stream });
+            }
+            Err(()) => {
+                crate::metrics::H2_PARSE_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Add a header, merging repeated names the way RFC 9113 §8.2.3 / RFC 9110 §5.3 define:
+/// HTTP/2 splits `cookie` into several fields (rejoin with "; "), `set-cookie` must stay
+/// distinct (kept newline-separated), everything else is comma-joined. A plain map insert
+/// kept only the LAST cookie crumb.
+fn insert_header(map: &mut HashMap<String, String>, name: String, value: String) {
+    match map.get_mut(&name) {
+        None => {
+            map.insert(name, value);
+        }
+        Some(existing) => {
+            let sep = match name.as_str() {
+                "cookie" => "; ",
+                "set-cookie" => "\n",
+                _ => ", ",
+            };
+            existing.push_str(sep);
+            existing.push_str(&value);
+        }
+    }
 }
 
 /// Returns per-stream decoded headers: Vec<(stream_id, headers)>.
@@ -566,3 +847,208 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod direction_tests {
+    use super::*;
+
+    fn frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len();
+        let mut f = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, ftype, flags];
+        f.extend_from_slice(&stream_id.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Literal header with incremental indexing, new name (adds an entry to the dynamic table).
+    fn lit_new(name: &str, value: &str) -> Vec<u8> {
+        let mut v = vec![0x40, name.len() as u8];
+        v.extend_from_slice(name.as_bytes());
+        v.push(value.len() as u8);
+        v.extend_from_slice(value.as_bytes());
+        v
+    }
+
+    const END_STREAM: u8 = 0x01;
+    const END_HEADERS: u8 = 0x04;
+
+    fn headers(items: &[H2Item]) -> Vec<(u32, HashMap<String, String>)> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                H2Item::Headers { stream_id, headers, .. } => Some((*stream_id, headers.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn client_stream(frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut v = HTTP2_PREFACE.to_vec();
+        for f in frames {
+            v.extend_from_slice(f);
+        }
+        v
+    }
+
+    #[test]
+    fn each_direction_has_its_own_hpack_table() {
+        // client request 1 adds `x-req: A` (dynamic index 62 in the CLIENT table)
+        let mut req_dir = Http2Direction::new(true);
+        let r1 = frame(0x01, END_HEADERS | END_STREAM, 1, &[&[0x82, 0x84][..], &lit_new("x-req", "A")].concat());
+        let items = req_dir.feed(&client_stream(&[r1]));
+        assert_eq!(headers(&items)[0].1["x-req"], "A");
+
+        // server response adds `x-resp: B` to the SERVER table, also at index 62
+        let mut resp_dir = Http2Direction::new(false);
+        let s1 = frame(0x01, END_HEADERS, 1, &[&[0x88][..], &lit_new("x-resp", "B")].concat());
+        assert_eq!(headers(&resp_dir.feed(&s1))[0].1["x-resp"], "B");
+
+        // client request 2 refers to index 62 => must still be `x-req: A`
+        let r2 = frame(0x01, END_HEADERS | END_STREAM, 3, &[0x82, 0x84, 0xBE]);
+        let h = headers(&req_dir.feed(&r2));
+        assert_eq!(h[0].1.get("x-req").map(String::as_str), Some("A"), "{h:?}");
+        assert!(!h[0].1.contains_key("x-resp"));
+    }
+
+    #[test]
+    fn a_single_decoder_for_both_directions_corrupts_headers() {
+        // Documents WHY the directions are separate: the old design's one shared decoder
+        // resolves the client's index 62 to the server's header.
+        let mut shared = Http2HpackDecoder::new();
+        shared.decode(&[&[0x82, 0x84][..], &lit_new("x-req", "A")].concat()).unwrap();
+        shared.decode(&[&[0x88][..], &lit_new("x-resp", "B")].concat()).unwrap();
+        let wrong = shared.decode(&[0x82, 0x84, 0xBE]).unwrap();
+        let names: Vec<String> = wrong.iter().map(|(n, _)| String::from_utf8_lossy(n).into()).collect();
+        assert!(names.contains(&"x-resp".to_string()) && !names.contains(&"x-req".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn frames_are_consumed_once_so_the_table_is_not_reinserted() {
+        let mut d = Http2Direction::new(true);
+        let f1 = frame(0x01, END_HEADERS | END_STREAM, 1, &[&[0x82, 0x84][..], &lit_new("x-a", "1")].concat());
+        let f2 = frame(0x01, END_HEADERS | END_STREAM, 3, &[&[0x82, 0x84][..], &lit_new("x-b", "2")].concat());
+        // x-b is index 62, x-a shifted to 63
+        let f3 = frame(0x01, END_HEADERS | END_STREAM, 5, &[0x82, 0x84, 0xBF, 0xBE]);
+        d.feed(&client_stream(&[f1]));
+        d.feed(&f2);
+        let h = headers(&d.feed(&f3));
+        assert_eq!(h.len(), 1);
+        assert_eq!((h[0].1["x-a"].as_str(), h[0].1["x-b"].as_str()), ("1", "2"));
+        assert_eq!(d.buffered(), 0);
+    }
+
+    #[test]
+    fn byte_by_byte_feed_equals_a_single_feed() {
+        let f1 = frame(0x01, END_HEADERS, 1, &[&[0x82, 0x84][..], &lit_new("x-a", "1")].concat());
+        let f2 = frame(0x00, END_STREAM, 1, b"hello");
+        let stream = client_stream(&[f1, f2]);
+        let whole = Http2Direction::new(true).feed(&stream);
+        let mut d = Http2Direction::new(true);
+        let mut piecewise = Vec::new();
+        for b in &stream {
+            piecewise.extend(d.feed(std::slice::from_ref(b)));
+        }
+        assert_eq!(whole, piecewise);
+        assert_eq!(whole.len(), 2);
+    }
+
+    #[test]
+    fn header_block_split_across_continuation_frames_and_reads() {
+        let block = [&[0x82, 0x84][..], &lit_new("x-long", "value")].concat();
+        let (a, b) = block.split_at(3);
+        let h = frame(0x01, 0, 1, a); // no END_HEADERS
+        let c = frame(0x09, END_HEADERS, 1, b);
+        let mut d = Http2Direction::new(true);
+        assert!(d.feed(&client_stream(&[h])).is_empty());
+        let items = d.feed(&c);
+        assert_eq!(headers(&items)[0].1["x-long"], "value");
+        // an unrelated frame while a block is open is a protocol violation, not silently accepted
+        let mut d2 = Http2Direction::new(false);
+        d2.feed(&frame(0x01, 0, 1, a));
+        d2.feed(&frame(0x00, 0, 1, b"x"));
+        assert!(d2.is_broken());
+    }
+
+    #[test]
+    fn padded_and_prioritised_headers_decode() {
+        let block = [0x82u8, 0x84];
+        let mut payload = vec![2u8]; // pad length
+        payload.extend_from_slice(&[0, 0, 0, 0, 16]); // PRIORITY: dependency + weight
+        payload.extend_from_slice(&block);
+        payload.extend_from_slice(&[0, 0]); // padding
+        let f = frame(0x01, END_HEADERS | 0x08 | 0x20, 1, &payload);
+        let items = Http2Direction::new(true).feed(&client_stream(&[f]));
+        assert_eq!(headers(&items)[0].1[":method"], "GET");
+    }
+
+    #[test]
+    fn data_padding_is_stripped_and_end_stream_reported() {
+        let mut payload = vec![3u8];
+        payload.extend_from_slice(b"world");
+        payload.extend_from_slice(&[0, 0, 0]);
+        let items = Http2Direction::new(false).feed(&frame(0x00, 0x08 | END_STREAM, 1, &payload));
+        assert_eq!(items, vec![H2Item::Data { stream_id: 1, data: b"world".to_vec(), end_stream: true }]);
+    }
+
+    #[test]
+    fn repeated_cookie_crumbs_are_rejoined_and_set_cookie_kept_distinct() {
+        let block = [
+            &[0x82u8, 0x84][..],
+            &lit_new("cookie", "a=1"),
+            &lit_new("cookie", "b=2"),
+            &lit_new("set-cookie", "s1=x"),
+            &lit_new("set-cookie", "s2=y"),
+            &lit_new("accept", "a"),
+            &lit_new("accept", "b"),
+        ]
+        .concat();
+        let items = Http2Direction::new(true).feed(&client_stream(&[frame(0x01, END_HEADERS, 1, &block)]));
+        let h = &headers(&items)[0].1;
+        assert_eq!(h["cookie"], "a=1; b=2", "the old map insert kept only the last crumb");
+        assert_eq!(h["set-cookie"], "s1=x\ns2=y");
+        assert_eq!(h["accept"], "a, b");
+    }
+
+    #[test]
+    fn oversized_or_garbage_framing_breaks_the_direction_without_panicking() {
+        // declared length 0xFFFFFF
+        let mut d = Http2Direction::new(false);
+        assert!(d.feed(&[0xff, 0xff, 0xff, 0x00, 0x00, 0, 0, 0, 1]).is_empty());
+        assert!(d.is_broken());
+        // not an HTTP/2 client stream at all
+        let mut d = Http2Direction::new(true);
+        assert!(d.feed(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").is_empty());
+        assert!(d.is_broken());
+        // HEADERS on stream 0 is illegal
+        let mut d = Http2Direction::new(false);
+        d.feed(&frame(0x01, END_HEADERS, 0, &[0x82]));
+        assert!(d.is_broken());
+        // a broken direction stays inert
+        assert!(d.feed(&frame(0x00, 0, 1, b"x")).is_empty());
+    }
+
+    #[test]
+    fn a_preface_split_across_reads_is_awaited() {
+        let mut d = Http2Direction::new(true);
+        assert!(d.feed(&HTTP2_PREFACE[..10]).is_empty());
+        assert!(!d.is_broken());
+        let rest = [&HTTP2_PREFACE[10..], &frame(0x01, END_HEADERS, 1, &[0x82, 0x84])[..]].concat();
+        assert_eq!(headers(&d.feed(&rest))[0].1[":method"], "GET");
+    }
+
+    #[test]
+    fn announced_max_frame_size_is_reported_and_honoured() {
+        let mut settings = vec![0x00, 0x05];
+        settings.extend_from_slice(&(100_000u32).to_be_bytes());
+        let mut announcer = Http2Direction::new(false);
+        announcer.feed(&frame(0x04, 0, 0, &settings));
+        assert_eq!(announcer.announced_max_frame, Some(100_000));
+        // the OTHER direction may then carry a 50 KB DATA frame, which the default 16 KB would reject
+        let mut peer = Http2Direction::new(true);
+        peer.feed(HTTP2_PREFACE);
+        peer.set_max_frame(100_000);
+        let big = vec![b'x'; 50_000];
+        let items = peer.feed(&frame(0x00, END_STREAM, 1, &big));
+        assert!(matches!(&items[0], H2Item::Data { data, .. } if data.len() == 50_000));
+        assert!(!peer.is_broken());
+    }
+}

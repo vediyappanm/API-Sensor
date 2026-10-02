@@ -6,6 +6,8 @@ pub static EVENTS_DROPPED:     AtomicU64 = AtomicU64::new(0);
 pub static UNPAIRED_RESPONSES: AtomicU64 = AtomicU64::new(0);
 /// Requests discarded because their response never arrived within the stream TTL.
 pub static PENDING_EXPIRED:    AtomicU64 = AtomicU64::new(0);
+/// HTTP/2 framing violations and HPACK decode failures (lost sync, or not HTTP/2).
+pub static H2_PARSE_ERRORS:    AtomicU64 = AtomicU64::new(0);
 pub static EVENTS_SENT:        AtomicU64 = AtomicU64::new(0);
 pub static SEND_ERRORS:        AtomicU64 = AtomicU64::new(0);
 pub static RINGBUF_DROPS:      AtomicU64 = AtomicU64::new(0);
@@ -29,6 +31,7 @@ async fn metrics_handler() -> impl IntoResponse {
     let drop_rate = if captured > 0 { dropped * 10000 / captured } else { 0 };
     let uptime = now_secs().saturating_sub(START_TIME_SECS.load(Ordering::Relaxed));
     let expired = PENDING_EXPIRED.load(Ordering::Relaxed);
+    let h2_errors = H2_PARSE_ERRORS.load(Ordering::Relaxed);
     let buffer_bytes = crate::types::TOTAL_BUFFER_BYTES.load(Ordering::Relaxed);
 
     format!(
@@ -47,6 +50,10 @@ apisec_buffer_bytes {buffer_bytes}
 # HELP apisec_pending_expired_total Requests dropped because no response was seen within the TTL
 # TYPE apisec_pending_expired_total counter
 apisec_pending_expired_total {expired}
+
+# HELP apisec_h2_parse_errors_total HTTP/2 framing or HPACK errors (capture lost sync)
+# TYPE apisec_h2_parse_errors_total counter
+apisec_h2_parse_errors_total {h2_errors}
 
 # HELP apisec_unpaired_responses_total HTTP responses with no matching request
 # TYPE apisec_unpaired_responses_total counter

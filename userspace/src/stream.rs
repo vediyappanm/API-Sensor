@@ -10,9 +10,7 @@ use crate::grpc::decode_grpc_fields;
 use crate::http::{
     HttpMessage, HttpResponseParsed, extract_http_header, is_usable_http_request, split_query,
 };
-use crate::http2::{
-    Http2HpackDecoder, contains_http2_preface, extract_data_frames, parse_http2_frames,
-};
+use crate::http2::{H2Item, Http2Direction};
 use crate::identity::extract_identity;
 use crate::mcp::{is_mcp_response, parse_sse_events};
 use crate::metrics::*;
@@ -141,14 +139,128 @@ struct StreamState {
     last_eviction_ms: u64,
 }
 
-#[derive(Default)]
-pub struct Http2Conn {
-    pub buffer: Vec<u8>,
-    pub seen_preface: bool,
-    pub pending_requests: PendingStreams,
-    pub last_event_ts: u64,
-    pub hpack: Http2HpackDecoder,
+/// A response whose HEADERS have been seen but whose stream has not ended yet.
+struct InflightResponse {
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+    charged: usize,
 }
+
+impl InflightResponse {
+    fn size_of(headers: &HashMap<String, String>, body_len: usize) -> usize {
+        const BASE: usize = 256;
+        BASE + headers.iter().map(|(k, v)| k.len() + v.len() + 64).sum::<usize>() + body_len
+    }
+}
+
+/// HTTP/2 responses being assembled (HEADERS seen, END_STREAM not yet), keyed by stream id.
+/// Charged against the memory ceiling and released on Drop like the other queues.
+#[derive(Default)]
+pub struct InflightResponses {
+    map: HashMap<u32, InflightResponse>,
+    bytes: PendingBytes,
+}
+
+impl InflightResponses {
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn start(&mut self, stream_id: u32, headers: HashMap<String, String>, max_total: usize, cap: usize) -> bool {
+        if let Some(old) = self.map.remove(&stream_id) {
+            self.bytes.sub(old.charged);
+        }
+        let charged = InflightResponse::size_of(&headers, 0);
+        if self.map.len() >= cap || !self.bytes.add(max_total, charged) {
+            EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.map.insert(stream_id, InflightResponse { headers, body: Vec::new(), charged });
+        true
+    }
+
+    /// Append DATA up to the capture cap. Returns false if the stream is unknown.
+    fn append(&mut self, stream_id: u32, data: &[u8], max_total: usize) -> bool {
+        let Some(r) = self.map.get_mut(&stream_id) else { return false };
+        let room = MAX_BODY_CAPTURE_BYTES.saturating_sub(r.body.len());
+        let take = data.len().min(room);
+        if take > 0 && self.bytes.add(max_total, take) {
+            r.body.extend_from_slice(&data[..take]);
+            r.charged += take;
+        }
+        true
+    }
+
+    /// Trailers (e.g. gRPC `grpc-status`) join the response headers.
+    fn merge_trailers(&mut self, stream_id: u32, trailers: HashMap<String, String>, max_total: usize) -> bool {
+        let Some(r) = self.map.get_mut(&stream_id) else { return false };
+        for (k, v) in trailers {
+            let extra = k.len() + v.len() + 64;
+            if self.bytes.add(max_total, extra) {
+                r.charged += extra;
+                r.headers.insert(k, v);
+            }
+        }
+        true
+    }
+
+    fn body_full(&self, stream_id: u32) -> bool {
+        self.map.get(&stream_id).map_or(false, |r| r.body.len() >= MAX_BODY_CAPTURE_BYTES)
+    }
+
+    fn take(&mut self, stream_id: u32) -> Option<(HashMap<String, String>, Vec<u8>)> {
+        let r = self.map.remove(&stream_id)?;
+        self.bytes.sub(r.charged);
+        Some((r.headers, r.body))
+    }
+
+    /// Drop responses that never completed. Their request is dropped by `PendingStreams::expire`.
+    pub fn expire(&mut self, live: &PendingStreams) -> usize {
+        let stale: Vec<u32> = self.map.keys().filter(|id| !live.contains(**id)).copied().collect();
+        for id in &stale {
+            self.take(*id);
+        }
+        stale.len()
+    }
+
+    #[cfg(test)]
+    pub fn accounted(&self) -> usize {
+        self.bytes.0
+    }
+
+    #[cfg(test)]
+    pub fn recount(&self) -> usize {
+        self.map.values().map(|r| r.charged).sum()
+    }
+}
+
+/// One HTTP/2 connection: independent parser state per direction (HPACK tables are per
+/// direction), the requests awaiting a response, and responses being assembled.
+pub struct Http2Conn {
+    /// client -> server bytes (starts with the connection preface)
+    pub req: Http2Direction,
+    /// server -> client bytes
+    pub resp: Http2Direction,
+    pub pending_requests: PendingStreams,
+    pub responses: InflightResponses,
+    pub last_event_ts: u64,
+    /// Bytes of incomplete frames held by `req`/`resp`; released on Drop.
+    buffered: PendingBytes,
+}
+
+impl Default for Http2Conn {
+    fn default() -> Self {
+        Self {
+            req: Http2Direction::new(true),
+            resp: Http2Direction::new(false),
+            pending_requests: PendingStreams::default(),
+            responses: InflightResponses::default(),
+            last_event_ts: 0,
+            buffered: PendingBytes::default(),
+        }
+    }
+}
+
 
 /// Subtract from TOTAL_BUFFER_BYTES with underflow protection.
 fn release_memory(amount: usize) {
@@ -290,6 +402,21 @@ impl PendingStreams {
         true
     }
 
+    pub fn contains(&self, stream_id: u32) -> bool {
+        self.map.contains_key(&stream_id)
+    }
+
+    /// Append request DATA to a queued request, up to the capture cap.
+    pub fn append_body(&mut self, stream_id: u32, data: &[u8], max_total: usize) -> bool {
+        let Some(req) = self.map.get_mut(&stream_id) else { return false };
+        let take = data.len().min(MAX_BODY_CAPTURE_BYTES.saturating_sub(req.body.len()));
+        if take > 0 && self.bytes.add(max_total, take) {
+            req.body.reserve_exact(take);
+            req.body.extend_from_slice(&data[..take]);
+        }
+        true
+    }
+
     pub fn remove(&mut self, stream_id: &u32) -> Option<ParsedRequest> {
         let req = self.map.remove(stream_id)?;
         self.bytes.sub(req.approx_bytes());
@@ -361,10 +488,8 @@ impl StreamState {
         let new_buffers_size: usize = self.buffers.values().map(|(b, _)| b.len()).sum();
         freed_bytes += old_buffers_size.saturating_sub(new_buffers_size);
 
-        let old_h2_size: usize = self.http2_state.values().map(|c| c.buffer.len()).sum();
+        // Http2Conn releases everything it holds on Drop, so no byte arithmetic here.
         self.http2_state.retain(|_, conn| now_ms.saturating_sub(conn.last_event_ts) < STREAM_TTL_MS);
-        let new_h2_size: usize = self.http2_state.values().map(|c| c.buffer.len()).sum();
-        freed_bytes += old_h2_size.saturating_sub(new_h2_size);
 
         // Requests whose response never arrived would otherwise sit (and hold memory) until
         // the connection closes. Their bytes are released by PendingBytes as they are dropped.
@@ -374,6 +499,7 @@ impl StreamState {
         }
         for conn in self.http2_state.values_mut() {
             expired += conn.pending_requests.expire(now_ms, STREAM_TTL_MS);
+            expired += conn.responses.expire(&conn.pending_requests);
         }
         if expired > 0 {
             PENDING_EXPIRED.fetch_add(expired as u64, Ordering::Relaxed);
@@ -395,9 +521,7 @@ impl StreamState {
             let mut keys: Vec<_> = self.http2_state.keys().cloned().collect();
             keys.sort_by_key(|k| self.http2_state.get(k).map(|c| c.last_event_ts).unwrap_or(0));
             for k in keys.into_iter().take(excess) {
-                if let Some(conn) = self.http2_state.remove(&k) {
-                    freed_bytes += conn.buffer.len();
-                }
+                self.http2_state.remove(&k);
             }
         }
 
@@ -434,14 +558,7 @@ impl StreamState {
             }
         });
         self.pending.retain(|k, _| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
-        self.http2_state.retain(|k, conn| {
-            if k.pid == pid && k.ssl_ptr == ssl_ptr {
-                freed_bytes += conn.buffer.len();
-                false
-            } else {
-                true
-            }
-        });
+        self.http2_state.retain(|k, _| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
         self.ws_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
         self.http3_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
 
@@ -517,17 +634,17 @@ impl StreamState {
 
         // HTTP/2 check — only process if already known H2 or preface detected in this event.
         // This avoids creating a shadow buffer for HTTP/1.1 connections.
+        // A connection is HTTP/2 only if its client stream BEGINS with the connection preface and
+        // no HTTP/1 bytes were seen on it before. Matching the preface anywhere in a payload let a
+        // request body that merely contained that string flip the connection to HTTP/2 and blind
+        // the HTTP/1 parser (a trivial evasion).
         let is_known_h2 = self.http2_state.contains_key(&conn_key);
-        let data_has_preface = if !is_known_h2 && data_len > 0 {
-            contains_http2_preface(payload)
-        } else {
-            false
-        };
-
-        if is_known_h2 || data_has_preface {
-            if let Some(events) = self.process_http2_event(conn_key.clone(), ev, payload, ts_ms, is_request_dir, data_has_preface) {
-                return events;
-            }
+        let starts_h2 = !is_known_h2
+            && is_request_dir
+            && payload.starts_with(crate::types::HTTP2_PREFACE)
+            && !self.buffers.contains_key(&stream_key);
+        if is_known_h2 || starts_h2 {
+            return self.process_http2_event(conn_key.clone(), ev, payload, ts_ms, is_request_dir);
         }
 
         if data_len == 0 {
@@ -711,66 +828,52 @@ impl StreamState {
         payload: &[u8],
         ts_ms: u64,
         is_request_dir: bool,
-        data_has_preface: bool,
-    ) -> Option<Vec<ApiTrafficEvent>> {
-        let net_ctx = if is_request_dir {
-            Some(self.net_context_from_event(ev))
-        } else {
-            None
-        };
+    ) -> Vec<ApiTrafficEvent> {
+        let net_ctx = if is_request_dir { Some(self.net_context_from_event(ev)) } else { None };
+        let account_id = self.account_id;
         let max_total = self.max_total_buffer_bytes;
-        let conn_state = self.http2_state.entry(conn_key).or_default();
-        conn_state.last_event_ts = ts_ms;
-        if data_has_preface {
-            conn_state.seen_preface = true;
+        let conn = self.http2_state.entry(conn_key).or_default();
+        conn.last_event_ts = ts_ms;
+        if payload.is_empty() {
+            return Vec::new();
         }
 
-        let data_len = payload.len();
-        if data_len == 0 {
-            return Some(vec![]);
-        }
-
-        // Atomic CAS memory reservation
-        if !reserve_memory(self.max_total_buffer_bytes, data_len) {
+        // Charge the incoming chunk while it is parsed; whatever remains buffered afterwards
+        // (an incomplete trailing frame) stays charged, the rest is released.
+        if !conn.buffered.add(max_total, payload.len()) {
             EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
-            return Some(vec![]);
+            return Vec::new();
         }
-        conn_state.buffer.extend_from_slice(payload);
-
-        if !conn_state.seen_preface {
-            if contains_http2_preface(&conn_state.buffer) {
-                conn_state.seen_preface = true;
-            } else {
-                return None;
-            }
+        let (before, items, after, announced) = {
+            let dir = if is_request_dir { &mut conn.req } else { &mut conn.resp };
+            let before = dir.buffered();
+            let items = dir.feed(payload);
+            (before, items, dir.buffered(), dir.announced_max_frame)
+        };
+        conn.buffered.sub((payload.len() + before).saturating_sub(after));
+        if let Some(size) = announced {
+            // What one side announces bounds the frames the other side may send.
+            if is_request_dir { conn.resp.set_max_frame(size) } else { conn.req.set_max_frame(size) }
         }
 
         let mut output = Vec::new();
-        if conn_state.buffer.len() > self.max_buffer * 2 {
-            let target_drain = conn_state.buffer.len() - self.max_buffer;
-            let boundary = find_next_frame_boundary(&conn_state.buffer, target_drain);
-            if boundary > 0 {
-                release_memory(boundary);
-                conn_state.buffer.drain(0..boundary);
-            }
-        }
-
-        let stream_frames = parse_http2_frames(&mut conn_state.hpack, &conn_state.buffer);
-        for (stream_id, headers) in stream_frames {
-            if is_request_dir {
-                if let Some(method) = headers.get(":method") {
+        for item in items {
+            match item {
+                H2Item::Headers { stream_id, headers, end_stream } if is_request_dir => {
+                    // A second HEADERS block on a known stream is request trailers: not a new request.
+                    let Some(method) = headers.get(":method").cloned() else { continue };
                     let path = headers.get(":path").cloned().unwrap_or_else(|| "/".to_string());
-                    if !is_usable_http_request(method, &path) {
+                    if !is_usable_http_request(&method, &path) {
                         continue;
                     }
                     let host = headers.get(":authority").cloned();
-                    conn_state.pending_requests.insert(
+                    conn.pending_requests.insert(
                         stream_id,
                         ParsedRequest {
-                            method: method.clone(),
+                            method,
                             path,
                             host,
-                            headers: headers.clone(),
+                            headers,
                             ts_ms,
                             net_ctx: net_ctx.clone().unwrap_or_default(),
                             body: Vec::new(),
@@ -778,73 +881,89 @@ impl StreamState {
                         max_total,
                         MAX_H2_PENDING_STREAMS,
                     );
-                    // Don't clear the buffer here — multiplexed streams may
-                    // have additional HEADERS / DATA frames in this same chunk
-                    // that we still need to parse. The buffer is drained at
-                    // the end of the function (after all frames processed)
-                    // and bounded by the max_buffer guard above, so we won't
-                    // grow without bound either.
+                    let _ = end_stream; // a body-less request: nothing more to wait for
                 }
-            } else if let Some(status) = headers.get(":status") {
-                let Some(request) = conn_state
-                    .pending_requests
-                    .remove(&stream_id)
-                    .filter(|req| is_usable_http_request(&req.method, &req.path))
-                else {
-                    skip_unpaired_response();
-                    continue;
-                };
-                let latency_ms = ts_ms.saturating_sub(request.ts_ms);
-                let is_grpc = headers
-                    .get("content-type")
-                    .map(|v| v.starts_with("application/grpc"))
-                    .unwrap_or(false);
-
-                // This stream's response DATA payloads. For plain HTTP/2 REST
-                // this is the response body; for gRPC it's protobuf bytes we
-                // decode into fields instead of shipping raw.
-                let data = extract_data_frames(&conn_state.buffer, stream_id);
-                let resp = HttpResponseParsed {
-                    status_code: status.parse::<i32>().unwrap_or(0),
-                    headers: headers.clone(),
-                    body: if is_grpc { Vec::new() } else { data.clone() },
-                };
-
-                let grpc_body = if is_grpc {
-                    let fields = decode_grpc_fields(&data);
-                    if !fields.is_empty() {
-                        serde_json::to_string(&fields).ok()
-                    } else {
-                        None
+                H2Item::Data { stream_id, data, .. } if is_request_dir => {
+                    conn.pending_requests.append_body(stream_id, &data, max_total);
+                }
+                H2Item::Headers { stream_id, headers, end_stream } => {
+                    if let Some(status) = headers.get(":status") {
+                        // 1xx are interim responses; the final one follows on the same stream.
+                        if status.starts_with('1') {
+                            continue;
+                        }
+                        if !conn.pending_requests.contains(stream_id) {
+                            skip_unpaired_response();
+                            continue;
+                        }
+                        conn.responses.start(stream_id, headers, max_total, MAX_H2_PENDING_STREAMS);
+                    } else if !conn.responses.merge_trailers(stream_id, headers, max_total) {
+                        continue;
                     }
-                } else {
-                    None
-                };
-
-                let protocol = if is_grpc { "gRPC" } else { "HTTP/2" };
-                let mut event = build_event(
-                    self.account_id,
-                    ts_ms,
-                    request,
-                    resp,
-                    latency_ms,
-                    protocol,
-                    "ebpf",
-                );
-                // gRPC body belongs in response, not request
-                if let Some(body) = grpc_body {
-                    // Assigned after build_event's redaction, so it must be redacted here.
-                    event.response.body = Some(redact_body(&body));
+                    if end_stream || conn.responses.body_full(stream_id) {
+                        Self::finish_h2_response(conn, stream_id, ts_ms, account_id, &mut output);
+                    }
                 }
-                output.push(event);
+                H2Item::Data { stream_id, data, end_stream } => {
+                    if conn.responses.append(stream_id, &data, max_total)
+                        && (end_stream || conn.responses.body_full(stream_id))
+                    {
+                        Self::finish_h2_response(conn, stream_id, ts_ms, account_id, &mut output);
+                    }
+                }
+                H2Item::Reset { stream_id } => {
+                    conn.responses.take(stream_id);
+                    conn.pending_requests.remove(&stream_id);
+                }
             }
         }
-        if !output.is_empty() {
-            let cleared = conn_state.buffer.len();
-            conn_state.buffer.clear();
-            release_memory(cleared);
+        output
+    }
+
+    /// Pair a completed (or capped) HTTP/2 response with its request and build the event.
+    fn finish_h2_response(
+        conn: &mut Http2Conn,
+        stream_id: u32,
+        ts_ms: u64,
+        account_id: u64,
+        output: &mut Vec<ApiTrafficEvent>,
+    ) {
+        let Some((headers, data)) = conn.responses.take(stream_id) else { return };
+        let Some(request) = conn
+            .pending_requests
+            .remove(&stream_id)
+            .filter(|req| is_usable_http_request(&req.method, &req.path))
+        else {
+            skip_unpaired_response();
+            return;
+        };
+        let latency_ms = ts_ms.saturating_sub(request.ts_ms);
+        let status_code = headers.get(":status").and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+        let is_grpc = headers
+            .get("content-type")
+            .map(|v| v.starts_with("application/grpc"))
+            .unwrap_or(false);
+
+        // For plain HTTP/2 this DATA is the response body; for gRPC it is protobuf we decode
+        // into fields instead of shipping raw.
+        let grpc_body = if is_grpc {
+            let fields = decode_grpc_fields(&data);
+            if fields.is_empty() { None } else { serde_json::to_string(&fields).ok() }
+        } else {
+            None
+        };
+        let resp = HttpResponseParsed {
+            status_code,
+            headers,
+            body: if is_grpc { Vec::new() } else { data },
+        };
+        let protocol = if is_grpc { "gRPC" } else { "HTTP/2" };
+        let mut event = build_event(account_id, ts_ms, request, resp, latency_ms, protocol, "ebpf");
+        if let Some(body) = grpc_body {
+            // Attached after build_event's own redaction, so it must be redacted here.
+            event.response.body = Some(redact_body(&body));
         }
-        Some(output)
+        output.push(event);
     }
 }
 
@@ -895,20 +1014,6 @@ fn compute_anomaly_features(path: &str, query: &HashMap<String, String>, body_le
         has_xss_pattern: contains_xss(path, query),
         has_path_traversal: path.contains("../") || path.contains("..\\"),
     }
-}
-
-/// Scan for the next valid HTTP/2 frame boundary at or after `start`.
-fn find_next_frame_boundary(buf: &[u8], start: usize) -> usize {
-    let mut i = start;
-    while i + 9 <= buf.len() {
-        let frame_len = ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | (buf[i + 2] as usize);
-        let frame_type = buf[i + 3];
-        if frame_len <= 16384 && frame_type <= 9 && i + 9 + frame_len <= buf.len() {
-            return i;
-        }
-        i += 1;
-    }
-    buf.len()
 }
 
 /// Atomic CAS memory reservation — returns true if reservation succeeded.
@@ -1474,5 +1579,209 @@ mod tests {
         // cap
         for id in 0..4u32 { assert!(s.insert(id * 2 + 1, req_with(1, 1), PLENTY, 4)); }
         assert!(!s.insert(99, req_with(1, 1), PLENTY, 4));
+    }
+
+    // ---- HTTP/2 stream-level behaviour --------------------------------------------------
+
+    const F_END_STREAM: u8 = 0x01;
+    const F_END_HEADERS: u8 = 0x04;
+
+    fn lit_new_name(name: &str, value: &str) -> Vec<u8> {
+        let mut v = vec![0x40, name.len() as u8];
+        v.extend_from_slice(name.as_bytes());
+        v.push(value.len() as u8);
+        v.extend_from_slice(value.as_bytes());
+        v
+    }
+
+    /// :method POST/GET, :path, and a content-type, as a HEADERS frame on `stream`.
+    fn h2_request(stream: u32, method_idx: u8, path: &str, extra: &[u8], flags: u8) -> Vec<u8> {
+        let mut hp = vec![0x80 | method_idx];
+        hp.extend(hpack_literal(4, path));
+        hp.extend_from_slice(extra);
+        h2_frame(0x01, flags, stream, &hp)
+    }
+
+    fn h2_status_headers(stream: u32, status_idx: u8, extra: &[u8], flags: u8) -> Vec<u8> {
+        let mut hp = vec![0x80 | status_idx];
+        hp.extend_from_slice(extra);
+        h2_frame(0x01, flags, stream, &hp)
+    }
+
+    fn client_bytes(frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut v = HTTP2_PREFACE.to_vec();
+        for f in frames {
+            v.extend_from_slice(f);
+        }
+        v
+    }
+
+    fn ev_at(direction: u8) -> TlsEventHeader {
+        tls_event(direction)
+    }
+
+    #[test]
+    fn h2_response_body_arriving_in_a_later_read_is_captured_in_one_event() {
+        let state = test_state();
+        let req = client_bytes(&[h2_request(1, 2, "/items", &[], F_END_HEADERS | F_END_STREAM)]);
+        assert!(state.handle_event(&ev_at(0), &req).is_empty());
+
+        // 200 with a JSON content-type, END_HEADERS only: the body has not arrived yet.
+        let ct = lit_new_name("content-type", "application/json");
+        let hdrs = h2_status_headers(1, 8, &ct, F_END_HEADERS);
+        assert!(state.handle_event(&ev_at(1), &hdrs).is_empty(), "must wait for END_STREAM");
+
+        // The body comes in a LATER read. It used to be lost because it was only searched for
+        // in the buffer present when the response HEADERS arrived.
+        let data = h2_frame(0x00, F_END_STREAM, 1, b"{\"items\":[1,2,3]}");
+        let events = state.handle_event(&ev_at(1), &data);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].protocol, "HTTP/2");
+        assert_eq!(events[0].response.status_code, 200);
+        assert_eq!(events[0].response.body.as_deref(), Some("{\"items\":[1,2,3]}"));
+    }
+
+    #[test]
+    fn h2_request_body_is_captured_and_redacted() {
+        let state = test_state();
+        let ct = lit_new_name("content-type", "application/json");
+        let req = client_bytes(&[
+            h2_request(1, 3, "/login", &ct, F_END_HEADERS),
+            h2_frame(0x00, F_END_STREAM, 1, b"{\"user\":\"alice\",\"password\":\"hunter2-correct-horse\"}"),
+        ]);
+        assert!(state.handle_event(&ev_at(0), &req).is_empty());
+        let events = state.handle_event(&ev_at(1), &h2_status_headers(1, 8, &[], F_END_HEADERS | F_END_STREAM));
+        assert_eq!(events.len(), 1);
+        let body = events[0].request.body.as_deref().expect("H2 request body was never captured before");
+        assert!(body.contains("\"user\":\"alice\""), "{body}");
+        assert!(!body.contains("hunter2-correct-horse"), "password leaked: {body}");
+        assert_eq!(events[0].request.method, "POST");
+    }
+
+    #[test]
+    fn h2_multiplexed_streams_complete_out_of_order_and_pair_correctly() {
+        let state = test_state();
+        let req = client_bytes(&[
+            h2_request(1, 2, "/a", &[], F_END_HEADERS | F_END_STREAM),
+            h2_request(3, 2, "/b", &[], F_END_HEADERS | F_END_STREAM),
+        ]);
+        assert!(state.handle_event(&ev_at(0), &req).is_empty());
+        // stream 3 answers first (404 = static idx 13), then stream 1 (200)
+        let resp = [
+            h2_status_headers(3, 13, &[], F_END_HEADERS | F_END_STREAM),
+            h2_status_headers(1, 8, &[], F_END_HEADERS | F_END_STREAM),
+        ]
+        .concat();
+        let events = state.handle_event(&ev_at(1), &resp);
+        assert_eq!(events.len(), 2);
+        assert_eq!((events[0].request.path.as_str(), events[0].response.status_code), ("/b", 404));
+        assert_eq!((events[1].request.path.as_str(), events[1].response.status_code), ("/a", 200));
+    }
+
+    #[test]
+    fn grpc_trailers_are_merged_into_the_response_headers() {
+        let state = test_state();
+        let mut gh = vec![0x83u8];
+        gh.extend(hpack_literal(4, "/pkg.Svc/Method"));
+        gh.extend(hpack_literal(31, "application/grpc"));
+        let req = client_bytes(&[h2_frame(0x01, F_END_HEADERS | F_END_STREAM, 1, &gh)]);
+        assert!(state.handle_event(&ev_at(0), &req).is_empty());
+
+        let mut rh = vec![0x88u8];
+        rh.extend(hpack_literal(31, "application/grpc"));
+        let msg = [0x00, 0x00, 0x00, 0x00, 0x02, 0x08, 0x07]; // field 1 varint 7
+        let trailers = [lit_new_name("grpc-status", "0"), lit_new_name("grpc-message", "ok")].concat();
+        let resp = [
+            h2_frame(0x01, F_END_HEADERS, 1, &rh),
+            h2_frame(0x00, 0, 1, &msg),
+            h2_frame(0x01, F_END_HEADERS | F_END_STREAM, 1, &trailers),
+        ]
+        .concat();
+        let events = state.handle_event(&ev_at(1), &resp);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].protocol, "gRPC");
+        assert_eq!(events[0].response.headers.get("grpc-status").map(String::as_str), Some("0"));
+        assert!(events[0].response.body.is_some());
+    }
+
+    #[test]
+    fn h2_interim_1xx_responses_do_not_complete_the_request() {
+        let state = test_state();
+        let req = client_bytes(&[h2_request(1, 3, "/up", &[], F_END_HEADERS)]);
+        assert!(state.handle_event(&ev_at(0), &req).is_empty());
+        let interim = h2_frame(0x01, F_END_HEADERS, 1, &hpack_literal(8, "100"));
+        assert!(state.handle_event(&ev_at(1), &interim).is_empty());
+        let events = state.handle_event(&ev_at(1), &h2_status_headers(1, 8, &[], F_END_HEADERS | F_END_STREAM));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].response.status_code, 200);
+    }
+
+    #[test]
+    fn h2_response_without_a_request_is_not_fabricated() {
+        let state = test_state();
+        assert!(state
+            .handle_event(&ev_at(0), &client_bytes(&[h2_frame(0x04, 0, 0, &[])]))
+            .is_empty());
+        let events = state.handle_event(&ev_at(1), &h2_status_headers(9, 8, &[], F_END_HEADERS | F_END_STREAM));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn h2_reset_stream_drops_the_pending_request() {
+        let state = test_state();
+        assert!(state
+            .handle_event(&ev_at(0), &client_bytes(&[h2_request(1, 2, "/x", &[], F_END_HEADERS | F_END_STREAM)]))
+            .is_empty());
+        let rst = h2_frame(0x03, 0, 1, &[0, 0, 0, 8]);
+        assert!(state.handle_event(&ev_at(1), &rst).is_empty());
+        let events = state.handle_event(&ev_at(1), &h2_status_headers(1, 8, &[], F_END_HEADERS | F_END_STREAM));
+        assert!(events.is_empty(), "a reset stream must not later pair with a response");
+    }
+
+    #[test]
+    fn http1_body_containing_the_h2_preface_cannot_blind_the_http1_parser() {
+        let state = test_state();
+        // An attacker (or any client) sends an HTTP/1 request whose BODY contains the HTTP/2
+        // preface. The old detector matched the preface anywhere and switched the whole
+        // connection to HTTP/2, after which no HTTP/1 traffic on it was parsed.
+        let body = String::from_utf8_lossy(HTTP2_PREFACE).to_string();
+        let req = format!(
+            "POST /api/x HTTP/1.1\r\nHost: h\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        assert!(state.handle_event(&tls_event(0), req.as_bytes()).is_empty());
+        let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let events = state.handle_event(&tls_event(1), resp.as_bytes());
+        assert_eq!(events.len(), 1, "the HTTP/1 exchange must still be captured");
+        assert_eq!(events[0].protocol, "HTTP/1.1");
+        assert_eq!(events[0].request.path, "/api/x");
+
+        // ...and a later write that merely STARTS with the preface on a connection that already
+        // spoke HTTP/1 must not switch it to HTTP/2 either.
+        state.handle_event(&tls_event(0), HTTP2_PREFACE);
+        let h2_conns: usize = state.shards.iter().map(|s| s.lock().unwrap().http2_state.len()).sum();
+        assert_eq!(h2_conns, 0, "an HTTP/1 connection was switched to HTTP/2 by a preface-looking write");
+    }
+
+    #[test]
+    fn h2_state_bytes_are_released_when_the_connection_goes_away() {
+        let state = test_state();
+        // an incomplete trailing frame stays buffered (and charged)
+        let mut req = client_bytes(&[h2_request(1, 2, "/x", &[], F_END_HEADERS | F_END_STREAM)]);
+        req.extend_from_slice(&[0x00, 0x00, 0x10, 0x00, 0x00, 0, 0, 0, 3, b'p']); // partial DATA
+        assert!(state.handle_event(&ev_at(0), &req).is_empty());
+        let held: usize = state
+            .shards
+            .iter()
+            .map(|s| {
+                let g = s.lock().unwrap();
+                g.http2_state.values().map(|c| c.req.buffered() + c.resp.buffered()).sum::<usize>()
+            })
+            .sum();
+        assert!(held > 0, "the partial frame should be buffered");
+        state.evict_connection(&ConnKey { pid: 42, ssl_ptr: 0x1000, born_ms: 0 });
+        let left: usize = state.shards.iter().map(|s| s.lock().unwrap().http2_state.len()).sum();
+        assert_eq!(left, 0);
     }
 }
