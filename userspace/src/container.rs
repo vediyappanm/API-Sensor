@@ -1,6 +1,8 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use hyper_util::rt::TokioIo;
@@ -52,7 +54,54 @@ const MAX_CACHE_ENTRIES: usize = 10_000;
 /// events keep arriving for stale cgroup ids.
 const MAX_PENDING_LOOKUPS: usize = 4_096;
 
+/// Where the cgroup v2 tree is mounted inside the sensor.
+const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
+/// Rescan the cgroup tree at most this often when an unknown cgroup id turns up.
+const CGROUP_RESCAN_COOLDOWN: Duration = Duration::from_secs(2);
+const CGROUP_SCAN_MAX_DEPTH: usize = 12;
+const CGROUP_SCAN_MAX_DIRS: usize = 200_000;
+
+/// cgroup id -> path (relative to the cgroup root), built by walking the mounted cgroup tree.
+///
+/// The kernel reports a process's *cgroup id* (the inode number of its cgroup directory) and its
+/// *pid in the initial PID namespace*. Only the first is usable from inside a pod: with kind, k3d or
+/// any nested node, the sensor's /proc belongs to a child PID namespace, so `/proc/<kernel pid>`
+/// names no process (or the wrong one). The old resolver looked the pid up in /proc, never learned
+/// any container, and a namespace scope therefore dropped every event.
+#[derive(Default)]
+struct CgroupIndex {
+    by_id: HashMap<u64, String>,
+    last_scan: Option<Instant>,
+}
+
+fn scan_cgroup_tree(root: &Path) -> HashMap<u64, String> {
+    let mut out = HashMap::new();
+    let mut stack = vec![(root.to_path_buf(), String::new(), 0usize)];
+    while let Some((dir, rel, depth)) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else { continue };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let child_rel = format!("{}/{}", rel, entry.file_name().to_string_lossy());
+            if let Ok(meta) = entry.metadata() {
+                out.insert(meta.ino(), child_rel.clone());
+            }
+            if depth < CGROUP_SCAN_MAX_DEPTH {
+                stack.push((entry.path(), child_rel, depth + 1));
+            }
+            if out.len() >= CGROUP_SCAN_MAX_DIRS {
+                return out;
+            }
+        }
+    }
+    out
+}
+
 pub struct ContainerResolver {
+    cgroup_root: PathBuf,
+    cgroup_index: Mutex<CgroupIndex>,
     cache: Mutex<HashMap<u64, ContainerCacheEntry>>,
     pending: Mutex<HashSet<u64>>,
     lookup_tx: mpsc::Sender<ContainerLookupRequest>,
@@ -63,12 +112,47 @@ pub struct ContainerResolver {
 impl ContainerResolver {
     pub fn new(lookup_tx: mpsc::Sender<ContainerLookupRequest>, node_name: String) -> Self {
         Self {
+            cgroup_root: PathBuf::from(DEFAULT_CGROUP_ROOT),
+            cgroup_index: Mutex::new(CgroupIndex::default()),
             cache: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashSet::new()),
             lookup_tx,
             node_name,
             ttl: Duration::from_secs(600),
         }
+    }
+
+    /// Use a different cgroup mount (tests, or a non-default mount point).
+    #[allow(dead_code)]
+    pub fn with_cgroup_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.cgroup_root = root.into();
+        self
+    }
+
+    /// Container identity for an event: by cgroup id (works across PID namespaces), falling back to
+    /// the pid's /proc entry (works when the sensor shares the initial PID namespace).
+    fn cgroup_info_for(&self, ev: &TlsEventHeader) -> Option<CgroupInfo> {
+        if let Some(path) = self.cgroup_path_for_id(ev.cgroup_id) {
+            if let Some(info) = parse_cgroup_path(&path) {
+                return Some(info);
+            }
+        }
+        parse_cgroup_info(ev.pid as i32)
+    }
+
+    fn cgroup_path_for_id(&self, cgroup_id: u64) -> Option<String> {
+        let mut index = self.cgroup_index.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(path) = index.by_id.get(&cgroup_id) {
+            return Some(path.clone());
+        }
+        // Unknown id: a container started since the last scan. Rescan, but not on every event.
+        let due = index.last_scan.map_or(true, |t| t.elapsed() >= CGROUP_RESCAN_COOLDOWN);
+        if !due {
+            return None;
+        }
+        index.by_id = scan_cgroup_tree(&self.cgroup_root);
+        index.last_scan = Some(Instant::now());
+        index.by_id.get(&cgroup_id).cloned()
     }
 
     pub fn resolve(&self, ev: &TlsEventHeader) -> Option<ContainerContext> {
@@ -94,7 +178,7 @@ impl ContainerResolver {
         } // cache lock dropped before /proc read
 
         // /proc/<pid>/cgroup read happens outside all locks — no mutex chain contention
-        let cgroup_info = parse_cgroup_info(ev.pid as i32);
+        let cgroup_info = self.cgroup_info_for(ev);
         let container_short = cgroup_info
             .as_ref()
             .and_then(|info| info.container_id_short.clone())
@@ -380,5 +464,86 @@ mod tests {
         let text = format!("12:memory:/kubepods/pod{UID}/{id}\n1:name=systemd:/\n0::/\n");
         assert_eq!(parse_cgroup_text(&text).unwrap().container_id_full, Some(id));
         assert!(parse_cgroup_text("0::/user.slice/user-0.slice/session-1.scope\n").is_none());
+    }
+
+    // ---- cgroup-id resolution (works when the sensor's /proc is a different PID namespace) ----
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("cgidx-{tag}-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn event_for(cgroup_id: u64, pid: u32) -> TlsEventHeader {
+        TlsEventHeader {
+            ts_ns: 1, pid, tid: pid, ssl_ptr: 1, data_len: 0, direction: 0, ip_family: 0, _pad16: 0,
+            comm: [0; 16], cgroup_id, netns_ino: 0, src_port: 0, dst_port: 0, src_ip4: 0, dst_ip4: 0,
+            src_ip6: [0; 16], dst_ip6: [0; 16],
+        }
+    }
+
+    fn resolver(root: &Path) -> ContainerResolver {
+        let (tx, _rx) = mpsc::channel(8);
+        ContainerResolver::new(tx, "n".into()).with_cgroup_root(root)
+    }
+
+    #[test]
+    fn a_container_is_found_by_cgroup_id_even_though_its_kernel_pid_means_nothing_here() {
+        // The layout and the failure mode seen on the production kind node: the kernel's pid
+        // (3250818) does not exist in the sensor's /proc, the cgroup id is all that identifies it.
+        let root = scratch("kind");
+        let id = "5dda869170205a9ac36dc25615ead3a914072192c76a8cdf53ebc21ae7b16f0e";
+        let leaf = root.join(format!(
+            "kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-besteffort.slice/kubelet-kubepods-besteffort-podc5497c64_1dfa_4501_8a37_0ba1c309829c.slice/cri-containerd-{id}.scope"
+        ));
+        fs::create_dir_all(&leaf).unwrap();
+        let cgroup_id = fs::metadata(&leaf).unwrap().ino();
+
+        let ctx = resolver(&root).resolve(&event_for(cgroup_id, 3_250_818)).expect("context");
+        assert_eq!(ctx.container_id, &id[..12], "container must be identified from the cgroup tree");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_container_started_after_the_first_scan_is_found_on_a_later_rescan() {
+        let root = scratch("late");
+        fs::create_dir_all(root.join("kubepods.slice")).unwrap();
+        let r = resolver(&root);
+        let late = root.join(format!("kubepods.slice/crio-{}.scope", "ab".repeat(32)));
+        fs::create_dir_all(&late).unwrap();
+        let id = fs::metadata(&late).unwrap().ino();
+        // first lookup of an unknown id triggers the scan that discovers it
+        assert_eq!(r.cgroup_path_for_id(id).as_deref(), Some(format!("/kubepods.slice/crio-{}.scope", "ab".repeat(32)).as_str()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unknown_cgroup_ids_do_not_rescan_the_tree_on_every_event() {
+        let root = scratch("cooldown");
+        let r = resolver(&root);
+        assert!(r.cgroup_path_for_id(999_999_999).is_none());
+        // a directory created right after the scan is NOT found until the cooldown passes
+        let d = root.join(format!("docker-{}.scope", "cd".repeat(32)));
+        fs::create_dir_all(&d).unwrap();
+        let id = fs::metadata(&d).unwrap().ino();
+        assert!(r.cgroup_path_for_id(id).is_none(), "within the cooldown the tree must not be rescanned");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_non_container_cgroup_resolves_to_no_container() {
+        let root = scratch("svc");
+        let svc = root.join("system.slice/ssh.service");
+        fs::create_dir_all(&svc).unwrap();
+        let ctx = resolver(&root).resolve(&event_for(fs::metadata(&svc).unwrap().ino(), 1)).expect("context");
+        assert_eq!(ctx.container_id, "unknown");
+        assert!(ctx.pod_namespace.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scanning_a_missing_cgroup_root_yields_nothing_instead_of_failing() {
+        assert!(scan_cgroup_tree(Path::new("/definitely/not/a/cgroup/root")).is_empty());
     }
 }

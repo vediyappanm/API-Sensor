@@ -10,6 +10,10 @@ pub static PENDING_EXPIRED:    AtomicU64 = AtomicU64::new(0);
 pub static H2_PARSE_ERRORS:    AtomicU64 = AtomicU64::new(0);
 /// Events skipped because their workload is outside the configured namespace scope.
 pub static EVENTS_OUT_OF_SCOPE: AtomicU64 = AtomicU64::new(0);
+/// The subset of out-of-scope events skipped because the workload's namespace could not be
+/// determined (cgroup not recognised, or the container-runtime lookup has not answered).
+/// A high share here, rather than in plain out-of-scope, means enrichment is broken.
+pub static EVENTS_SCOPE_UNRESOLVED: AtomicU64 = AtomicU64::new(0);
 /// Unix seconds of the last successful ring-buffer poll (capture-loop heartbeat); 0 = never.
 pub static LAST_POLL_SECS:     AtomicU64 = AtomicU64::new(0);
 /// Unix seconds of the last batch the ingest endpoint accepted; 0 = never.
@@ -84,6 +88,7 @@ async fn metrics_handler() -> impl IntoResponse {
     let lost_send = EVENTS_LOST_SEND.load(Ordering::Relaxed);
     let consec_fail = CONSECUTIVE_SEND_FAILURES.load(Ordering::Relaxed);
     let out_of_scope = EVENTS_OUT_OF_SCOPE.load(Ordering::Relaxed);
+    let scope_unresolved = EVENTS_SCOPE_UNRESOLVED.load(Ordering::Relaxed);
     let now = now_secs();
     let last_ok = LAST_SEND_OK_SECS.load(Ordering::Relaxed);
     let since_ok = if last_ok == 0 { -1 } else { now.saturating_sub(last_ok) as i64 };
@@ -119,6 +124,10 @@ apisec_events_lost_send_total {lost_send}
 # HELP apisec_events_out_of_scope_total Events skipped because their workload is outside the namespace scope
 # TYPE apisec_events_out_of_scope_total counter
 apisec_events_out_of_scope_total {out_of_scope}
+
+# HELP apisec_events_scope_unresolved_total Out-of-scope events whose namespace could not be determined
+# TYPE apisec_events_scope_unresolved_total counter
+apisec_events_scope_unresolved_total {scope_unresolved}
 
 # HELP apisec_consecutive_send_failures Batches in a row that failed all retries
 # TYPE apisec_consecutive_send_failures gauge

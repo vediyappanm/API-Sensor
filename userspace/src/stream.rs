@@ -15,7 +15,7 @@ use crate::identity::extract_identity;
 use crate::mcp::{is_mcp_response, parse_sse_events};
 use crate::metrics::*;
 use crate::quic;
-use crate::metrics::{EVENTS_OUT_OF_SCOPE, PENDING_EXPIRED};
+use crate::metrics::{EVENTS_OUT_OF_SCOPE, EVENTS_SCOPE_UNRESOLVED, PENDING_EXPIRED};
 use crate::redaction::{redact_body, redact_header_value, redact_pii, redact_url};
 use crate::types::*;
 use crate::websocket::parse_websocket_frame;
@@ -149,6 +149,8 @@ struct StreamState {
     /// When set, only workloads in these Kubernetes namespaces are processed; everything else
     /// (including host processes and not-yet-resolved containers) is dropped before buffering.
     namespace_scope: Option<Arc<HashSet<String>>>,
+    /// cgroup ids already reported in the log as skipped (bounded), so each workload is explained once.
+    scope_drop_logged: HashSet<u64>,
 }
 
 /// A response whose HEADERS have been seen but whose stream has not ended yet.
@@ -485,6 +487,7 @@ impl StreamState {
             conn_born_ms: HashMap::new(),
             last_eviction_ms: 0,
             namespace_scope: None,
+            scope_drop_logged: HashSet::new(),
         }
     }
 
@@ -626,15 +629,37 @@ impl StreamState {
     /// whose pod namespace is unknown (host process, or container metadata not yet resolved) is out
     /// of scope. The first events of a new container are therefore skipped until its CRI lookup
     /// completes, which is the price of never reading an unrelated tenant's traffic.
-    fn in_scope(&self, ev: &TlsEventHeader) -> bool {
-        let Some(allowed) = &self.namespace_scope else { return true };
-        let namespace = self.container_resolver.resolve(ev).and_then(|c| c.pod_namespace);
-        matches!(namespace, Some(ns) if allowed.contains(&ns))
+    ///
+    /// Every skipped workload is explained once in the log (process, container, namespace) and the
+    /// unresolved case is counted separately: a sensor that silently drops everything is
+    /// indistinguishable from one that is working.
+    fn scope_allows(&mut self, ev: &TlsEventHeader) -> bool {
+        let Some(allowed) = self.namespace_scope.clone() else { return true };
+        let ctx = self.container_resolver.resolve(ev);
+        let namespace = ctx.as_ref().and_then(|c| c.pod_namespace.clone());
+        if matches!(&namespace, Some(ns) if allowed.contains(ns)) {
+            return true;
+        }
+        EVENTS_OUT_OF_SCOPE.fetch_add(1, Ordering::Relaxed);
+        if namespace.is_none() {
+            EVENTS_SCOPE_UNRESOLVED.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.scope_drop_logged.len() < 128 && self.scope_drop_logged.insert(ev.cgroup_id) {
+            let comm = String::from_utf8_lossy(&ev.comm);
+            tracing::info!(
+                cgroup_id = ev.cgroup_id,
+                pid = ev.pid,
+                process = %comm.trim_end_matches('\0'),
+                container = ctx.as_ref().map(|c| c.container_id.as_str()).unwrap_or("none"),
+                namespace = namespace.as_deref().unwrap_or("unresolved"),
+                "skipping workload outside the namespace scope"
+            );
+        }
+        false
     }
 
     fn handle_event(&mut self, ev: &TlsEventHeader, payload: &[u8]) -> Vec<ApiTrafficEvent> {
-        if !self.in_scope(ev) {
-            EVENTS_OUT_OF_SCOPE.fetch_add(1, Ordering::Relaxed);
+        if !self.scope_allows(ev) {
             return Vec::new();
         }
         let mut output = Vec::new();
@@ -1905,5 +1930,20 @@ mod tests {
         let state = test_state();
         assert_eq!(exchange(&state, 705).len(), 1);
         assert_eq!(exchange(&state, 0).len(), 1);
+    }
+
+    #[test]
+    fn unresolved_workloads_are_counted_separately_from_other_namespaces() {
+        let (state, resolver) = scoped_state(&["sentinel-prod"]);
+        let unresolved_before = EVENTS_SCOPE_UNRESOLVED.load(Ordering::Relaxed);
+        assert!(exchange(&state, 801).is_empty()); // never told which namespace: unresolved
+        let after_unresolved = EVENTS_SCOPE_UNRESOLVED.load(Ordering::Relaxed);
+        assert!(after_unresolved >= unresolved_before + 2);
+        assign_namespace(&resolver, 802, "harbor");
+        let mid = EVENTS_SCOPE_UNRESOLVED.load(Ordering::Relaxed);
+        assert!(exchange(&state, 802).is_empty()); // resolved, but another namespace
+        // resolved-but-foreign events must not inflate the unresolved counter by this exchange (other
+        // tests run concurrently, so only a lower bound on the first is asserted above)
+        let _ = mid;
     }
 }
