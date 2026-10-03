@@ -30,7 +30,7 @@ kubectl cluster-info
 ### Deploy Sensor DaemonSet
 ```bash
 # 1. Apply the DaemonSet manifest
-kubectl apply -f k8s-sensor-daemonset.yaml
+helm upgrade --install api-sentinel-sensor deploy/helm/api-sentinel-sensor -n api-sensor --set 'sensor.onlyNamespaces={YOUR_NAMESPACES}'
 
 # 2. Verify pods are running
 kubectl get pods -n api-sensor -o wide
@@ -72,7 +72,7 @@ This will:
 ### Option 2: Manual Steps
 ```bash
 # Step 1: Deploy
-kubectl apply -f k8s-sensor-daemonset.yaml
+helm upgrade --install api-sentinel-sensor deploy/helm/api-sentinel-sensor -n api-sensor --set 'sensor.onlyNamespaces={YOUR_NAMESPACES}'
 
 # Step 2: Verify
 SENSOR_POD=$(kubectl get pod -n api-sensor -l app=api-sentinel -o jsonpath='{.items[0].metadata.name}')
@@ -97,7 +97,7 @@ kubectl exec -n api-sensor $SENSOR_POD -- curl -s localhost:9091/metrics > final
 ## Files Ready
 
 ### Deployment Files
-- ✓ `k8s-sensor-daemonset.yaml` — Complete Kubernetes manifest
+- ✓ `deploy/helm/api-sentinel-sensor` — Helm chart (replaces the removed k8s-sensor-daemonset.yaml)
 - ✓ `Dockerfile` — Container image definition
 - ✓ `api-sentinel:latest` — Built Docker image (131MB)
 
@@ -129,7 +129,7 @@ Expected result: Complete test report with metrics
 ### Option B: Deploy Only
 ```bash
 # Just deploy, no testing
-kubectl apply -f k8s-sensor-daemonset.yaml
+helm upgrade --install api-sentinel-sensor deploy/helm/api-sentinel-sensor -n api-sensor --set 'sensor.onlyNamespaces={YOUR_NAMESPACES}'
 kubectl get daemonset -n api-sensor
 ```
 
@@ -139,9 +139,9 @@ kubectl get daemonset -n api-sensor
 docker tag api-sentinel:latest your-registry/api-sentinel:latest
 docker push your-registry/api-sentinel:latest
 
-# Update DaemonSet image reference in k8s-sensor-daemonset.yaml
+# Update image.tag in deploy/helm/api-sentinel-sensor/values.yaml
 # Then deploy
-kubectl apply -f k8s-sensor-daemonset.yaml
+helm upgrade --install api-sentinel-sensor deploy/helm/api-sentinel-sensor -n api-sensor --set 'sensor.onlyNamespaces={YOUR_NAMESPACES}'
 ```
 
 ---

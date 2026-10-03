@@ -5,7 +5,16 @@ metadata:
   labels:
     app.kubernetes.io/name: api-sentinel-sensor
     app.kubernetes.io/instance: {{ .Release.Name }}
+{{- /*
+  Scope is mandatory. With hostPID the sensor can read the decrypted traffic of EVERY process on the
+  node, including other tenants' workloads. Either list the namespaces to capture or state, on
+  purpose, that this node is dedicated to the monitored workloads.
+*/ -}}
+{{- if and (empty .Values.sensor.onlyNamespaces) (not .Values.sensor.captureAllWorkloads) }}
+{{- fail "Set sensor.onlyNamespaces (the namespaces to capture) or, on a node dedicated to monitored workloads, sensor.captureAllWorkloads=true" }}
+{{- end }}
 data:
+  ONLY_NAMESPACES: {{ join "," .Values.sensor.onlyNamespaces | quote }}
   INGEST_URL: {{ .Values.sensor.ingestUrl | quote }}
   ACCOUNT_ID: {{ .Values.sensor.accountId | quote }}
   TENANT_ID: {{ .Values.sensor.tenantId | quote }}

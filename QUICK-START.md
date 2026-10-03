@@ -38,7 +38,7 @@ docker build -t api-sentinel:latest .
 
 ### Step 3: Deploy to Kubernetes
 ```bash
-kubectl apply -f k8s-sensor-daemonset.yaml
+helm upgrade --install api-sentinel-sensor deploy/helm/api-sentinel-sensor -n api-sensor --set 'sensor.onlyNamespaces={YOUR_NAMESPACES}'
 ```
 
 ### Step 4: Verify Deployment

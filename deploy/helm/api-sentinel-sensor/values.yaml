@@ -24,6 +24,13 @@ sensor:
   metricsPort: 9090
   sampleDefault: "100"
   sampleHealth: "5"
+  # Which workloads to capture. REQUIRED: the chart refuses to render without one of these two.
+  # The sensor can read the decrypted traffic of every process on the node, so say which
+  # Kubernetes namespaces are in scope. Anything else (host processes, other tenants, containers
+  # whose namespace is not yet known) is skipped before it is buffered.
+  onlyNamespaces: []          # e.g. ["aegis-sentinel", "my-apps"]
+  # Only for a node dedicated to the monitored workloads. Captures EVERYTHING on the node.
+  captureAllWorkloads: false
   # containerd CRI socket on the node — required for pod/namespace enrichment.
   # k3s nodes use /run/k3s/containerd/containerd.sock.
   criSocket: /run/containerd/containerd.sock

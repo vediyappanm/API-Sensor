@@ -21,6 +21,9 @@ spec:
     spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
       hostPID: true
+      # The sensor never talks to the Kubernetes API (pod metadata comes from the CRI socket), so it
+      # gets no service-account token.
+      automountServiceAccountToken: false
       containers:
         - name: sensor
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -28,7 +31,6 @@ spec:
           args:
             - --bpf={{ .Values.sensor.bpfObjectPath }}
             - --ingest=$(INGEST_URL)
-            - --api-key=$(API_KEY)
             - --account-id=$(ACCOUNT_ID)
             - --tenant-id=$(TENANT_ID)
             - --policy-version=$(POLICY_VERSION)
@@ -60,14 +62,26 @@ spec:
                   fieldPath: spec.nodeName
             - name: RUST_LOG
               value: "info"
+          # The API key reaches the sensor through the API_KEY env var only (clap reads it). It must not
+          # be an argument: arguments are visible to every process on the node through /proc.
+          # Least privilege, verified by running this exact spec on a real node:
+          #   BPF, PERFMON, SYS_RESOURCE  load and attach the probes
+          #   SYS_PTRACE                  read other processes' /proc maps to find their TLS libraries
+          #   SYS_ADMIN                   Ubuntu/Debian kernels (kernel.perf_event_paranoid > 2) require it for
+          #                               perf_event_open, which uprobes use; without it every attach is -EACCES
+          # Not needed, so not granted: privileged, NET_ADMIN, hostNetwork, hostIPC, the host root mount.
           securityContext:
             privileged: false
+            allowPrivilegeEscalation: false
+            runAsUser: 0
             capabilities:
+              drop: ["ALL"]
               add:
                 - BPF
                 - PERFMON
-                - SYS_ADMIN
+                - SYS_RESOURCE
                 - SYS_PTRACE
+                - SYS_ADMIN
           ports:
             - name: metrics
               containerPort: {{ .Values.sensor.metricsPort }}
@@ -87,23 +101,18 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
-            - name: debugfs
-              mountPath: /sys/kernel/debug
+            - name: btf
+              mountPath: /sys/kernel/btf
               readOnly: true
-            - name: bpf-maps
-              mountPath: /sys/fs/bpf
             - name: cgroup
               mountPath: /sys/fs/cgroup
               readOnly: true
             - name: cri-sock
               mountPath: {{ .Values.sensor.criSocket }}
       volumes:
-        - name: debugfs
+        - name: btf
           hostPath:
-            path: /sys/kernel/debug
-        - name: bpf-maps
-          hostPath:
-            path: /sys/fs/bpf
+            path: /sys/kernel/btf
         - name: cgroup
           hostPath:
             path: /sys/fs/cgroup

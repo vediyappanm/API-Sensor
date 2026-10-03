@@ -108,9 +108,14 @@ phase_deploy() {
   log_info "Creating namespace..."
   kubectl create namespace "$SENSOR_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-  # Apply DaemonSet
-  log_info "Deploying DaemonSet..."
-  kubectl apply -f k8s-sensor-daemonset.yaml || log_error "DaemonSet deployment failed"
+  # Deploy with the Helm chart (the old hand-written manifest was privileged, probed a port the
+  # sensor never serves, and could not discover any workload's TLS library). The chart refuses to
+  # render without an explicit capture scope.
+  : "${SENSOR_SCOPE_NAMESPACES:?set SENSOR_SCOPE_NAMESPACES to the comma-separated namespaces to capture, e.g. my-apps,payments}"
+  log_info "Deploying sensor via Helm (scope: $SENSOR_SCOPE_NAMESPACES)..."
+  helm upgrade --install api-sentinel-sensor deploy/helm/api-sentinel-sensor \
+    --namespace "$SENSOR_NAMESPACE" \
+    --set "sensor.onlyNamespaces={${SENSOR_SCOPE_NAMESPACES}}" || log_error "Sensor deployment failed"
 
   # Wait for rollout
   log_info "Waiting for DaemonSet rollout (timeout: 5m)..."

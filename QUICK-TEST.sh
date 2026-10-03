@@ -72,7 +72,7 @@ test "Health Status" "grep -q 'healthz\|health' userspace/src/metrics.rs"
 
 echo ""
 echo "DEPLOYMENT:"
-test "K8s Manifest" "[ -f k8s-sensor-daemonset.yaml ]"
+test "Helm chart" "[ -f deploy/helm/api-sentinel-sensor/Chart.yaml ]"
 test "Dockerfile" "[ -f Dockerfile ]"
 test "Load Test Script" "[ -f k6-load-test.js ]"
 test "Deployment Script" "[ -f deploy-and-test.sh ]"
