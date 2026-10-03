@@ -86,6 +86,11 @@ struct Args {
     sample_default: u8,
     #[arg(long, default_value = "5")]
     sample_health: u8,
+    /// Capture only workloads in these Kubernetes namespaces (comma-separated). Everything else on
+    /// the node, including host processes, is skipped before it is buffered. Without it the sensor
+    /// reads the decrypted traffic of EVERY process it can attach to.
+    #[arg(long, env = "ONLY_NAMESPACES", value_delimiter = ',')]
+    only_namespaces: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +359,14 @@ async fn main() -> Result<()> {
         args.max_total_buffer_bytes,
         dns_resolver.clone(),
     ));
+
+    let scope: Vec<String> = args.only_namespaces.iter().map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect();
+    if scope.is_empty() {
+        tracing::warn!("no --only-namespaces set: capturing the decrypted traffic of EVERY workload on this host");
+    } else {
+        state.set_namespace_scope(&scope);
+        tracing::info!(namespaces = ?scope, "capture restricted to these namespaces");
+    }
 
     let mut ringbuf = RingBufferBuilder::new();
     let sender = tx.clone();

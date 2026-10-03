@@ -8,6 +8,8 @@ pub static UNPAIRED_RESPONSES: AtomicU64 = AtomicU64::new(0);
 pub static PENDING_EXPIRED:    AtomicU64 = AtomicU64::new(0);
 /// HTTP/2 framing violations and HPACK decode failures (lost sync, or not HTTP/2).
 pub static H2_PARSE_ERRORS:    AtomicU64 = AtomicU64::new(0);
+/// Events skipped because their workload is outside the configured namespace scope.
+pub static EVENTS_OUT_OF_SCOPE: AtomicU64 = AtomicU64::new(0);
 /// Unix seconds of the last successful ring-buffer poll (capture-loop heartbeat); 0 = never.
 pub static LAST_POLL_SECS:     AtomicU64 = AtomicU64::new(0);
 /// Unix seconds of the last batch the ingest endpoint accepted; 0 = never.
@@ -81,6 +83,7 @@ async fn metrics_handler() -> impl IntoResponse {
     let h2_errors = H2_PARSE_ERRORS.load(Ordering::Relaxed);
     let lost_send = EVENTS_LOST_SEND.load(Ordering::Relaxed);
     let consec_fail = CONSECUTIVE_SEND_FAILURES.load(Ordering::Relaxed);
+    let out_of_scope = EVENTS_OUT_OF_SCOPE.load(Ordering::Relaxed);
     let now = now_secs();
     let last_ok = LAST_SEND_OK_SECS.load(Ordering::Relaxed);
     let since_ok = if last_ok == 0 { -1 } else { now.saturating_sub(last_ok) as i64 };
@@ -112,6 +115,10 @@ apisec_h2_parse_errors_total {h2_errors}
 # HELP apisec_events_lost_send_total Events lost because their batch could not be delivered
 # TYPE apisec_events_lost_send_total counter
 apisec_events_lost_send_total {lost_send}
+
+# HELP apisec_events_out_of_scope_total Events skipped because their workload is outside the namespace scope
+# TYPE apisec_events_out_of_scope_total counter
+apisec_events_out_of_scope_total {out_of_scope}
 
 # HELP apisec_consecutive_send_failures Batches in a row that failed all retries
 # TYPE apisec_consecutive_send_failures gauge

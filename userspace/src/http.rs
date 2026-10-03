@@ -167,8 +167,14 @@ pub fn is_usable_http_request(method: &str, path: &str) -> bool {
     is_http_method(method) && !path.is_empty()
 }
 
+/// TLS libraries to attach to. `pid > 0`: the libraries mapped by that process. `pid <= 0` (the
+/// DaemonSet default): every distinct libssl/libgnutls mapped by any process on the node. This used
+/// to return an empty list for `pid <= 0`, which made `--discover-libs` a silent no-op node-wide, so
+/// a sensor started the documented way watched only its own container's library.
 pub fn discover_tls_libs(pid: i32) -> Vec<String> {
-    if pid <= 0 { return Vec::new(); }
+    if pid <= 0 {
+        return discover_tls_libs_in(std::path::Path::new("/proc"));
+    }
     let mut libs = HashMap::<String, bool>::new();
     let maps_path = format!("/proc/{}/maps", pid);
     let Ok(contents) = fs::read_to_string(&maps_path) else { return Vec::new(); };
@@ -182,9 +188,138 @@ pub fn discover_tls_libs(pid: i32) -> Vec<String> {
     libs.keys().cloned().collect()
 }
 
+/// Upper bound on libraries attached node-wide. Each one costs several probes; an unbounded
+/// number of distinct images on a busy node must not turn into unbounded kernel state.
+const MAX_DISCOVERED_LIBS: usize = 512;
+
+/// Scan `<proc_root>/<pid>/maps` for every process and return each distinct libssl/libgnutls once.
+///
+/// "Distinct" means the same underlying file (device + inode): thousands of processes map one
+/// library, and uprobes attach to the file, not the process. Each library is returned as
+/// `<proc_root>/<pid>/root<path>` because that is the only way to open a file that lives in
+/// another container's mount namespace. The result is sorted so the choice is deterministic.
+pub fn discover_tls_libs_in(proc_root: &std::path::Path) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut seen = std::collections::HashSet::<(u64, u64)>::new();
+    let mut found = Vec::<String>::new();
+    let Ok(entries) = fs::read_dir(proc_root) else { return found };
+    let mut pids: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .collect();
+    pids.sort_by_key(|p| p.parse::<u64>().unwrap_or(u64::MAX));
+    for pid in pids {
+        let Ok(maps) = fs::read_to_string(proc_root.join(&pid).join("maps")) else { continue };
+        for line in maps.lines() {
+            let Some(path) = line.split_whitespace().nth(5) else { continue };
+            if !path.starts_with('/') || path.ends_with("(deleted)") {
+                continue;
+            }
+            let name = path.rsplit('/').next().unwrap_or("");
+            if !(name.starts_with("libssl.so") || name.starts_with("libgnutls.so")) {
+                continue;
+            }
+            let via_proc = proc_root.join(&pid).join("root").join(path.trim_start_matches('/'));
+            let Ok(meta) = fs::metadata(&via_proc) else { continue };
+            if seen.insert((meta.dev(), meta.ino())) {
+                found.push(via_proc.to_string_lossy().into_owned());
+                if found.len() >= MAX_DISCOVERED_LIBS {
+                    found.sort();
+                    return found;
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("discover-{tag}-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Fake process `pid` that maps `lib` (a path inside its own root).
+    fn fake_process(proc_root: &Path, pid: u32, lib: &str, content: &[u8]) {
+        let root = proc_root.join(pid.to_string()).join("root");
+        let file = root.join(lib.trim_start_matches('/'));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, content).unwrap();
+        std::fs::write(
+            proc_root.join(pid.to_string()).join("maps"),
+            format!("7f00-7f10 r-xp 00000000 08:01 12345 {lib}\n7f20-7f30 r--p 0 08:01 99 /usr/lib/libc.so.6\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn finds_each_distinct_library_once_reached_through_proc_root() {
+        let p = scratch("distinct");
+        fake_process(&p, 100, "/usr/lib/x86_64-linux-gnu/libssl.so.3", b"openssl-A");
+        fake_process(&p, 200, "/lib/libssl.so.1.1", b"openssl-B"); // different image, different file
+        let libs = discover_tls_libs_in(&p);
+        assert_eq!(libs.len(), 2, "{libs:?}");
+        assert!(libs.iter().all(|l| l.contains("/root/")), "must go through /proc/<pid>/root: {libs:?}");
+        assert!(libs.windows(2).all(|w| w[0] <= w[1]), "deterministic order");
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn a_library_shared_by_many_processes_is_attached_once() {
+        let p = scratch("shared");
+        fake_process(&p, 100, "/usr/lib/libssl.so.3", b"same-file");
+        // process 300 maps the very same file (hard link => same device + inode)
+        let a = p.join("100/root/usr/lib/libssl.so.3");
+        let b_dir = p.join("300/root/usr/lib");
+        std::fs::create_dir_all(&b_dir).unwrap();
+        std::fs::hard_link(&a, b_dir.join("libssl.so.3")).unwrap();
+        std::fs::write(p.join("300/maps"), "7f00-7f10 r-xp 0 08:01 12345 /usr/lib/libssl.so.3\n").unwrap();
+        assert_eq!(discover_tls_libs_in(&p).len(), 1, "same inode must be deduplicated");
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn ignores_other_libraries_deleted_mappings_and_non_pid_entries() {
+        let p = scratch("ignore");
+        fake_process(&p, 100, "/usr/lib/libcrypto.so.3", b"not-tls-entry-point"); // libcrypto is not libssl
+        std::fs::create_dir_all(p.join("self")).unwrap();
+        std::fs::write(p.join("self/maps"), "7f00-7f10 r-xp 0 08:01 1 /usr/lib/libssl.so.3\n").unwrap();
+        std::fs::create_dir_all(p.join("400")).unwrap();
+        std::fs::write(p.join("400/maps"), "7f00-7f10 r-xp 0 08:01 1 /usr/lib/libssl.so.3 (deleted)\n[heap]\nanon\n").unwrap();
+        assert!(discover_tls_libs_in(&p).is_empty());
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn unreadable_or_missing_proc_yields_nothing_instead_of_failing() {
+        assert!(discover_tls_libs_in(Path::new("/definitely/not/a/proc")).is_empty());
+        let p = scratch("nomaps");
+        std::fs::create_dir_all(p.join("500")).unwrap(); // a pid dir with no maps file
+        assert!(discover_tls_libs_in(&p).is_empty());
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn node_wide_discovery_finds_the_libraries_of_the_real_machine() {
+        // pid <= 0 must now scan /proc rather than return an empty list. Only assert when this
+        // machine actually has a TLS library mapped by some process we can read.
+        let from_proc = discover_tls_libs(-1);
+        let direct = discover_tls_libs_in(Path::new("/proc"));
+        assert_eq!(from_proc, direct);
+    }
+}
 
 #[cfg(test)]
 mod tests {

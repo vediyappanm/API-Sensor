@@ -15,7 +15,7 @@ use crate::identity::extract_identity;
 use crate::mcp::{is_mcp_response, parse_sse_events};
 use crate::metrics::*;
 use crate::quic;
-use crate::metrics::PENDING_EXPIRED;
+use crate::metrics::{EVENTS_OUT_OF_SCOPE, PENDING_EXPIRED};
 use crate::redaction::{redact_body, redact_header_value, redact_pii, redact_url};
 use crate::types::*;
 use crate::websocket::parse_websocket_frame;
@@ -83,6 +83,15 @@ impl ShardedStreamState {
         }
     }
 
+    /// Restrict capture to these Kubernetes namespaces. An empty list is rejected by the caller;
+    /// to capture everything, do not call this.
+    pub fn set_namespace_scope(&self, namespaces: &[String]) {
+        let set: Arc<HashSet<String>> = Arc::new(namespaces.iter().cloned().collect());
+        for shard in &self.shards {
+            shard.lock().unwrap_or_else(|e| e.into_inner()).namespace_scope = Some(set.clone());
+        }
+    }
+
     /// Shard by (pid, ssl_ptr) only — born_ms is resolved within the shard.
     fn shard_index(&self, pid: u32, ssl_ptr: u64) -> usize {
         use std::collections::hash_map::DefaultHasher;
@@ -137,6 +146,9 @@ struct StreamState {
     /// Maps (pid, ssl_ptr) → first-seen timestamp for born_ms disambiguation.
     conn_born_ms: HashMap<(u32, u64), u64>,
     last_eviction_ms: u64,
+    /// When set, only workloads in these Kubernetes namespaces are processed; everything else
+    /// (including host processes and not-yet-resolved containers) is dropped before buffering.
+    namespace_scope: Option<Arc<HashSet<String>>>,
 }
 
 /// A response whose HEADERS have been seen but whose stream has not ended yet.
@@ -472,6 +484,7 @@ impl StreamState {
             known_connections: HashSet::new(),
             conn_born_ms: HashMap::new(),
             last_eviction_ms: 0,
+            namespace_scope: None,
         }
     }
 
@@ -609,7 +622,21 @@ impl StreamState {
         ctx
     }
 
+    /// Is this event's workload inside the configured namespace scope? Fails closed: a process
+    /// whose pod namespace is unknown (host process, or container metadata not yet resolved) is out
+    /// of scope. The first events of a new container are therefore skipped until its CRI lookup
+    /// completes, which is the price of never reading an unrelated tenant's traffic.
+    fn in_scope(&self, ev: &TlsEventHeader) -> bool {
+        let Some(allowed) = &self.namespace_scope else { return true };
+        let namespace = self.container_resolver.resolve(ev).and_then(|c| c.pod_namespace);
+        matches!(namespace, Some(ns) if allowed.contains(&ns))
+    }
+
     fn handle_event(&mut self, ev: &TlsEventHeader, payload: &[u8]) -> Vec<ApiTrafficEvent> {
+        if !self.in_scope(ev) {
+            EVENTS_OUT_OF_SCOPE.fetch_add(1, Ordering::Relaxed);
+            return Vec::new();
+        }
         let mut output = Vec::new();
         // Wall clock at userspace emit time. BPF ktime is monotonic-since-boot
         // and was previously double-converted in output.rs, stamping every
@@ -1783,5 +1810,100 @@ mod tests {
         state.evict_connection(&ConnKey { pid: 42, ssl_ptr: 0x1000, born_ms: 0 });
         let left: usize = state.shards.iter().map(|s| s.lock().unwrap().http2_state.len()).sum();
         assert_eq!(left, 0);
+    }
+
+    // ---- Namespace scope: never read an unrelated tenant's traffic --------------------------
+
+    fn scoped_state(namespaces: &[&str]) -> (ShardedStreamState, Arc<ContainerResolver>) {
+        crate::redaction::init_pii_hash_key_for_tests(&[0x11u8; 32]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (dtx, _drx) = tokio::sync::mpsc::channel(8);
+        let resolver = Arc::new(ContainerResolver::new(tx, "test-node".into()));
+        let state = ShardedStreamState::new(
+            1,
+            TrafficRole::Server,
+            65_536,
+            resolver.clone(),
+            10_485_760,
+            Arc::new(DnsResolver::new(dtx)),
+        );
+        let ns: Vec<String> = namespaces.iter().map(|s| s.to_string()).collect();
+        state.set_namespace_scope(&ns);
+        (state, resolver)
+    }
+
+    fn ev_in_cgroup(direction: u8, cgroup: u64) -> TlsEventHeader {
+        let mut e = tls_event(direction);
+        e.cgroup_id = cgroup;
+        e
+    }
+
+    /// Teach the resolver which namespace a cgroup belongs to, as the CRI lookup would.
+    fn assign_namespace(resolver: &ContainerResolver, cgroup: u64, namespace: &str) {
+        resolver.resolve(&ev_in_cgroup(0, cgroup)); // creates the cache entry
+        resolver.update_from_cri(
+            cgroup,
+            crate::container::ContainerMetadata {
+                pod_name: Some("p".into()),
+                pod_namespace: Some(namespace.into()),
+                container_name: Some("c".into()),
+                service_name: None,
+                workload_type: None,
+            },
+        );
+    }
+
+    fn exchange(state: &ShardedStreamState, cgroup: u64) -> Vec<ApiTrafficEvent> {
+        let req = b"GET /orders HTTP/1.1\r\nHost: shop\r\n\r\n";
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        state.handle_event(&ev_in_cgroup(0, cgroup), req);
+        state.handle_event(&ev_in_cgroup(1, cgroup), resp)
+    }
+
+    #[test]
+    fn a_workload_in_an_allowed_namespace_is_captured() {
+        let (state, resolver) = scoped_state(&["sentinel-prod"]);
+        assign_namespace(&resolver, 701, "sentinel-prod");
+        assert_eq!(exchange(&state, 701).len(), 1);
+    }
+
+    #[test]
+    fn a_workload_in_another_namespace_is_never_read_and_is_counted() {
+        let (state, resolver) = scoped_state(&["sentinel-prod"]);
+        assign_namespace(&resolver, 702, "harbor");
+        let before = EVENTS_OUT_OF_SCOPE.load(Ordering::Relaxed);
+        assert!(exchange(&state, 702).is_empty());
+        assert!(EVENTS_OUT_OF_SCOPE.load(Ordering::Relaxed) >= before + 2);
+        // dropped before buffering: nothing was kept for this connection
+        let held: usize = state.shards.iter().map(|s| s.lock().unwrap().buffers.len()).sum();
+        assert_eq!(held, 0, "out-of-scope traffic must not even be buffered");
+    }
+
+    #[test]
+    fn an_unresolved_container_fails_closed() {
+        let (state, _resolver) = scoped_state(&["sentinel-prod"]);
+        // no CRI answer yet: namespace unknown => out of scope
+        assert!(exchange(&state, 703).is_empty());
+    }
+
+    #[test]
+    fn a_host_process_with_no_cgroup_is_out_of_scope() {
+        let (state, _resolver) = scoped_state(&["sentinel-prod"]);
+        assert!(exchange(&state, 0).is_empty());
+    }
+
+    #[test]
+    fn traffic_flows_as_soon_as_the_namespace_is_resolved() {
+        let (state, resolver) = scoped_state(&["sentinel-prod"]);
+        assert!(exchange(&state, 704).is_empty(), "skipped while unresolved");
+        assign_namespace(&resolver, 704, "sentinel-prod");
+        assert_eq!(exchange(&state, 704).len(), 1, "captured once the lookup completes");
+    }
+
+    #[test]
+    fn without_a_scope_everything_is_captured_as_before() {
+        let state = test_state();
+        assert_eq!(exchange(&state, 705).len(), 1);
+        assert_eq!(exchange(&state, 0).len(), 1);
     }
 }
