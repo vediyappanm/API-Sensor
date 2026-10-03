@@ -6,13 +6,13 @@ image:
 resources:
   limits:
     cpu: 500m
-    memory: 256Mi
+    memory: 512Mi
   requests:
     cpu: 100m
     memory: 128Mi
 
 sensor:
-  bpfObjectPath: /opt/sensor/http_trace.bpf.o
+  bpfObjectPath: /app/bpf/http_trace.bpf.o
   ingestUrl: http://api-sentinel-ingest:8080/v1/events
   accountId: "1000000"
   tenantId: "default"

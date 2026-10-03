@@ -1,6 +1,5 @@
 userspace/target/
 bpf/http_trace.bpf.o
-bpf/vmlinux.h
 *.o
 *.d
 *.swp

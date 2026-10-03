@@ -1,1 +1,4 @@
 userspace/target
+.git
+*.o
+teaching.md
