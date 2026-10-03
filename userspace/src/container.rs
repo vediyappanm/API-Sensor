@@ -177,85 +177,75 @@ pub fn parse_cgroup_info(pid: i32) -> Option<CgroupInfo> {
     if pid <= 0 {
         return None;
     }
-    let path = read_cgroup_path(pid)?;
-    if let Some(info) = parse_cgroup_v1(&path) {
-        return Some(info);
-    }
-    parse_cgroup_v2(&path)
+    let contents = fs::read_to_string(format!("/proc/{}/cgroup", pid)).ok()?;
+    parse_cgroup_text(&contents)
 }
 
-fn read_cgroup_path(pid: i32) -> Option<String> {
-    let cgroup_path = format!("/proc/{}/cgroup", pid);
-    let contents = fs::read_to_string(cgroup_path).ok()?;
-    for line in contents.lines() {
-        if let Some(path) = line.split(':').nth(2) {
-            if path.contains("kubepods") {
-                return Some(path.to_string());
-            }
-        }
-    }
-    None
+/// Parse the text of `/proc/<pid>/cgroup` (cgroup v1 lists one line per controller, v2 one line).
+/// The first line whose path names a container wins.
+pub fn parse_cgroup_text(contents: &str) -> Option<CgroupInfo> {
+    contents
+        .lines()
+        .filter_map(|line| line.splitn(3, ':').nth(2))
+        .find_map(parse_cgroup_path)
 }
 
-fn parse_cgroup_v1(path: &str) -> Option<CgroupInfo> {
-    if !path.contains("/kubepods/") {
-        return None;
-    }
+/// Extract the container ID and pod UID from a cgroup path, whatever the layout.
+///
+/// The old parser accepted only `/kubepods/...` (v1) or a path containing the literal text
+/// `kubepods.slice` (v2). Real clusters differ: kind nests everything under
+/// `kubelet-kubepods-<qos>.slice`, paths may start with `../..` outside the container's cgroup
+/// namespace, runtimes name the scope `cri-containerd-`, `crio-`, `docker-` or just the bare ID,
+/// and systemd writes the pod UID with underscores. For every such container it returned nothing,
+/// so the sensor could neither enrich events nor apply its namespace scope.
+pub fn parse_cgroup_path(path: &str) -> Option<CgroupInfo> {
     let mut pod_uid = None;
     let mut container_id_full = None;
     for seg in path.split('/') {
-        if seg.starts_with("pod") && seg.len() > 3 {
-            pod_uid = Some(seg.trim_start_matches("pod").to_string());
-        } else if seg.len() >= 32 && seg.chars().all(|c| c.is_ascii_hexdigit()) {
-            container_id_full = Some(seg.to_string());
+        if seg.is_empty() || seg == ".." || seg == "." {
+            continue;
+        }
+        if let Some(uid) = pod_uid_from_segment(seg) {
+            pod_uid = Some(uid);
+        }
+        if let Some(id) = container_id_from_segment(seg) {
+            container_id_full = Some(id);
         }
     }
-    let container_id_short = container_id_full.as_ref().map(|id| short_id(id));
-    Some(CgroupInfo { pod_uid, container_id_full, container_id_short })
+    // No container ID means this is not a container's cgroup (a system service, a user session).
+    let id = container_id_full?;
+    Some(CgroupInfo { pod_uid, container_id_short: Some(short_id(&id)), container_id_full: Some(id) })
 }
 
-fn parse_cgroup_v2(path: &str) -> Option<CgroupInfo> {
-    if !path.contains("kubepods.slice") {
-        return None;
-    }
-    let mut pod_uid = None;
-    let mut container_id_full = None;
-    for seg in path.split('/') {
-        if seg.contains("pod") && seg.ends_with(".slice") {
-            pod_uid = extract_pod_uid(seg);
-        } else if seg.ends_with(".scope") {
-            container_id_full = extract_container_id(seg);
-        }
-    }
-    let container_id_short = container_id_full.as_ref().map(|id| short_id(id));
-    Some(CgroupInfo { pod_uid, container_id_full, container_id_short })
-}
-
-fn extract_pod_uid(segment: &str) -> Option<String> {
-    let pod_pos = segment.rfind("pod")?;
-    let mut uid = String::new();
-    for ch in segment[pod_pos + 3..].chars() {
-        if ch.is_ascii_hexdigit() || ch == '-' {
-            uid.push(ch);
-        } else {
+/// A container ID segment: optional runtime prefix, 32+ hex digits, optional `.scope`.
+fn container_id_from_segment(segment: &str) -> Option<String> {
+    let mut s = segment.strip_suffix(".scope").unwrap_or(segment);
+    for prefix in ["cri-containerd-", "cri-o-", "crio-", "docker-", "libpod-", "containerd-"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest;
             break;
         }
     }
-    if uid.is_empty() { None } else { Some(uid) }
+    if s.len() >= 32 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(s.to_string())
+    } else {
+        None
+    }
 }
 
-fn extract_container_id(segment: &str) -> Option<String> {
-    let mut s = segment.trim_end_matches(".scope").to_string();
-    for prefix in ["cri-containerd-", "docker-", "crio-", "containerd-"] {
-        if s.starts_with(prefix) {
-            s = s.trim_start_matches(prefix).to_string();
-            break;
-        }
-    }
-    if s.len() < 12 { return None; }
-    // Reject anything that isn't a valid hex container ID
-    if !s.chars().all(|c| c.is_ascii_hexdigit()) { return None; }
-    Some(s)
+/// A pod segment: `pod<uid>` (cgroupfs) or `...-pod<uid with underscores>.slice` (systemd). Only a
+/// UUID-shaped value counts, so `kubepods-burstable.slice` is never mistaken for a pod.
+fn pod_uid_from_segment(segment: &str) -> Option<String> {
+    let s = segment.strip_suffix(".slice").unwrap_or(segment);
+    let start = if s.starts_with("pod") { Some(0) } else { s.rfind("-pod").map(|i| i + 1) }?;
+    let uid = s[start + 3..].replace('_', "-");
+    is_uuid(&uid).then_some(uid)
+}
+
+fn is_uuid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && parts.iter().zip([8usize, 4, 4, 4, 12]).all(|(p, n)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn short_id(full: &str) -> String {
@@ -316,19 +306,79 @@ async fn fetch_container_metadata_inner(
 mod tests {
     use super::*;
 
+    const UID: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+    fn ids(path: &str) -> (Option<String>, Option<String>) {
+        let i = parse_cgroup_path(path).expect("container cgroup");
+        (i.pod_uid, i.container_id_full)
+    }
+
     #[test]
-    fn test_parse_cgroup_v1() {
-        let path = "/kubepods/burstable/pod123e4567-e89b-12d3-a456-426614174000/abcdef0123456789abcdef0123456789";
-        let info = parse_cgroup_v1(path).expect("v1 parse");
-        assert_eq!(info.pod_uid.unwrap(), "123e4567-e89b-12d3-a456-426614174000");
+    fn cgroup_v1_cgroupfs_layout() {
+        let path = format!("/kubepods/burstable/pod{UID}/abcdef0123456789abcdef0123456789");
+        let info = parse_cgroup_path(&path).unwrap();
+        assert_eq!(info.pod_uid.unwrap(), UID);
         assert_eq!(info.container_id_short.unwrap(), "abcdef012345");
     }
 
     #[test]
-    fn test_parse_cgroup_v2() {
-        let path = "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod123e4567-e89b-12d3-a456-426614174000.slice/cri-containerd-abcdef0123456789abcdef0123456789.scope";
-        let info = parse_cgroup_v2(path).expect("v2 parse");
-        assert_eq!(info.pod_uid.unwrap(), "123e4567-e89b-12d3-a456-426614174000");
+    fn cgroup_v2_systemd_layout() {
+        let path = format!("/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod{}.slice/cri-containerd-abcdef0123456789abcdef0123456789.scope", UID.replace('-', "_"));
+        let info = parse_cgroup_path(&path).unwrap();
+        assert_eq!(info.pod_uid.unwrap(), UID, "systemd writes the UID with underscores; the old code truncated it");
         assert_eq!(info.container_id_short.unwrap(), "abcdef012345");
+    }
+
+    #[test]
+    fn guaranteed_pods_have_no_qos_slice() {
+        let path = format!("/kubepods.slice/kubepods-pod{}.slice/crio-{}.scope", UID.replace('-', "_"), "ab".repeat(32));
+        assert_eq!(ids(&path), (Some(UID.to_string()), Some("ab".repeat(32))));
+    }
+
+    #[test]
+    fn the_layout_seen_on_the_real_kind_cluster() {
+        // Verbatim from the production node: nested under kubelet-, relative to the sensor's cgroup
+        // namespace root, UID with underscores. The old parser returned None for this.
+        let id = "5dda869170205a9ac36dc25615ead3a914072192c76a8cdf53ebc21ae7b16f0e";
+        for suffix in [".scope", ""] {
+            let path = format!("/../../../kubelet-kubepods-besteffort.slice/kubelet-kubepods-besteffort-podc5497c64_1dfa_4501_8a37_0ba1c309829c.slice/cri-containerd-{id}{suffix}");
+            assert_eq!(
+                ids(&path),
+                (Some("c5497c64-1dfa-4501-8a37-0ba1c309829c".to_string()), Some(id.to_string())),
+                "suffix {suffix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_runtimes_and_standalone_docker() {
+        let id = "cd".repeat(32);
+        assert_eq!(ids(&format!("/system.slice/docker-{id}.scope")).1, Some(id.clone()));
+        assert_eq!(ids(&format!("/machine.slice/libpod-{id}.scope")).1, Some(id.clone()), "podman");
+        assert_eq!(ids(&format!("/kubepods.slice/kubepods-burstable.slice/cri-o-{id}.scope")).1, Some(id));
+    }
+
+    #[test]
+    fn a_non_container_cgroup_is_not_a_container() {
+        assert!(parse_cgroup_path("/system.slice/ssh.service").is_none());
+        assert!(parse_cgroup_path("/user.slice/user-1000.slice/session-3.scope").is_none());
+        assert!(parse_cgroup_path("/kubepods.slice/kubepods-burstable.slice").is_none());
+        assert!(parse_cgroup_path("/").is_none());
+        assert!(parse_cgroup_path("").is_none());
+    }
+
+    #[test]
+    fn kubepods_slice_names_are_never_mistaken_for_a_pod() {
+        let id = "ef".repeat(32);
+        let info = parse_cgroup_path(&format!("/kubepods.slice/kubepods-besteffort.slice/cri-containerd-{id}.scope")).unwrap();
+        assert!(info.pod_uid.is_none());
+    }
+
+    #[test]
+    fn proc_cgroup_text_v1_hybrid_picks_the_line_that_names_a_container() {
+        let id = "01".repeat(32);
+        let text = format!("12:memory:/kubepods/pod{UID}/{id}\n1:name=systemd:/\n0::/\n");
+        assert_eq!(parse_cgroup_text(&text).unwrap().container_id_full, Some(id));
+        assert!(parse_cgroup_text("0::/user.slice/user-0.slice/session-1.scope\n").is_none());
     }
 }
