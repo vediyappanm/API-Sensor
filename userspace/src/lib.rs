@@ -2,6 +2,7 @@ pub mod dns;
 pub mod http;
 pub mod http2;
 pub mod identity;
+pub mod ingest;
 pub mod output;
 pub mod quic;
 pub mod websocket;

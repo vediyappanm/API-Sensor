@@ -442,7 +442,10 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_millis(poll_backoff_ms)).await;
         }
         match ringbuf.poll(Duration::from_millis(200)) {
-            Ok(()) => { poll_backoff_ms = 0; }
+            Ok(()) => {
+                poll_backoff_ms = 0;
+                metrics::touch_poll_heartbeat();
+            }
             Err(e) => {
                 poll_backoff_ms = (poll_backoff_ms * 2 + 10).min(1000);
                 tracing::warn!(error = %e, backoff_ms = poll_backoff_ms, "ring buffer poll error");

@@ -4,7 +4,7 @@ use flate2::Compression;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::metrics::{EVENTS_SENT, SEND_ERRORS};
+use crate::metrics::{record_send_failure, record_send_success, EVENTS_SENT, SEND_ERRORS};
 use crate::output::to_sensor_batch;
 use crate::types::ApiTrafficEvent;
 
@@ -12,6 +12,22 @@ const MAX_ATTEMPTS: u32 = 3;
 const COMPRESS_THRESHOLD_BYTES: usize = 4096;
 const BASE_BACKOFF_MS: u64 = 200;
 const MAX_BACKOFF_MS: u64 = 10_000;
+
+/// Full cause chain of an error. reqwest's Display is just "error sending request for url (...)",
+/// which hides whether the cause was a refused connection, a DNS failure or a TLS error.
+pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut cur = err.source();
+    while let Some(e) = cur {
+        let part = e.to_string();
+        if !out.contains(&part) {
+            out.push_str(": ");
+            out.push_str(&part);
+        }
+        cur = e.source();
+    }
+    out
+}
 
 fn jittered_backoff_ms(attempt: u32) -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,7 +40,7 @@ fn jittered_backoff_ms(attempt: u32) -> u64 {
     base.saturating_sub(1).min(mix % base.max(1))
 }
 
-pub async fn send_batch_with_client(
+async fn try_send_batch(
     client: &reqwest::Client,
     url: &str,
     api_key: &str,
@@ -91,14 +107,38 @@ pub async fn send_batch_with_client(
             }
             Err(e) => {
                 if attempt + 1 < MAX_ATTEMPTS {
-                    last_err = Some(e.to_string());
+                    last_err = Some(error_chain(&e));
                     continue;
                 }
                 SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
-                return Err(e.into());
+                return Err(anyhow::anyhow!("ingest request failed: {}", error_chain(&e)));
             }
         }
     }
     SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
     Err(anyhow::anyhow!("ingest failed after {} attempts: {:?}", MAX_ATTEMPTS, last_err))
+}
+
+/// Send one batch. On failure the batch is gone (it is not retried beyond MAX_ATTEMPTS), so the
+/// loss is recorded: events counted as dropped, consecutive-failure counter raised, which is what
+/// `/readyz` and the metrics report. On success the failure streak resets.
+pub async fn send_batch_with_client(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    tenant_id: &str,
+    policy_version: &str,
+    events: Vec<ApiTrafficEvent>,
+) -> Result<()> {
+    let count = events.len() as u64;
+    match try_send_batch(client, url, api_key, tenant_id, policy_version, events).await {
+        Ok(()) => {
+            record_send_success();
+            Ok(())
+        }
+        Err(e) => {
+            record_send_failure(count);
+            Err(e)
+        }
+    }
 }

@@ -83,7 +83,7 @@ pub struct CloseEvent {
 // API traffic model
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 pub struct ApiRequest {
     pub method: String,
     pub path: String,
@@ -94,7 +94,7 @@ pub struct ApiRequest {
     pub body: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 pub struct ApiResponse {
     pub status_code: i32,
     pub headers: HashMap<String, String>,
@@ -111,7 +111,7 @@ pub struct EventMetadata {
     pub mcp_tool_name: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 pub struct ApiTrafficEvent {
     pub version: String,
     pub event_type: String,
