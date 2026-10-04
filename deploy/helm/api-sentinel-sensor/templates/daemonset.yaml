@@ -15,6 +15,10 @@ spec:
         app.kubernetes.io/name: api-sentinel-sensor
         app.kubernetes.io/instance: {{ .Release.Name }}
       annotations:
+        # Pods read their ConfigMap only at start. Without this, `helm upgrade` that changes scope,
+        # ingest URL or limits updated the ConfigMap but left every sensor running the old values
+        # (found live: a "restored" namespace scope was not in force 12 hours later).
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.sensor.metricsPort | quote }}
         prometheus.io/path: "/metrics"

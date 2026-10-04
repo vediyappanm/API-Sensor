@@ -1,0 +1,32 @@
+# Apply in the namespace that runs the Sentinel API, when that namespace uses a default-deny
+# NetworkPolicy. Additive: it allows ONLY the eBPF sensor (from the sensor's namespace) to deliver
+# event batches to the API; everything else stays denied.
+#
+#   kubectl apply -f deploy/k8s/allow-sensor-to-api.yaml
+#
+# Adjust `namespace` (the API's), the API pod label, and the sensor's namespace if yours differ.
+# Symptom when it is missing: the sensor logs "operation timed out" on every flush and /readyz
+# reports delivery_failing.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-ingress-from-sensor
+  namespace: aegis-sentinel
+  labels:
+    app.kubernetes.io/part-of: api-sentinel
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: sentinel-sensor
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api-sentinel-sensor
+      ports:
+        - port: 8000
+          protocol: TCP
