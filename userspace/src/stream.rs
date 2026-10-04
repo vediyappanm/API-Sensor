@@ -131,6 +131,10 @@ struct StreamState {
     buffers: HashMap<StreamKey, (Vec<u8>, u64)>,
     pending: HashMap<ConnKey, PendingQueue>,
     http2_state: HashMap<ConnKey, Http2Conn>,
+    /// Server HTTP/2 frames (SETTINGS, WINDOW_UPDATE) that arrived before the
+    /// client connection preface. They belong to the response direction and are
+    /// replayed once the preface opens the connection.
+    h2_early_resp: HashMap<ConnKey, (Vec<u8>, u64)>,
     http3_connections: HashSet<ConnKey>,
     ws_connections: HashSet<ConnKey>,
     known_connections: HashSet<ConnKey>,
@@ -261,6 +265,34 @@ impl Default for Http2Conn {
     }
 }
 
+
+/// Server bytes that show up before the client preface: a run of complete
+/// connection frames (SETTINGS, PING, WINDOW_UPDATE) on stream 0. A trailing
+/// partial frame is allowed. Anything else is left for the HTTP/1 parser.
+fn looks_like_h2_connection_frames(buf: &[u8]) -> bool {
+    if buf.len() < 9 {
+        return false;
+    }
+    let mut i = 0;
+    let mut saw = false;
+    while i + 9 <= buf.len() {
+        let len = ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | buf[i + 2] as usize;
+        let ftype = buf[i + 3];
+        let sid = u32::from_be_bytes([buf[i + 5], buf[i + 6], buf[i + 7], buf[i + 8]]) & 0x7fff_ffff;
+        if len > 16_384 {
+            return false;
+        }
+        if i + 9 + len > buf.len() {
+            return saw;
+        }
+        if sid != 0 || !matches!(ftype, 0x04 | 0x06 | 0x08) {
+            return false;
+        }
+        saw = true;
+        i += 9 + len;
+    }
+    saw && i == buf.len()
+}
 
 /// Subtract from TOTAL_BUFFER_BYTES with underflow protection.
 fn release_memory(amount: usize) {
@@ -467,6 +499,7 @@ impl StreamState {
             buffers: HashMap::new(),
             pending: HashMap::new(),
             http2_state: HashMap::new(),
+            h2_early_resp: HashMap::new(),
             http3_connections: HashSet::new(),
             ws_connections: HashSet::new(),
             known_connections: HashSet::new(),
@@ -490,6 +523,7 @@ impl StreamState {
 
         // Http2Conn releases everything it holds on Drop, so no byte arithmetic here.
         self.http2_state.retain(|_, conn| now_ms.saturating_sub(conn.last_event_ts) < STREAM_TTL_MS);
+        self.h2_early_resp.retain(|_, (_, seen)| now_ms.saturating_sub(*seen) < STREAM_TTL_MS);
 
         // Requests whose response never arrived would otherwise sit (and hold memory) until
         // the connection closes. Their bytes are released by PendingBytes as they are dropped.
@@ -559,6 +593,7 @@ impl StreamState {
         });
         self.pending.retain(|k, _| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
         self.http2_state.retain(|k, _| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
+        self.h2_early_resp.retain(|k, _| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
         self.ws_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
         self.http3_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
 
@@ -643,8 +678,27 @@ impl StreamState {
             && is_request_dir
             && payload.starts_with(crate::types::HTTP2_PREFACE)
             && !self.buffers.contains_key(&stream_key);
+        // A server writes its SETTINGS before it has read the client preface.
+        // Those bytes are not a request, and they are not HTTP/1. Hold them
+        // until the preface opens the connection, then feed the response direction.
+        if !is_known_h2 && !is_request_dir && looks_like_h2_connection_frames(payload) {
+            let entry = self.h2_early_resp.entry(conn_key).or_insert_with(|| (Vec::new(), ts_ms));
+            if entry.0.len().saturating_add(payload.len()) <= 65_536 {
+                entry.0.extend_from_slice(payload);
+            }
+            entry.1 = ts_ms;
+            return output;
+        }
+        if starts_h2 {
+            if let Some((early, _)) = self.h2_early_resp.remove(&conn_key) {
+                if !early.is_empty() {
+                    output.extend(self.process_http2_event(conn_key.clone(), ev, &early, ts_ms, false));
+                }
+            }
+        }
         if is_known_h2 || starts_h2 {
-            return self.process_http2_event(conn_key.clone(), ev, payload, ts_ms, is_request_dir);
+            output.extend(self.process_http2_event(conn_key, ev, payload, ts_ms, is_request_dir));
+            return output;
         }
 
         if data_len == 0 {
@@ -781,13 +835,31 @@ impl StreamState {
                     }
 
                     let is_mcp = is_mcp_response(&resp.headers);
+                    let upgrade = upgrade_hdr.as_deref() == Some("websocket");
 
                     let Some(request) = self.pending.entry(conn_key.clone()).or_default().pop_usable() else {
                         skip_unpaired_response();
                         continue;
                     };
                     let latency_ms = ts_ms.saturating_sub(request.ts_ms);
-                    let protocol = if is_mcp { "MCP" } else { "HTTP/1.1" };
+                    // The upgrade itself is the WebSocket event. Later frames are
+                    // counted, not emitted: per-frame events on /api/stream/live
+                    // fed the live feed back into itself.
+                    let protocol = if is_mcp {
+                        "MCP"
+                    } else if upgrade {
+                        "WebSocket"
+                    } else {
+                        "HTTP/1.1"
+                    };
+                    // The SSE body carries the JSON-RPC call. The raw TLS chunk
+                    // may be only the tail of the headers.
+                    let mcp_events = if is_mcp {
+                        let source: &[u8] = if resp.body.is_empty() { payload } else { &resp.body };
+                        parse_sse_events(source)
+                    } else {
+                        Vec::new()
+                    };
                     let mut event = build_event(
                         self.account_id,
                         ts_ms,
@@ -798,7 +870,6 @@ impl StreamState {
                         "ebpf",
                     );
                     if is_mcp {
-                        let mcp_events = parse_sse_events(payload);
                         if let Some(mcp_ev) = mcp_events.first() {
                             event.metadata = Some(EventMetadata {
                                 has_injection: mcp_ev.has_injection,
@@ -1242,6 +1313,25 @@ mod tests {
     }
 
     #[test]
+    fn mcp_sse_body_records_method_and_tool() {
+        let state = test_state();
+        let req = b"POST /mcp HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n{}";
+        assert!(state.handle_event(&tls_event(0), req).is_empty());
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"read_file\"}}\n\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let events = state.handle_event(&tls_event(1), resp.as_bytes());
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].protocol, "MCP");
+        let meta = events[0].metadata.as_ref().expect("mcp metadata");
+        assert_eq!(meta.mcp_method.as_deref(), Some("tools/call"));
+        assert_eq!(meta.mcp_tool_name.as_deref(), Some("read_file"));
+    }
+
+    #[test]
     fn garbage_request_then_response_is_not_emitted_as_unknown() {
         let state = test_state();
         let garbage = b"FOO /x HTTP/1.1\r\nHost: example.com\r\n\r\n";
@@ -1266,6 +1356,7 @@ mod tests {
         assert_eq!(upgrade[0].request.method, "GET");
         assert_eq!(upgrade[0].request.path, "/api/stream/live");
         assert_eq!(upgrade[0].response.status_code, 101);
+        assert_eq!(upgrade[0].protocol, "WebSocket");
 
         // Unmasked TEXT frame: FIN+text, len=5, "hello"
         let frame = [0x81u8, 0x05, b'h', b'e', b'l', b'l', b'o'];
@@ -1274,6 +1365,13 @@ mod tests {
             events.is_empty(),
             "WS frames must not appear as TEXT /ws: {events:?}"
         );
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     /// 9-byte HTTP/2 frame header + payload.
@@ -1312,7 +1410,7 @@ mod tests {
         let mut req_hpack = vec![0x83u8];
         req_hpack.extend(hpack_literal(4, "/pkg.Svc/Method"));
         req_hpack.extend(hpack_literal(31, "application/grpc"));
-        let mut req = HTTP2_PREFACE.to_vec();
+        let mut req = crate::types::HTTP2_CONNECTION_PREFACE.to_vec();
         req.extend(h2_frame(0x01, 0x05, 1, &req_hpack)); // HEADERS END_STREAM|END_HEADERS
         assert!(state.handle_event(&tls_event(0), &req).is_empty());
 
@@ -1338,6 +1436,33 @@ mod tests {
             arr[0]["value_str"].as_str().unwrap().contains("test"),
             "decoded value should contain 'test': {body}"
         );
+    }
+
+    /// Bytes captured from a real curl --http2 GET /api/items against an h2 server.
+    /// Order is what the server process sees: its SETTINGS goes out before the
+    /// client preface is read.
+    #[test]
+    fn real_curl_http2_exchange_is_collected() {
+        let state = test_state();
+        let chunks: &[(u8, &str)] = &[
+            (1, "00002a04000000000000010000100000020000000000040000ffff000500004000000800000000000300000064000600010000"),
+            (0, "505249202a20485454502f322e300d0a0d0a534d0d0a0d0a000012040000000000000300000064000400a000000002000000000000040800000000003e7f0001"),
+            (1, "000000040100000000"),
+            (0, "0000270105000000018287418b089d5c0b8170dc0bcd34ef04876075998324b4a37a8825b650c3cbb6b83f53032a2f2a"),
+            (1, "00000e010400000001885f8b1d75d0620d263d4c7441ea00000b0001000000017b226f6b223a747275657d"),
+        ];
+        let mut events = Vec::new();
+        for (dir, hex) in chunks {
+            let bytes = hex_bytes(hex);
+            events.extend(state.handle_event(&tls_event(*dir), &bytes));
+        }
+        assert_eq!(events.len(), 1, "real curl HTTP/2 exchange should emit one event: {events:?}");
+        assert_eq!(events[0].protocol, "HTTP/2");
+        assert_eq!(events[0].request.method, "GET");
+        assert!(events[0].request.path.contains("/api/items"), "{:?}", events[0].request.path);
+        assert_eq!(events[0].response.status_code, 200);
+        let body = events[0].response.body.as_deref().unwrap_or("");
+        assert!(body.contains("ok"), "response body missing: {body}");
     }
 
     #[test]
@@ -1473,7 +1598,7 @@ mod tests {
         let mut req_hpack = vec![0x83u8];
         req_hpack.extend(hpack_literal(4, "/pkg.Svc/Method"));
         req_hpack.extend(hpack_literal(31, "application/grpc"));
-        let mut req = HTTP2_PREFACE.to_vec();
+        let mut req = crate::types::HTTP2_CONNECTION_PREFACE.to_vec();
         req.extend(h2_frame(0x01, 0x05, 1, &req_hpack));
         assert!(state.handle_event(&tls_event(0), &req).is_empty());
 
@@ -1609,7 +1734,7 @@ mod tests {
     }
 
     fn client_bytes(frames: &[Vec<u8>]) -> Vec<u8> {
-        let mut v = HTTP2_PREFACE.to_vec();
+        let mut v = crate::types::HTTP2_CONNECTION_PREFACE.to_vec();
         for f in frames {
             v.extend_from_slice(f);
         }

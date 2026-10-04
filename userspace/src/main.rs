@@ -35,7 +35,7 @@ use crate::bpf::{attach_tls_uprobes, attach_kernel_probes, attach_quic_uprobes,
 use crate::boringssl::{attach_boring_ssl_static, attach_mbedtls_static, attach_wolfssl_static};
 use crate::container::{ContainerLookupRequest, ContainerResolver, fetch_container_metadata};
 use crate::dns::{DnsResolver, reverse_dns_lookup};
-use crate::go_tls::{attach_go_tls_probes, detect_go_binary, find_go_tls_offsets};
+use crate::go_tls::{attach_go_tls_probes, detect_go_binary, discover_go_binaries, find_go_tls_offsets};
 use crate::http::discover_tls_libs;
 use crate::ingest::send_batch_with_client;
 use crate::metrics::*;
@@ -189,16 +189,24 @@ async fn main() -> Result<()> {
     // Go TLS probes
     if args.go_tls {
         tracing::info!(pid = args.pid, "Go TLS: scanning");
-        if let Some(go_bin) = detect_go_binary(args.pid) {
+        let go_bins = if args.pid > 0 {
+            detect_go_binary(args.pid).into_iter().collect::<Vec<_>>()
+        } else {
+            // DaemonSet runs with pid -1. Scanning one pid found nothing and
+            // left every Go process on the node unprobed.
+            discover_go_binaries(8)
+        };
+        if go_bins.is_empty() {
+            tracing::warn!(pid = args.pid, "Go TLS: no Go binary found");
+        }
+        for go_bin in &go_bins {
             tracing::info!(binary = %go_bin, "Go TLS: detected binary");
-            if let Some(offsets) = find_go_tls_offsets(&go_bin) {
+            if let Some(offsets) = find_go_tls_offsets(go_bin) {
                 tracing::info!(binary = %go_bin, version = %offsets.go_version, "attaching Go TLS probes");
                 attach_go_tls_probes(&mut obj, &offsets, &mut links, args.pid);
             } else {
                 tracing::warn!(binary = %go_bin, "Go TLS: no offsets found");
             }
-        } else {
-            tracing::warn!(pid = args.pid, "Go TLS: no Go binary found");
         }
         // Check for static BoringSSL in the target binary
         if args.pid > 0 {
