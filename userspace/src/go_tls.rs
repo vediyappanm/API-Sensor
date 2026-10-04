@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 
 // ---------------------------------------------------------------------------
 // Go TLS ELF scanning + capstone RET finding
@@ -239,6 +240,86 @@ fn goid_offset_for_version(version: &str) -> u64 {
 /// Maximum file size to read when scanning for Go binaries (200 MB).
 const MAX_GO_SCAN_SIZE: u64 = 200 * 1024 * 1024;
 
+/// Executables of live processes that look like Go binaries, newest-inode
+/// deduped. `limit` caps how many we open: a node-wide scan must not read
+/// every binary on the host before the sensor starts polling.
+pub fn discover_go_binaries(limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let entries = match fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "Go TLS: cannot read /proc");
+            return out;
+        }
+    };
+    for ent in entries.flatten() {
+        if out.len() >= limit {
+            break;
+        }
+        let name = ent.file_name();
+        let pid = name.to_string_lossy();
+        if !pid.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let exe = format!("/proc/{pid}/exe");
+        let path = match fs::read_link(&exe) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let path_str = path.to_string_lossy();
+        if !path_str.starts_with('/') || path_str.contains(".so") {
+            continue;
+        }
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.len() == 0 || meta.len() > MAX_GO_SCAN_SIZE {
+            continue;
+        }
+        let id = (meta.dev(), meta.ino());
+        if !seen.insert(id) {
+            continue;
+        }
+        if file_looks_like_go(&path, meta.len()) {
+            out.push(path.to_string_lossy().into_owned());
+        }
+    }
+    out
+}
+
+/// Look for the Go build-info magic in the head and tail of the file. The
+/// full ELF is read later, and only for binaries that match.
+fn file_looks_like_go(path: &std::path::Path, len: u64) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let window = 65_536u64.min(len) as usize;
+    let mut buf = vec![0u8; window];
+    if f.read(&mut buf).ok().unwrap_or(0) == 0 {
+        return false;
+    }
+    if parse_go_version_from_binary(&buf).is_some() {
+        return true;
+    }
+    if len > window as u64 {
+        if f.seek(SeekFrom::End(-(window as i64))).is_err() {
+            return false;
+        }
+        let mut tail = vec![0u8; window];
+        if f.read(&mut tail).ok().unwrap_or(0) == 0 {
+            return false;
+        }
+        if parse_go_version_from_binary(&tail).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn detect_go_binary(pid: i32) -> Option<String> {
     if pid <= 0 { return None; }
     let maps_path = format!("/proc/{}/maps", pid);
@@ -305,4 +386,15 @@ pub fn attach_at_offset(
         .map_err(|e| anyhow::anyhow!("attach {} at offset {:#x}: {}", prog_name, offset, e))?;
     links.push(link);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_wide_scan_respects_a_zero_limit() {
+        assert!(discover_go_binaries(0).is_empty());
+        assert!(detect_go_binary(-1).is_none());
+    }
 }

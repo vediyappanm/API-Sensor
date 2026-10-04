@@ -1,7 +1,7 @@
 use hpack::decoder::Decoder;
 use std::collections::HashMap;
 
-use crate::types::HTTP2_PREFACE;
+use crate::types::{HTTP2_CONNECTION_PREFACE, HTTP2_PREFACE};
 
 // ---------------------------------------------------------------------------
 // Http2HpackDecoder wrapper (HPACK resync)
@@ -354,15 +354,18 @@ impl Http2Direction {
         self.buf.extend_from_slice(data);
 
         if !self.preface_done {
-            if self.buf.len() >= HTTP2_PREFACE.len() {
-                if self.buf.starts_with(HTTP2_PREFACE) {
-                    self.buf.drain(..HTTP2_PREFACE.len());
+            // RFC 9113 §3.4: 24 bytes. Stopping at the 14-byte "PRI * HTTP/2.0"
+            // magic leaves "\r\n\r\nSM\r\n\r\n" to be parsed as a frame, which
+            // declares an illegal length and breaks the whole direction.
+            if self.buf.len() >= HTTP2_CONNECTION_PREFACE.len() {
+                if self.buf.starts_with(HTTP2_CONNECTION_PREFACE) {
+                    self.buf.drain(..HTTP2_CONNECTION_PREFACE.len());
                     self.preface_done = true;
                 } else {
                     self.fail();
                     return out;
                 }
-            } else if HTTP2_PREFACE.starts_with(&self.buf) {
+            } else if HTTP2_CONNECTION_PREFACE.starts_with(&self.buf) {
                 return out; // preface split across reads: wait for the rest
             } else {
                 self.fail();
@@ -882,11 +885,31 @@ mod direction_tests {
     }
 
     fn client_stream(frames: &[Vec<u8>]) -> Vec<u8> {
-        let mut v = HTTP2_PREFACE.to_vec();
+        let mut v = HTTP2_CONNECTION_PREFACE.to_vec();
         for f in frames {
             v.extend_from_slice(f);
         }
         v
+    }
+
+    #[test]
+    fn real_curl_request_headers_decode() {
+        let c0 = hex_bytes("505249202a20485454502f322e300d0a0d0a534d0d0a0d0a000012040000000000000300000064000400a000000002000000000000040800000000003e7f0001");
+        let c1 = hex_bytes("0000270105000000018287418b089d5c0b8170dc0bcd34ef04876075998324b4a37a8825b650c3cbb6b83f53032a2f2a");
+        let mut d = Http2Direction::new(true);
+        let a = d.feed(&c0);
+        assert!(a.is_empty(), "preface/settings produce no headers, broken={}", d.is_broken());
+        assert!(!d.is_broken());
+        let b = d.feed(&c1);
+        let h = headers(&b);
+        assert!(!d.is_broken(), "request direction broke");
+        assert_eq!(h.len(), 1, "items={b:?} buffered={}", d.buffered());
+        assert_eq!(h[0].1.get(":method").map(String::as_str), Some("GET"), "{:?}", h[0].1);
+        assert!(h[0].1.get(":path").unwrap_or(&String::new()).contains("api"), "{:?}", h[0].1);
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i+2], 16).unwrap()).collect()
     }
 
     #[test]
@@ -1029,9 +1052,9 @@ mod direction_tests {
     #[test]
     fn a_preface_split_across_reads_is_awaited() {
         let mut d = Http2Direction::new(true);
-        assert!(d.feed(&HTTP2_PREFACE[..10]).is_empty());
+        assert!(d.feed(&HTTP2_CONNECTION_PREFACE[..10]).is_empty());
         assert!(!d.is_broken());
-        let rest = [&HTTP2_PREFACE[10..], &frame(0x01, END_HEADERS, 1, &[0x82, 0x84])[..]].concat();
+        let rest = [&HTTP2_CONNECTION_PREFACE[10..], &frame(0x01, END_HEADERS, 1, &[0x82, 0x84])[..]].concat();
         assert_eq!(headers(&d.feed(&rest))[0].1[":method"], "GET");
     }
 
@@ -1044,7 +1067,7 @@ mod direction_tests {
         assert_eq!(announcer.announced_max_frame, Some(100_000));
         // the OTHER direction may then carry a 50 KB DATA frame, which the default 16 KB would reject
         let mut peer = Http2Direction::new(true);
-        peer.feed(HTTP2_PREFACE);
+        peer.feed(HTTP2_CONNECTION_PREFACE);
         peer.set_max_frame(100_000);
         let big = vec![b'x'; 50_000];
         let items = peer.feed(&frame(0x00, END_STREAM, 1, &big));
