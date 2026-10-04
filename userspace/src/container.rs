@@ -392,6 +392,29 @@ mod tests {
 
     const UID: &str = "123e4567-e89b-12d3-a456-426614174000";
 
+    #[test]
+    fn cri_status_decodes_when_image_is_a_message_with_non_utf8_bytes() {
+        use prost::Message;
+        // ContainerStatus { id = 1: "abc", image = 8: <ImageSpec bytes, deliberately not UTF-8>,
+        //                   labels = 12: {"io.kubernetes.pod.namespace": "aegis-sentinel"} }
+        let mut status: Vec<u8> = vec![0x0a, 3, b'a', b'b', b'c'];
+        status.extend_from_slice(&[0x42, 4, 0x0a, 0x80, 0xff, 0xfe]);
+        let (k, v) = ("io.kubernetes.pod.namespace", "aegis-sentinel");
+        let mut entry = vec![0x0a, k.len() as u8];
+        entry.extend_from_slice(k.as_bytes());
+        entry.extend_from_slice(&[0x12, v.len() as u8]);
+        entry.extend_from_slice(v.as_bytes());
+        status.push(0x62);
+        status.push(entry.len() as u8);
+        status.extend_from_slice(&entry);
+        let mut resp = vec![0x0a, status.len() as u8];
+        resp.extend_from_slice(&status);
+
+        let decoded = cri::ContainerStatusResponse::decode(resp.as_slice()).expect("must decode");
+        let labels = decoded.status.expect("status").labels;
+        assert_eq!(labels.get("io.kubernetes.pod.namespace").map(String::as_str), Some("aegis-sentinel"));
+    }
+
     fn ids(path: &str) -> (Option<String>, Option<String>) {
         let i = parse_cgroup_path(path).expect("container cgroup");
         (i.pod_uid, i.container_id_full)
