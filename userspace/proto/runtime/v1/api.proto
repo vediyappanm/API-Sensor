@@ -24,7 +24,9 @@ message ContainerStatus {
   int64 started_at = 5;
   int64 finished_at = 6;
   int64 exit_code = 7;
-  string image = 8;
+  // Field 8 (`image`) is deliberately not declared: in containerd's CRI it is an ImageSpec MESSAGE, and
+  // declaring it as a string made prost reject ContainerStatusResponse whenever the nested bytes were not
+  // valid UTF-8 (the whole lookup failed, so the pod namespace stayed unresolved). Unknown fields are skipped.
   string image_ref = 9;
   string reason = 10;
   string message = 11;
