@@ -143,7 +143,7 @@ struct StreamState {
     /// Server HTTP/2 frames (SETTINGS, WINDOW_UPDATE) that arrived before the
     /// client connection preface. They belong to the response direction and are
     /// replayed once the preface opens the connection.
-    h2_early_resp: HashMap<ConnKey, (Vec<u8>, u64)>,
+    h2_early_resp: HashMap<ConnKey, EarlyResp>,
     http3_connections: HashSet<ConnKey>,
     ws_connections: HashSet<ConnKey>,
     known_connections: HashSet<ConnKey>,
@@ -279,6 +279,18 @@ impl Default for Http2Conn {
     }
 }
 
+
+/// Server connection frames held until the client preface arrives. Counted against the global memory
+/// ceiling (released on Drop), and bounded in size and in number of connections: SETTINGS, PING and
+/// WINDOW_UPDATE are a few dozen bytes, so anything near the cap is not a real handshake.
+struct EarlyResp {
+    data: Vec<u8>,
+    seen_ms: u64,
+    charge: PendingBytes,
+}
+
+const MAX_H2_EARLY_BYTES: usize = 8_192;
+const MAX_H2_EARLY_CONNS: usize = 1_024;
 
 /// Server bytes that show up before the client preface: a run of complete
 /// connection frames (SETTINGS, PING, WINDOW_UPDATE) on stream 0. A trailing
@@ -539,7 +551,7 @@ impl StreamState {
 
         // Http2Conn releases everything it holds on Drop, so no byte arithmetic here.
         self.http2_state.retain(|_, conn| now_ms.saturating_sub(conn.last_event_ts) < STREAM_TTL_MS);
-        self.h2_early_resp.retain(|_, (_, seen)| now_ms.saturating_sub(*seen) < STREAM_TTL_MS);
+        self.h2_early_resp.retain(|_, e| now_ms.saturating_sub(e.seen_ms) < STREAM_TTL_MS);
 
         // Requests whose response never arrived would otherwise sit (and hold memory) until
         // the connection closes. Their bytes are released by PendingBytes as they are dropped.
@@ -734,17 +746,28 @@ impl StreamState {
         // Those bytes are not a request, and they are not HTTP/1. Hold them
         // until the preface opens the connection, then feed the response direction.
         if !is_known_h2 && !is_request_dir && looks_like_h2_connection_frames(payload) {
-            let entry = self.h2_early_resp.entry(conn_key).or_insert_with(|| (Vec::new(), ts_ms));
-            if entry.0.len().saturating_add(payload.len()) <= 65_536 {
-                entry.0.extend_from_slice(payload);
+            let max_total = self.max_total_buffer_bytes;
+            if !self.h2_early_resp.contains_key(&conn_key) && self.h2_early_resp.len() >= MAX_H2_EARLY_CONNS {
+                EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                return output;
             }
-            entry.1 = ts_ms;
+            let entry = self.h2_early_resp.entry(conn_key).or_insert_with(|| EarlyResp {
+                data: Vec::new(),
+                seen_ms: ts_ms,
+                charge: PendingBytes::default(),
+            });
+            if entry.data.len().saturating_add(payload.len()) <= MAX_H2_EARLY_BYTES
+                && entry.charge.add(max_total, payload.len())
+            {
+                entry.data.extend_from_slice(payload);
+            }
+            entry.seen_ms = ts_ms;
             return output;
         }
         if starts_h2 {
-            if let Some((early, _)) = self.h2_early_resp.remove(&conn_key) {
-                if !early.is_empty() {
-                    output.extend(self.process_http2_event(conn_key.clone(), ev, &early, ts_ms, false));
+            if let Some(early) = self.h2_early_resp.remove(&conn_key) {
+                if !early.data.is_empty() {
+                    output.extend(self.process_http2_event(conn_key.clone(), ev, &early.data, ts_ms, false));
                 }
             }
         }
@@ -2070,5 +2093,67 @@ mod tests {
         // resolved-but-foreign events must not inflate the unresolved counter by this exchange (other
         // tests run concurrently, so only a lower bound on the first is asserted above)
         let _ = mid;
+    }
+
+    // ---- early server frames are bounded and charged to the memory ceiling ------------------
+
+    fn server_settings_frame() -> Vec<u8> {
+        h2_frame(0x04, 0, 0, &[0, 3, 0, 0, 0, 100]) // SETTINGS: MAX_CONCURRENT_STREAMS = 100
+    }
+
+    fn early_held(state: &ShardedStreamState) -> (usize, usize) {
+        state.shards.iter().fold((0, 0), |(n, b), sh| {
+            let g = sh.lock().unwrap();
+            (n + g.h2_early_resp.len(), b + g.h2_early_resp.values().map(|e| e.data.len()).sum::<usize>())
+        })
+    }
+
+    fn ev_conn(direction: u8, conn: u64) -> TlsEventHeader {
+        let mut e = tls_event(direction);
+        e.ssl_ptr = 0x5000 + conn;
+        e
+    }
+
+    #[test]
+    fn early_server_frames_are_held_then_released_with_the_connection() {
+        let state = test_state();
+        let frame = server_settings_frame();
+        assert!(state.handle_event(&ev_conn(1, 1), &frame).is_empty());
+        assert_eq!(early_held(&state), (1, frame.len()));
+        state.evict_connection(&ConnKey { pid: 42, ssl_ptr: 0x5001, born_ms: 0 });
+        assert_eq!(early_held(&state), (0, 0), "held bytes must go away with the connection");
+    }
+
+    #[test]
+    fn early_server_frames_cannot_exceed_the_global_ceiling() {
+        crate::redaction::init_pii_hash_key_for_tests(&[0x11u8; 32]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (dtx, _drx) = tokio::sync::mpsc::channel(8);
+        let frame = server_settings_frame();
+        // a ceiling that fits roughly three frames
+        let state = ShardedStreamState::new(
+            1,
+            TrafficRole::Server,
+            65_536,
+            Arc::new(ContainerResolver::new(tx, "n".into())),
+            frame.len() * 3,
+            Arc::new(DnsResolver::new(dtx)),
+        );
+        for conn in 0..40u64 {
+            state.handle_event(&ev_conn(1, conn), &frame);
+        }
+        let (_, bytes) = early_held(&state);
+        assert!(bytes <= frame.len() * 3, "{bytes} bytes held against a {} byte ceiling", frame.len() * 3);
+    }
+
+    #[test]
+    fn one_connection_cannot_hold_more_than_a_handshake_needs() {
+        let state = test_state();
+        let frame = server_settings_frame();
+        for _ in 0..2_000 {
+            state.handle_event(&ev_conn(1, 77), &frame);
+        }
+        let (_, bytes) = early_held(&state);
+        assert!(bytes <= MAX_H2_EARLY_BYTES, "{bytes}");
     }
 }
