@@ -24,6 +24,9 @@ pub static CONSECUTIVE_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static EVENTS_LOST_SEND:   AtomicU64 = AtomicU64::new(0);
 pub static EVENTS_SENT:        AtomicU64 = AtomicU64::new(0);
 pub static SEND_ERRORS:        AtomicU64 = AtomicU64::new(0);
+/// Batches whose request timed out after it was sent. Their events are counted in
+/// EVENTS_LOST_SEND, but the backend may still have stored them.
+pub static SEND_TIMEOUTS:      AtomicU64 = AtomicU64::new(0);
 pub static RINGBUF_DROPS:      AtomicU64 = AtomicU64::new(0);
 // F02, F09: Producer-side loss counters from BPF (per-CPU aggregated in userspace)
 pub static BPF_ATTEMPTED:      AtomicU64 = AtomicU64::new(0);
@@ -183,6 +186,10 @@ apisec_events_sent_total {}
 # TYPE apisec_send_errors_total counter
 apisec_send_errors_total {}
 
+# HELP apisec_send_timeouts_total Batches that timed out after sending; not resent, the backend may still store them
+# TYPE apisec_send_timeouts_total counter
+apisec_send_timeouts_total {}
+
 # HELP apisec_drop_rate_bps Drop rate basis points
 # TYPE apisec_drop_rate_bps gauge
 apisec_drop_rate_bps {drop_rate}
@@ -284,6 +291,7 @@ apisec_uptime_seconds {uptime}
         UNPAIRED_RESPONSES.load(Ordering::Relaxed),
         EVENTS_SENT.load(Ordering::Relaxed),
         SEND_ERRORS.load(Ordering::Relaxed),
+        SEND_TIMEOUTS.load(Ordering::Relaxed),
         ACTIVE_CONNECTIONS.load(Ordering::Relaxed),
         RINGBUF_DROPS.load(Ordering::Relaxed),
         BPF_ATTEMPTED.load(Ordering::Relaxed),

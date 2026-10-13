@@ -1262,21 +1262,20 @@ int tcp_close_entry(struct pt_regs *ctx)
     return 0;
 }
 
-SEC("tracepoint/sched/sched_process_exec")
-int handle_new_process(struct trace_event_raw_sched_process_exec *ctx)
+// Raw tracepoint: attached by name through the bpf() syscall. A classic tracepoint needs tracefs
+// to resolve its id, and tracefs is not mounted in containers, so that attach always failed.
+// TP_PROTO(struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm)
+SEC("raw_tp/sched_process_exec")
+int handle_new_process(struct bpf_raw_tracepoint_args *ctx)
 {
+    struct linux_binprm *bprm = (struct linux_binprm *)ctx->args[2];
     struct new_proc_event *e = bpf_ringbuf_reserve(&proc_events, sizeof(*e), 0);
     if (!e) return 0;
 
     e->pid       = bpf_get_current_pid_tgid() >> 32;
     e->cgroup_id = bpf_get_current_cgroup_id();
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
-
-    // __data_loc encoding: lower 16 bits = offset, upper 16 bits = length
-    __u32 data_loc = ctx->__data_loc_filename;
-    __u16 offset   = (__u16)(data_loc & 0xFFFF);
-    const char *fn = (const char *)ctx + offset;
-    bpf_probe_read_str(&e->filename, sizeof(e->filename), fn);
+    bpf_probe_read_kernel_str(&e->filename, sizeof(e->filename), BPF_CORE_READ(bprm, filename));
 
     bpf_ringbuf_submit(e, 0);
     return 0;

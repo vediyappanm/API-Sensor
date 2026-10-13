@@ -468,7 +468,7 @@ Environment: Windows 11 + Docker Desktop, build image `api-sensor-build:dev` (Ub
 
 | Command | Result |
 |---------|--------|
-| `cargo test --no-fail-fast` (Docker build image) | **496 passed, 0 failed, 0 ignored**: lib 216, bin 225, adversarial 27, delivery 2, enforcement 9, integration 9, memory_ceiling 1, producer_stats 3, schema_contract 4 |
+| `cargo test --no-fail-fast` (Docker build image) | **497 passed, 0 failed, 0 ignored**: lib 216, bin 225, adversarial 27, delivery 3, enforcement 9, integration 9, memory_ceiling 1, producer_stats 3, schema_contract 4 |
 | `export::tests` batch ceiling: overflow flushes first, exact fit after a flush, oversized dropped and counted, and no sent batch exceeds its budget over 500 mixed sizes | PASS |
 | `enforcement::an_export_byte_budget_too_small_for_one_event_is_rejected` | PASS |
 | `bash scripts/test-live-harness.sh`: relative `SENSOR_BIN`/`BPF_OBJ` resolve against the caller's directory, not `$WORK`; a missing file fails with status 2 | 5/5 PASS |
@@ -584,6 +584,52 @@ Events are counted per `rid` query value at the schema-validating validator.
 
 ---
 
+## Canary 1b — image `e5856f8` on kind-wecrew (2026-10-13 09:52–10:12 UTC): gate NOT met
+
+- **Setup:** one pod, `api-sentinel-sensor-s7hd5` in `sentinel-sensor`, running `harbor.wecrew.in/finspot/api-sentinel-sensor:e5856f8` (Helm revision 17). Kernel 6.8.0-139-generic.
+- **Startup:** BPF loaded (`dynptr=true lsm=false ktls=true`). TLS uprobes attached `usable_libs=82 total_libs=82`, and kTLS kprobes `attached=4`. **The exec tracepoint did not attach**: the same failure as on Docker Desktop.
+- **Direction fix:** works on stored traffic. Rows from 09:58 onward carry `outgoing`.
+- **Marked request:** `CANARYAPP-095856` returned 200 but was **not** in `request_logs` through 10:11:58.
+
+**Delivery, sampled every 30 s from 10:00:22 to 10:12:30:**
+- `lost_send` rose from 11 to 63.
+- `consecutive_send_failures` bounced between 0 and 4.
+- `seconds_since_last_send_ok` peaked at 131.
+- `export_queue_bytes` grew from 0.8 to 6.9 MB and never drained.
+- There were 24 `flush failed` messages, all `operation timed out`.
+- Postgres was still blocked on `UPDATE sensors SET lines_shipped…`.
+
+**Duplicates:** `request_logs` has no event-id column, and `event_context` carries no sensor `Id`. Grouping by `created_at, method, path, direction` found ten groups with **count = 3**, all outgoing Kubernetes API calls.
+
+**Memory (release build):**
+- `VmRSS` 33 MB and `VmHWM` 37 MB, flat. PID 1 is the sensor, so these readings are valid.
+- The cgroup working set rose from 208 to 217 Mi.
+- The pod limit is 1536 Mi.
+- Ingest was failing throughout, so this was not a clean load test.
+
+**Not run:** the Kubernetes SIGTERM test (step 5) and the host harness (step 7).
+
+### Two sensor defects found, fixed after `e5856f8`
+
+1. **The sensor re-sent timed-out batches, tripling rows and load.**
+   - **Cause:** `MAX_ATTEMPTS = 3`, and a request timeout was retried like a refused connection. The backend committed every attempt late, which explains the count = 3 groups exactly. Each failing batch also held the export task for about 30 s (3 × 10 s plus backoff), so the queue grew. The retries tripled the writes contending on the locked `sensors` row.
+   - **Fix (`ingest.rs`):** a batch is resent only when the server certainly did not process it, that is, a connection failure or HTTP 429/503. A timeout after sending, a 500/502/504, or a mid-request reset is not resent. Those events still count in `apisec_events_lost_send_total`, and timeouts also count in the new `apisec_send_timeouts_total`, because the backend may still store them.
+   - **Test:** `tests/delivery.rs::a_batch_is_resent_only_when_the_server_certainly_did_not_process_it` uses a counting server. A timeout, then a 500, each reach the server exactly once; a 503 and a 429 each reach it 3 times.
+   - **Revisit when** the backend deduplicates on event `Id` (ACK contract point 1). Resending ambiguous failures becomes safe then.
+2. **The exec tracepoint never attached in a container.**
+   - **Cause:** a classic `tracepoint/` program is attached by libbpf through tracefs (`/sys/kernel/tracing/events/.../id`), and tracefs is not mounted in containers, privileged or not; the chart mounts only `/sys/kernel/btf` and the cgroup filesystem. Kprobes and uprobes do not use tracefs, which is why they attached.
+   - **Fix (`bpf/http_trace.bpf.c`):** the program is now `raw_tp/sched_process_exec`, attached by name through `bpf()`. The filename is read from `bprm->filename` with CO-RE. The event layout is unchanged, so no ABI bump. Success now logs `exec tracepoint attached`.
+   - **Verified live** on Docker Desktop 6.6 in a privileged container with `tracefs mounted: 0`: the program passed the verifier, logged `exec tracepoint attached`, and reported 22 `new process` events with correct filenames (`/usr/bin/true`, `/bin/sleep`). The pod is not privileged, but raw tracepoints need the same BPF capabilities as the kprobes that already attach there. Confirm on the canary.
+
+**Tests:** `cargo test` 497 passed, 0 failed: lib 216, bin 225, adversarial 27, delivery 3, enforcement 9, integration 9, memory_ceiling 1, producer_stats 3, schema_contract 4.
+
+**The gate is still blocked on the ingest service** (the Canary 1 backend list). The retry fix removes the sensor's tripling but cannot make a 16 s ingest answer in under 10 s.
+
+**Backend follow-up:**
+- `request_logs` and `event_context` drop the sensor's event `Id`. Store it with a unique constraint; the ACK contract depends on it.
+
+---
+
 ## ACK contract (proposal — needs backend sign-off before durable replay)
 
 Durable replay is **not implemented**. A disk spool replays the right thing only once the backend's answer per batch is defined. This is the current sensor behaviour (`ingest.rs`) and a proposed contract to agree first.
@@ -635,7 +681,7 @@ Do not claim "collects all traffic".
 
 ### Test totals (Docker build image, this session)
 
-- `cargo test --no-fail-fast`: 496 passed, 0 failed, 0 ignored. The suites are lib 216, bin 225, adversarial 27, delivery 2, enforcement 9, integration 9, memory_ceiling 1, producer_stats 3 and schema_contract 4.
+- `cargo test --no-fail-fast`: 497 passed, 0 failed, 0 ignored. The suites are lib 216, bin 225, adversarial 27, delivery 3, enforcement 9, integration 9, memory_ceiling 1, producer_stats 3 and schema_contract 4.
 - The BPF object compiles with `clang -O2 -g -Wall` and loads through the 6.6 verifier.
 
 ### VPS validation checklist (run as root on a Linux host)

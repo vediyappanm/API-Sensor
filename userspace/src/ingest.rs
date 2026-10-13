@@ -4,7 +4,7 @@ use flate2::Compression;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::metrics::{record_send_failure, record_send_success, EVENTS_SENT, SEND_ERRORS};
+use crate::metrics::{record_send_failure, record_send_success, EVENTS_SENT, SEND_ERRORS, SEND_TIMEOUTS};
 use crate::output::to_sensor_batch;
 use crate::types::ApiTrafficEvent;
 
@@ -12,6 +12,15 @@ const MAX_ATTEMPTS: u32 = 3;
 const COMPRESS_THRESHOLD_BYTES: usize = 4096;
 const BASE_BACKOFF_MS: u64 = 200;
 const MAX_BACKOFF_MS: u64 = 10_000;
+
+/// A batch is resent only when the server certainly did not process it: the connection was never
+/// established, or the server refused it (429, 503). After a timeout, a 500/502/504 or a reset
+/// once the body was sent, the outcome is unknown and the backend may still commit the batch.
+/// Event Ids are stable across attempts, but until the backend deduplicates on them a resend
+/// stores the rows again and adds load to an ingest service that is already too slow.
+fn status_means_not_processed(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+}
 
 /// Full cause chain of an error. reqwest's Display is just "error sending request for url (...)",
 /// which hides whether the cause was a refused connection, a DNS failure or a TLS error.
@@ -119,9 +128,7 @@ async fn try_send_batch(
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
                     .map(|secs| secs.saturating_mul(1000));
-                let retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                    || status.is_server_error();
-                if retryable && attempt + 1 < MAX_ATTEMPTS {
+                if status_means_not_processed(status) && attempt + 1 < MAX_ATTEMPTS {
                     if let Some(ms) = retry_after_ms {
                         tokio::time::sleep(Duration::from_millis(ms.min(MAX_BACKOFF_MS))).await;
                     }
@@ -134,11 +141,18 @@ async fn try_send_batch(
                 return Err(anyhow::anyhow!("ingest HTTP {}: {}", status, redacted_text));
             }
             Err(e) => {
-                if attempt + 1 < MAX_ATTEMPTS {
+                if e.is_connect() && attempt + 1 < MAX_ATTEMPTS {
                     last_err = Some(error_chain(&e));
                     continue;
                 }
                 SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
+                if e.is_timeout() && !e.is_connect() {
+                    SEND_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                    return Err(anyhow::anyhow!(
+                        "ingest request timed out after sending; the backend may still store this batch, so it is not resent: {}",
+                        error_chain(&e)
+                    ));
+                }
                 return Err(anyhow::anyhow!("ingest request failed: {}", error_chain(&e)));
             }
         }

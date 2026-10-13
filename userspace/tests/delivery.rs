@@ -4,11 +4,14 @@
 //! log line that said only "error sending request for url" - the sensor had silently lost everything.
 //! One test function, because the counters are process-global.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use api_sec_sensor::ingest::send_batch_with_client;
 use api_sec_sensor::metrics::{
     CONSECUTIVE_SEND_FAILURES, EVENTS_DROPPED, EVENTS_LOST_SEND, EVENTS_SENT, LAST_SEND_OK_SECS,
+    SEND_TIMEOUTS,
 };
 use api_sec_sensor::types::ApiTrafficEvent;
 use axum::{http::StatusCode, routing::post, Router};
@@ -101,6 +104,56 @@ async fn failed_batches_are_counted_with_their_cause_and_success_resets_the_stre
     assert_eq!(sent, sent0 + 5);
     assert_eq!(consec, 0, "a success must reset the consecutive-failure streak");
     assert!(LAST_SEND_OK_SECS.load(Ordering::Relaxed) > 0);
+}
+
+/// A server that counts the requests it receives, answers `status`, and takes `delay` to do so.
+async fn serve_counting(status: StatusCode, delay: Duration) -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let app = Router::new().route("/v1/events", post(move || {
+        let h = h.clone();
+        async move {
+            h.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
+            status
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/v1/events"), hits)
+}
+
+#[tokio::test]
+async fn a_batch_is_resent_only_when_the_server_certainly_did_not_process_it() {
+    let _serial = SERIAL.lock().await;
+    init_test_key();
+    let client = reqwest::Client::builder().timeout(Duration::from_millis(300)).build().unwrap();
+
+    // Canary 1: the backend committed every timed-out attempt, so each batch was stored 3 times.
+    let (slow, hits) = serve_counting(StatusCode::OK, Duration::from_secs(2)).await;
+    let timeouts0 = SEND_TIMEOUTS.load(Ordering::Relaxed);
+    let lost0 = EVENTS_LOST_SEND.load(Ordering::Relaxed);
+    let err = send_batch_with_client(&client, &slow, "k", "t", "p", events(4)).await.expect_err("timeout must fail");
+    assert!(format!("{err:#}").contains("not resent"), "{err:#}");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "a timed-out batch must not be sent again");
+    assert_eq!(SEND_TIMEOUTS.load(Ordering::Relaxed), timeouts0 + 1);
+    assert_eq!(EVENTS_LOST_SEND.load(Ordering::Relaxed), lost0 + 4, "unacknowledged events stay visible");
+
+    // A 500 may come after a partial commit: outcome unknown, not resent.
+    let (failing, hits) = serve_counting(StatusCode::INTERNAL_SERVER_ERROR, Duration::ZERO).await;
+    send_batch_with_client(&client, &failing, "k", "t", "p", events(1)).await.expect_err("500 must fail");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "a 500 must not be resent");
+
+    // 503 and 429 mean the server refused the batch, so resending cannot duplicate it.
+    for status in [StatusCode::SERVICE_UNAVAILABLE, StatusCode::TOO_MANY_REQUESTS] {
+        let (refusing, hits) = serve_counting(status, Duration::ZERO).await;
+        send_batch_with_client(&client, &refusing, "k", "t", "p", events(1)).await.expect_err("refusal must fail");
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "{status} is retried up to the attempt limit");
+    }
 }
 
 #[tokio::test]

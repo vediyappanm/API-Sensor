@@ -240,7 +240,10 @@ pub fn attach_kernel_probes(
     // Exec notifications trigger library rediscovery; periodic rescans cover a missed attach.
     if let Some(mut exec) = obj.progs_mut().find(|p| p.name() == OsStr::new("handle_new_process")) {
         match exec.attach() {
-            Ok(link) => links.push(link),
+            Ok(link) => {
+                links.push(link);
+                tracing::info!("exec tracepoint attached");
+            }
             Err(e) => tracing::warn!(error = %e, "exec tracepoint not attached; relying on periodic rescans"),
         }
     }
