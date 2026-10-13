@@ -8,11 +8,11 @@ use crate::container::ContainerResolver;
 use crate::dns::{self, DnsResolver};
 use crate::grpc::decode_grpc_fields;
 use crate::http::{
-    HttpMessage, HttpResponseParsed, extract_http_header, is_usable_http_request, split_query,
+    Http1Decoder, Http1Item, HttpMessage, HttpResponseParsed, is_usable_http_request, split_query,
 };
 use crate::http2::{H2Item, Http2Direction};
 use crate::identity::extract_identity;
-use crate::mcp::{is_mcp_response, parse_sse_events};
+use crate::mcp::{is_mcp_response, parse_jsonrpc_request, parse_sse_events};
 use crate::metrics::*;
 use crate::quic;
 use crate::metrics::{EVENTS_OUT_OF_SCOPE, EVENTS_SCOPE_UNRESOLVED, PENDING_EXPIRED};
@@ -27,6 +27,8 @@ const MAX_H2_PENDING_STREAMS: usize = 200;
 /// evidence, not archives — the kernel already truncates at 32 KiB, and this
 /// keeps batch size and PII-scan cost bounded.
 pub const MAX_BODY_CAPTURE_BYTES: usize = 8192;
+/// Upper bound on partial-transaction events produced by one expiry pass or close.
+const MAX_INCOMPLETE_PER_SWEEP: usize = 1024;
 
 /// Redact PII from a captured body and cap its length. Returns None for an
 /// empty body so the wire field stays null rather than "".
@@ -43,6 +45,81 @@ fn skip_unpaired_response() {
     UNPAIRED_RESPONSES.fetch_add(1, Ordering::Relaxed);
 }
 
+/// True when `payload` begins an HTTP/1 request line or status line.
+fn starts_http1_message(payload: &[u8]) -> bool {
+    if payload.starts_with(b"HTTP/1.") {
+        return true;
+    }
+    let Some(sp) = payload.iter().take(8).position(|&b| b == b' ') else { return false };
+    std::str::from_utf8(&payload[..sp]).map_or(false, crate::http::is_http_method)
+}
+
+/// Request direction (0 = read, 1 = write) inferred from one chunk and the connect/accept hint.
+pub fn infer_request_direction(direction: u8, role_hint: u8, payload: &[u8]) -> Option<u8> {
+    let other = if direction == 0 { 1 } else { 0 };
+    if payload.starts_with(HTTP2_PREFACE) || (!payload.is_empty() && HTTP2_PREFACE.starts_with(payload)) {
+        return Some(direction);
+    }
+    if payload.starts_with(b"HTTP/1.") {
+        return Some(other);
+    }
+    if starts_http1_message(payload) {
+        return Some(direction);
+    }
+    match role_hint {
+        ROLE_HINT_SERVER => Some(0),
+        ROLE_HINT_CLIENT => Some(1),
+        _ => None,
+    }
+}
+
+/// Paths that are always kept regardless of sampling rate.
+fn always_keep_path(path: &str) -> bool {
+    ["/auth", "/login", "/token", "/oauth", "/admin", "/mcp"].iter().any(|p| path.starts_with(p))
+}
+
+fn is_health_path(path: &str) -> bool {
+    ["/health", "/readyz", "/livez", "/metrics"].iter().any(|p| path.starts_with(p))
+}
+
+/// Deterministic per-transaction sampling (F07): applied to completed, paired events so a
+/// dropped request can never leave its response to pair with another request.
+#[derive(Clone, Copy)]
+pub struct TransactionSampler {
+    pub default_rate: u8,
+    pub health_rate: u8,
+}
+
+impl Default for TransactionSampler {
+    fn default() -> Self {
+        Self { default_rate: 100, health_rate: 100 }
+    }
+}
+
+impl TransactionSampler {
+    pub fn keep(&self, ev: &ApiTrafficEvent) -> bool {
+        let path = ev.request.path.as_str();
+        if always_keep_path(path) {
+            return true;
+        }
+        let rate = if is_health_path(path) { self.health_rate } else { self.default_rate };
+        if rate >= 100 {
+            return true;
+        }
+        if rate == 0 {
+            return false;
+        }
+        use std::collections::hash_map::DefaultHasher;
+        let mut h = DefaultHasher::new();
+        ev.request.method.hash(&mut h);
+        path.hash(&mut h);
+        ev.source_ip.hash(&mut h);
+        ev.source_port.hash(&mut h);
+        ev.observed_at.hash(&mut h);
+        (h.finish() % 100) < rate as u64
+    }
+}
+
 fn wall_clock_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -56,6 +133,7 @@ fn wall_clock_ms() -> u64 {
 
 pub struct ShardedStreamState {
     shards: Vec<Arc<Mutex<StreamState>>>,
+    sampler: TransactionSampler,
 }
 
 impl ShardedStreamState {
@@ -80,7 +158,14 @@ impl ShardedStreamState {
                     )))
                 })
                 .collect(),
+            sampler: TransactionSampler::default(),
         }
+    }
+
+    /// Sample completed transactions (not TLS chunks). Rates are percentages, 0–100.
+    pub fn with_sampler(mut self, sampler: TransactionSampler) -> Self {
+        self.sampler = sampler;
+        self
     }
 
     /// Restrict capture to these Kubernetes namespaces. An empty list is rejected by the caller;
@@ -104,25 +189,53 @@ impl ShardedStreamState {
     pub fn handle_event(&self, ev: &TlsEventHeader, payload: &[u8]) -> Vec<ApiTrafficEvent> {
         let idx = self.shard_index(ev.pid, ev.ssl_ptr);
         let shard = &self.shards[idx];
-        match shard.lock() {
+        let events = match shard.lock() {
             Ok(mut guard) => guard.handle_event(ev, payload),
             Err(e) => {
                 tracing::warn!("shard mutex poisoned, recovering");
                 e.into_inner().handle_event(ev, payload)
             }
-        }
+        };
+        self.sample(events)
     }
 
-    pub fn evict_connection(&self, conn_key: &ConnKey) {
+    /// Forget a closed connection. Requests it never answered come back as `connection_closed`.
+    pub fn evict_connection(&self, conn_key: &ConnKey) -> Vec<ApiTrafficEvent> {
         let idx = self.shard_index(conn_key.pid, conn_key.ssl_ptr);
-        let shard = &self.shards[idx];
-        match shard.lock() {
-            Ok(mut guard) => guard.evict_connection_by_ptr(conn_key.pid, conn_key.ssl_ptr),
-            Err(e) => {
-                tracing::warn!("shard mutex poisoned, recovering");
-                e.into_inner().evict_connection_by_ptr(conn_key.pid, conn_key.ssl_ptr);
-            }
+        let events = self.shards[idx]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .evict_connection_by_ptr(conn_key);
+        self.sample(events)
+    }
+
+    /// Periodic expiry that does not depend on further traffic arriving (F22).
+    pub fn sweep(&self) -> Vec<ApiTrafficEvent> {
+        let now = wall_clock_ms();
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            out.extend(shard.lock().unwrap_or_else(|e| e.into_inner()).evict_stale(now));
         }
+        self.sample(out)
+    }
+
+    /// Everything still waiting for a response, for shutdown.
+    pub fn drain_incomplete(&self, outcome: &str) -> Vec<ApiTrafficEvent> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            out.extend(shard.lock().unwrap_or_else(|e| e.into_inner()).take_all_incomplete(outcome));
+        }
+        self.sample(out)
+    }
+
+    fn sample(&self, mut events: Vec<ApiTrafficEvent>) -> Vec<ApiTrafficEvent> {
+        let before = events.len();
+        events.retain(|e| self.sampler.keep(e));
+        let sampled = before - events.len();
+        if sampled > 0 {
+            TRANSACTIONS_SAMPLED.fetch_add(sampled as u64, Ordering::Relaxed);
+        }
+        events
     }
 }
 
@@ -147,8 +260,18 @@ struct StreamState {
     http3_connections: HashSet<ConnKey>,
     ws_connections: HashSet<ConnKey>,
     known_connections: HashSet<ConnKey>,
-    /// Maps (pid, ssl_ptr) → first-seen timestamp for born_ms disambiguation.
-    conn_born_ms: HashMap<(u32, u64), u64>,
+    /// Maps (pid, ssl_ptr, process start, generation) → first-seen timestamp.
+    conn_born_ms: HashMap<(u32, u64, u64, u32), u64>,
+    /// Frozen per-connection request direction (0 = read, 1 = write) for `TrafficRole::Auto`.
+    conn_roles: HashMap<ConnKey, u8>,
+    /// HTTP/1 directions that lost bytes; parsing resumes at the next message start.
+    gapped_streams: HashSet<StreamKey>,
+    /// Incremental HTTP/1 framing state per direction; lives alongside `buffers`.
+    h1_decoders: HashMap<StreamKey, Http1Decoder>,
+    /// A first request chunk shorter than the HTTP/2 preface magic that still matches it.
+    h2_prefix: HashMap<ConnKey, Vec<u8>>,
+    /// Bytes of a WebSocket frame still to arrive on this stream.
+    ws_remaining: HashMap<StreamKey, u64>,
     last_eviction_ms: u64,
     /// When set, only workloads in these Kubernetes namespaces are processed; everything else
     /// (including host processes and not-yet-resolved containers) is dropped before buffering.
@@ -220,10 +343,6 @@ impl InflightResponses {
             }
         }
         true
-    }
-
-    fn body_full(&self, stream_id: u32) -> bool {
-        self.map.get(&stream_id).map_or(false, |r| r.body.len() >= MAX_BODY_CAPTURE_BYTES)
     }
 
     fn take(&mut self, stream_id: u32) -> Option<(HashMap<String, String>, Vec<u8>)> {
@@ -323,7 +442,7 @@ fn looks_like_h2_connection_frames(buf: &[u8]) -> bool {
 /// Subtract from TOTAL_BUFFER_BYTES with underflow protection.
 fn release_memory(amount: usize) {
     if amount == 0 { return; }
-    TOTAL_BUFFER_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    TOTAL_BUFFER_BYTES.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(amount))
     }).ok();
 }
@@ -372,6 +491,13 @@ impl PendingQueue {
         self.items.len()
     }
 
+    /// Whether the request the next response answers was HEAD / CONNECT (changes its framing).
+    pub fn front_is_head_or_connect(&self) -> (bool, bool) {
+        self.items
+            .front()
+            .map_or((false, false), |r| (r.method == "HEAD", r.method == "CONNECT"))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -405,7 +531,12 @@ impl PendingQueue {
 
     /// Drop requests older than `ttl_ms` whose response was never seen.
     pub fn expire(&mut self, now_ms: u64, ttl_ms: u64) -> usize {
-        let mut expired = 0;
+        self.expire_take(now_ms, ttl_ms).len()
+    }
+
+    /// Remove and return requests older than `ttl_ms` whose response was never seen.
+    pub fn expire_take(&mut self, now_ms: u64, ttl_ms: u64) -> Vec<ParsedRequest> {
+        let mut out = Vec::new();
         while self
             .items
             .front()
@@ -413,10 +544,15 @@ impl PendingQueue {
         {
             if let Some(r) = self.items.pop_front() {
                 self.bytes.sub(r.approx_bytes());
-                expired += 1;
+                out.push(r);
             }
         }
-        expired
+        out
+    }
+
+    /// Remove and return every queued request.
+    pub fn take_all(&mut self) -> Vec<ParsedRequest> {
+        self.expire_take(u64::MAX, 0)
     }
 
     #[cfg(test)]
@@ -464,6 +600,10 @@ impl PendingStreams {
         self.map.contains_key(&stream_id)
     }
 
+    pub fn ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.map.keys().copied()
+    }
+
     /// Append request DATA to a queued request, up to the capture cap.
     pub fn append_body(&mut self, stream_id: u32, data: &[u8], max_total: usize) -> bool {
         let Some(req) = self.map.get_mut(&stream_id) else { return false };
@@ -483,16 +623,24 @@ impl PendingStreams {
 
     /// Drop requests older than `ttl_ms` whose response was never seen.
     pub fn expire(&mut self, now_ms: u64, ttl_ms: u64) -> usize {
-        let stale: Vec<u32> = self
+        self.expire_take(now_ms, ttl_ms).len()
+    }
+
+    /// Remove and return requests older than `ttl_ms`, oldest first.
+    pub fn expire_take(&mut self, now_ms: u64, ttl_ms: u64) -> Vec<ParsedRequest> {
+        let mut stale: Vec<u32> = self
             .map
             .iter()
             .filter(|(_, r)| now_ms.saturating_sub(r.ts_ms) >= ttl_ms)
             .map(|(id, _)| *id)
             .collect();
-        for id in &stale {
-            self.remove(id);
-        }
-        stale.len()
+        stale.sort_unstable();
+        stale.iter().filter_map(|id| self.remove(id)).collect()
+    }
+
+    /// Remove and return every pending request.
+    pub fn take_all(&mut self) -> Vec<ParsedRequest> {
+        self.expire_take(u64::MAX, 0)
     }
 
     #[cfg(test)]
@@ -530,15 +678,20 @@ impl StreamState {
             ws_connections: HashSet::new(),
             known_connections: HashSet::new(),
             conn_born_ms: HashMap::new(),
+            conn_roles: HashMap::new(),
+            gapped_streams: HashSet::new(),
+            h1_decoders: HashMap::new(),
+            h2_prefix: HashMap::new(),
+            ws_remaining: HashMap::new(),
             last_eviction_ms: 0,
             namespace_scope: None,
             scope_drop_logged: HashSet::new(),
         }
     }
 
-    fn evict_stale(&mut self, now_ms: u64) {
+    fn evict_stale(&mut self, now_ms: u64) -> Vec<ApiTrafficEvent> {
         if now_ms.saturating_sub(self.last_eviction_ms) < 10_000 {
-            return;
+            return Vec::new();
         }
         self.last_eviction_ms = now_ms;
 
@@ -549,24 +702,34 @@ impl StreamState {
         let new_buffers_size: usize = self.buffers.values().map(|(b, _)| b.len()).sum();
         freed_bytes += old_buffers_size.saturating_sub(new_buffers_size);
 
+        // Requests whose response never arrived would otherwise sit (and hold memory) until
+        // the connection closes. They leave as events with an explicit outcome (F22); their
+        // bytes are released by PendingBytes as they are removed.
+        let mut unanswered: Vec<(ParsedRequest, &'static str)> = Vec::new();
+        for (key, queue) in self.pending.iter_mut() {
+            let proto = if self.http3_connections.contains(key) { "HTTP/3" } else { "HTTP/1.1" };
+            unanswered.extend(queue.expire_take(now_ms, STREAM_TTL_MS).into_iter().map(|r| (r, proto)));
+        }
+        let mut expired = 0usize;
+        for conn in self.http2_state.values_mut() {
+            let idle = now_ms.saturating_sub(conn.last_event_ts) >= STREAM_TTL_MS;
+            let reqs = if idle {
+                conn.pending_requests.take_all()
+            } else {
+                conn.pending_requests.expire_take(now_ms, STREAM_TTL_MS)
+            };
+            unanswered.extend(reqs.into_iter().map(|r| (r, "HTTP/2")));
+            expired += conn.responses.expire(&conn.pending_requests);
+        }
         // Http2Conn releases everything it holds on Drop, so no byte arithmetic here.
         self.http2_state.retain(|_, conn| now_ms.saturating_sub(conn.last_event_ts) < STREAM_TTL_MS);
         self.h2_early_resp.retain(|_, e| now_ms.saturating_sub(e.seen_ms) < STREAM_TTL_MS);
-
-        // Requests whose response never arrived would otherwise sit (and hold memory) until
-        // the connection closes. Their bytes are released by PendingBytes as they are dropped.
-        let mut expired = 0usize;
-        for queue in self.pending.values_mut() {
-            expired += queue.expire(now_ms, STREAM_TTL_MS);
-        }
-        for conn in self.http2_state.values_mut() {
-            expired += conn.pending_requests.expire(now_ms, STREAM_TTL_MS);
-            expired += conn.responses.expire(&conn.pending_requests);
-        }
+        expired += unanswered.len();
         if expired > 0 {
             PENDING_EXPIRED.fetch_add(expired as u64, Ordering::Relaxed);
         }
         self.pending.retain(|_, queue| !queue.is_empty());
+        let incomplete = self.incomplete_events(unanswered, "no_response_observed");
 
         if self.buffers.len() > MAX_STREAM_ENTRIES {
             let excess = self.buffers.len() - MAX_STREAM_ENTRIES;
@@ -599,44 +762,135 @@ impl StreamState {
                 || self.http3_connections.contains(k);
             if !still_active {
                 ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
-                self.conn_born_ms.remove(&(k.pid, k.ssl_ptr));
+                self.conn_born_ms.remove(&(k.pid, k.ssl_ptr, k.proc_start_ns, k.generation));
             }
             still_active
         });
         // Clean up ws/h3 connections for evicted connections
         self.ws_connections.retain(|k| self.known_connections.contains(k));
         self.http3_connections.retain(|k| self.known_connections.contains(k));
+        self.conn_roles.retain(|k, _| self.known_connections.contains(k));
+        if self.gapped_streams.len() > MAX_STREAM_ENTRIES {
+            self.gapped_streams.clear();
+        }
+        let buffers = &self.buffers;
+        self.h1_decoders.retain(|k, _| buffers.contains_key(k));
+        let known = &self.known_connections;
+        self.h2_prefix.retain(|k, _| known.contains(k));
+        if !self.ws_remaining.is_empty() {
+            let ws: HashSet<(u32, u64, u64, u32)> = self
+                .ws_connections
+                .iter()
+                .map(|c| (c.pid, c.ssl_ptr, c.proc_start_ns, c.generation))
+                .collect();
+            self.ws_remaining
+                .retain(|k, _| ws.contains(&(k.pid, k.ssl_ptr, k.proc_start_ns, k.generation)));
+        }
+        incomplete
     }
 
-    /// Evict a connection by (pid, ssl_ptr), regardless of born_ms.
-    fn evict_connection_by_ptr(&mut self, pid: u32, ssl_ptr: u64) {
+    /// Partial-transaction events, bounded per call; the rest are only counted.
+    fn incomplete_events(&self, reqs: Vec<(ParsedRequest, &'static str)>, outcome: &str) -> Vec<ApiTrafficEvent> {
+        let n = reqs.len();
+        let out: Vec<ApiTrafficEvent> = reqs
+            .into_iter()
+            .take(MAX_INCOMPLETE_PER_SWEEP)
+            .map(|(r, proto)| build_incomplete_event(self.account_id, r, proto, outcome))
+            .collect();
+        if n > out.len() {
+            EVENTS_DROPPED.fetch_add((n - out.len()) as u64, Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// Every request still waiting for a response, as `outcome` events (shutdown).
+    fn take_all_incomplete(&mut self, outcome: &str) -> Vec<ApiTrafficEvent> {
+        let mut reqs: Vec<(ParsedRequest, &'static str)> = Vec::new();
+        for (key, queue) in self.pending.iter_mut() {
+            let proto = if self.http3_connections.contains(key) { "HTTP/3" } else { "HTTP/1.1" };
+            reqs.extend(queue.take_all().into_iter().map(|r| (r, proto)));
+        }
+        for conn in self.http2_state.values_mut() {
+            reqs.extend(conn.pending_requests.take_all().into_iter().map(|r| (r, "HTTP/2")));
+        }
+        self.pending.clear();
+        self.incomplete_events(reqs, outcome)
+    }
+
+    /// Evict one connection incarnation. A close carrying a process start time and generation
+    /// only matches that incarnation, so a stale close cannot evict a reused SSL pointer (F03).
+    /// Records from an older BPF object (zero identity) fall back to (pid, ssl_ptr).
+    fn evict_connection_by_ptr(&mut self, key: &ConnKey) -> Vec<ApiTrafficEvent> {
+        let exact = key.proc_start_ns != 0 || key.generation != 0;
+        let (pid, ssl_ptr, start, generation) = (key.pid, key.ssl_ptr, key.proc_start_ns, key.generation);
+        let hit_conn = |k: &ConnKey| {
+            k.pid == pid && k.ssl_ptr == ssl_ptr && (!exact || (k.proc_start_ns == start && k.generation == generation))
+        };
+        let hit_stream = |k: &StreamKey| {
+            k.pid == pid && k.ssl_ptr == ssl_ptr && (!exact || (k.proc_start_ns == start && k.generation == generation))
+        };
+        let mut unanswered: Vec<(ParsedRequest, &'static str)> = Vec::new();
+        for (k, queue) in self.pending.iter_mut().filter(|(k, _)| hit_conn(k)) {
+            let proto = if self.http3_connections.contains(k) { "HTTP/3" } else { "HTTP/1.1" };
+            unanswered.extend(queue.take_all().into_iter().map(|r| (r, proto)));
+        }
+        for (_, conn) in self.http2_state.iter_mut().filter(|(k, _)| hit_conn(k)) {
+            unanswered.extend(conn.pending_requests.take_all().into_iter().map(|r| (r, "HTTP/2")));
+        }
+        let incomplete = self.incomplete_events(unanswered, "connection_closed");
         let mut freed_bytes: usize = 0;
         self.buffers.retain(|k, (buf, _)| {
-            if k.pid == pid && k.ssl_ptr == ssl_ptr {
+            if hit_stream(k) {
                 freed_bytes += buf.len();
                 false
             } else {
                 true
             }
         });
-        self.pending.retain(|k, _| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
-        self.http2_state.retain(|k, _| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
-        self.h2_early_resp.retain(|k, _| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
-        self.ws_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
-        self.http3_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
+        self.gapped_streams.retain(|k| !hit_stream(k));
+        self.h1_decoders.retain(|k, _| !hit_stream(k));
+        self.ws_remaining.retain(|k, _| !hit_stream(k));
+        self.pending.retain(|k, _| !hit_conn(k));
+        self.http2_state.retain(|k, _| !hit_conn(k));
+        self.h2_early_resp.retain(|k, _| !hit_conn(k));
+        self.ws_connections.retain(|k| !hit_conn(k));
+        self.http3_connections.retain(|k| !hit_conn(k));
+        self.conn_roles.retain(|k, _| !hit_conn(k));
+        self.h2_prefix.retain(|k, _| !hit_conn(k));
 
         let before = self.known_connections.len();
-        self.known_connections.retain(|k| !(k.pid == pid && k.ssl_ptr == ssl_ptr));
+        self.known_connections.retain(|k| !hit_conn(k));
         let evicted = before - self.known_connections.len();
         if evicted > 0 {
             ACTIVE_CONNECTIONS.fetch_sub(evicted as u64, Ordering::Relaxed);
         }
 
-        self.conn_born_ms.remove(&(pid, ssl_ptr));
+        self.conn_born_ms
+            .retain(|&(p, s, st, g), _| !(p == pid && s == ssl_ptr && (!exact || (st == start && g == generation))));
 
         if freed_bytes > 0 {
             release_memory(freed_bytes);
         }
+        incomplete
+    }
+
+    /// Which TLS direction carries requests on this connection (0 = read, 1 = write).
+    /// Explicit roles are diagnostic overrides. `Auto` freezes the first confident inference:
+    /// request/response syntax wins, then the kernel's accept/connect hint. Unknown stays unknown.
+    fn request_direction(&mut self, conn_key: &ConnKey, ev: &TlsEventHeader, payload: &[u8]) -> Option<u8> {
+        match self.role {
+            TrafficRole::Server => return Some(0),
+            TrafficRole::Client => return Some(1),
+            TrafficRole::Auto => {}
+        }
+        if let Some(dir) = self.conn_roles.get(conn_key) {
+            return Some(*dir);
+        }
+        let dir = infer_request_direction(ev.direction, ev.role_hint, payload)?;
+        if self.conn_roles.len() < MAX_STREAM_ENTRIES {
+            self.conn_roles.insert(conn_key.clone(), dir);
+        }
+        Some(dir)
     }
 
     fn net_context_from_event(&self, ev: &TlsEventHeader) -> NetContext {
@@ -655,6 +909,12 @@ impl StreamState {
                 ctx.dest_ip   = Some(Ipv6Addr::from(ev.dst_ip6).to_string());
             }
             _ => {}
+        }
+        // BPF reports the local socket end as src. `ev` carries the request, so a read means this
+        // side is the server and the client is the remote end; source must always be the client.
+        if ev.direction == 0 {
+            std::mem::swap(&mut ctx.source_ip, &mut ctx.dest_ip);
+            std::mem::swap(&mut ctx.source_port, &mut ctx.dest_port);
         }
         ctx.container = self.container_resolver.resolve(ev);
 
@@ -714,22 +974,45 @@ impl StreamState {
         // and was previously double-converted in output.rs, stamping every
         // event with node boot time (Live Feed looked frozen).
         let ts_ms = wall_clock_ms();
-        let born_ms = *self.conn_born_ms.entry((ev.pid, ev.ssl_ptr)).or_insert(ts_ms);
-        let conn_key = ConnKey { pid: ev.pid, ssl_ptr: ev.ssl_ptr, born_ms };
-        let stream_key = StreamKey { pid: ev.pid, ssl_ptr: ev.ssl_ptr, direction: ev.direction };
-        let data_len = payload.len();
+        let born_ms = *self
+            .conn_born_ms
+            .entry((ev.pid, ev.ssl_ptr, ev.proc_start_ns, ev.conn_generation))
+            .or_insert(ts_ms);
+        let conn_key = ConnKey::from_event(ev, born_ms);
+        let stream_key = StreamKey::from_event(ev);
 
-        self.evict_stale(ts_ms);
+        output.extend(self.evict_stale(ts_ms));
 
         // Track active connections
         if self.known_connections.insert(conn_key.clone()) {
             ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         }
 
-        let is_request_dir = match self.role {
-            TrafficRole::Server => ev.direction == 0,
-            TrafficRole::Client => ev.direction == 1,
+        let is_request_dir = match self.request_direction(&conn_key, ev, payload) {
+            Some(dir) => ev.direction == dir,
+            None => {
+                // Server SETTINGS can precede the client preface; keep them for the H2 path.
+                if !looks_like_h2_connection_frames(payload) {
+                    ROLE_AMBIGUOUS.fetch_add(1, Ordering::Relaxed);
+                    return output;
+                }
+                false
+            }
         };
+
+        // A kernel-side truncation means bytes are missing from this direction: never join
+        // across it (F08). HTTP/2 framing/HPACK cannot recover, so the connection is dropped.
+        if ev.is_truncated() {
+            CAPTURE_GAPS.fetch_add(1, Ordering::Relaxed);
+            if self.http2_state.remove(&conn_key).is_some() {
+                return output;
+            }
+            if let Some((buf, _)) = self.buffers.remove(&stream_key) {
+                release_memory(buf.len());
+            }
+            self.h1_decoders.remove(&stream_key);
+            self.gapped_streams.insert(stream_key.clone());
+        }
 
         // HTTP/2 check — only process if already known H2 or preface detected in this event.
         // This avoids creating a shadow buffer for HTTP/1.1 connections.
@@ -738,6 +1021,32 @@ impl StreamState {
         // request body that merely contained that string flip the connection to HTTP/2 and blind
         // the HTTP/1 parser (a trivial evasion).
         let is_known_h2 = self.http2_state.contains_key(&conn_key);
+
+        // The preface may be split across reads (F17). Hold a short first chunk that could
+        // still become the preface; the next chunk decides between HTTP/2 and HTTP/1.
+        let held = if is_request_dir { self.h2_prefix.remove(&conn_key) } else { None };
+        let joined;
+        let payload: &[u8] = match held {
+            Some(mut h) => {
+                h.extend_from_slice(payload);
+                joined = h;
+                &joined
+            }
+            None => payload,
+        };
+        let data_len = payload.len();
+        if !is_known_h2
+            && is_request_dir
+            && !payload.is_empty()
+            && payload.len() < crate::types::HTTP2_PREFACE.len()
+            && crate::types::HTTP2_PREFACE.starts_with(payload)
+            && !self.buffers.contains_key(&stream_key)
+            && self.h2_prefix.len() < MAX_H2_EARLY_CONNS
+        {
+            self.h2_prefix.insert(conn_key, payload.to_vec());
+            return output;
+        }
+
         let starts_h2 = !is_known_h2
             && is_request_dir
             && payload.starts_with(crate::types::HTTP2_PREFACE)
@@ -832,25 +1141,51 @@ impl StreamState {
         // TEXT/PING/PONG with a hardcoded /ws path flooded Live Feed and
         // created a feedback loop with /api/stream/live.
         if self.ws_connections.contains(&conn_key) {
-            let mut pos = 0;
-            while pos < payload.len() {
+            // A frame can span TLS chunks: skip the unread remainder of the previous frame
+            // before looking for the next header, or payload bytes are misread as headers.
+            let mut left = self.ws_remaining.remove(&stream_key).unwrap_or(0);
+            let mut pos = left.min(payload.len() as u64) as usize;
+            left -= pos as u64;
+            while left == 0 && pos < payload.len() {
                 match parse_websocket_frame(&payload[pos..]) {
                     Some((_frame, consumed)) => {
                         if consumed == 0 { break; }
                         PROTO_WEBSOCKET.fetch_add(1, Ordering::Relaxed);
-                        pos += consumed;
+                        let avail = payload.len() - pos;
+                        if consumed > avail {
+                            left = (consumed - avail) as u64;
+                            pos = payload.len();
+                        } else {
+                            pos += consumed;
+                        }
                     }
                     None => break,
                 }
             }
+            if left > 0 && self.ws_remaining.len() < MAX_STREAM_ENTRIES {
+                self.ws_remaining.insert(stream_key, left);
+            }
             return output;
+        }
+
+        // After a gap, resynchronise only on a chunk that begins a new HTTP/1 message.
+        if self.gapped_streams.contains(&stream_key) {
+            if !starts_http1_message(payload) || ev.is_truncated() {
+                return output;
+            }
+            self.gapped_streams.remove(&stream_key);
         }
 
         // HTTP/1.1 parsing — use atomic CAS for memory reservation
         let max_buf = self.max_buffer;
         let max_total = self.max_total_buffer_bytes;
+        let (head_resp, connect_resp) = if is_request_dir {
+            (false, false)
+        } else {
+            self.pending.get(&conn_key).map_or((false, false), PendingQueue::front_is_head_or_connect)
+        };
         let parsed = {
-            let (buf, last_seen) = self.buffers.entry(stream_key).or_insert_with(|| (Vec::new(), ts_ms));
+            let (buf, last_seen) = self.buffers.entry(stream_key.clone()).or_insert_with(|| (Vec::new(), ts_ms));
             *last_seen = ts_ms;
 
             if !reserve_memory(max_total, data_len) {
@@ -859,27 +1194,54 @@ impl StreamState {
             }
             buf.extend_from_slice(payload);
 
+            // Dropping the head of an unparsed message would splice unrelated bytes
+            // together; discard the whole buffer and wait for the next message start.
             if buf.len() > max_buf {
-                let drain = buf.len() - max_buf;
-                release_memory(drain);
-                buf.drain(0..drain);
+                release_memory(buf.len());
+                buf.clear();
+                CAPTURE_GAPS.fetch_add(1, Ordering::Relaxed);
+                self.h1_decoders.remove(&stream_key);
+                self.gapped_streams.insert(stream_key);
+                return output;
             }
 
-            let mut msgs = Vec::new();
-            let before_len = buf.len();
-            while let Some((msg, remaining)) = extract_http_header(buf) {
-                msgs.push(msg);
-                *buf = remaining;
-            }
-            // Account for consumed bytes in memory ceiling
-            let consumed = before_len.saturating_sub(buf.len());
+            let decoder = self
+                .h1_decoders
+                .entry(stream_key.clone())
+                .or_insert_with(|| Http1Decoder::new(MAX_BODY_CAPTURE_BYTES));
+            let (consumed, items) = decoder.feed(buf, head_resp, connect_resp);
+            // Only an incomplete header/chunk line stays buffered; bodies are consumed as they arrive.
+            buf.drain(..consumed);
             if consumed > 0 {
                 release_memory(consumed);
             }
-            msgs
+            items
         };
 
-        for msg in parsed {
+        let mut msgs = Vec::with_capacity(parsed.len());
+        for item in parsed {
+            match item {
+                Http1Item::Message(m) => {
+                    if m.body_truncated || m.partial {
+                        BODIES_TRUNCATED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    msgs.push(m.msg);
+                }
+                Http1Item::Invalid(reason) => {
+                    H1_PARSE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(reason, pid = ev.pid, "HTTP/1 framing invalid; resynchronising");
+                    if let Some((buf, _)) = self.buffers.get_mut(&stream_key) {
+                        release_memory(buf.len());
+                        buf.clear();
+                    }
+                    self.h1_decoders.remove(&stream_key);
+                    self.gapped_streams.insert(stream_key.clone());
+                    break;
+                }
+            }
+        }
+
+        for msg in msgs {
             match msg {
                 HttpMessage::Request(req) => {
                     if is_request_dir && is_usable_http_request(&req.method, &req.path) {
@@ -902,6 +1264,10 @@ impl StreamState {
                     if is_request_dir {
                         continue;
                     }
+                    // 1xx (other than 101) is interim: the final response still answers the request.
+                    if (100..200).contains(&resp.status_code) && resp.status_code != 101 {
+                        continue;
+                    }
 
                     // Check for WebSocket upgrade
                     let upgrade_hdr = resp.headers.get("upgrade").map(|v| v.to_lowercase());
@@ -909,7 +1275,7 @@ impl StreamState {
                         self.ws_connections.insert(conn_key.clone());
                     }
 
-                    let is_mcp = is_mcp_response(&resp.headers);
+                    let is_sse = is_mcp_response(&resp.headers);
                     let upgrade = upgrade_hdr.as_deref() == Some("websocket");
 
                     let Some(request) = self.pending.entry(conn_key.clone()).or_default().pop_usable() else {
@@ -917,6 +1283,19 @@ impl StreamState {
                         continue;
                     };
                     let latency_ms = ts_ms.saturating_sub(request.ts_ms);
+                    // The SSE body carries the JSON-RPC call. The raw TLS chunk
+                    // may be only the tail of the headers.
+                    let request_calls = parse_jsonrpc_request(&request.body);
+                    let mcp_events = if !request_calls.is_empty() {
+                        request_calls
+                    } else if is_sse {
+                        let source: &[u8] = if resp.body.is_empty() { payload } else { &resp.body };
+                        parse_sse_events(source)
+                    } else {
+                        Vec::new()
+                    };
+                    // SSE is a transport, not a protocol: only JSON-RPC 2.0 content makes it MCP.
+                    let is_mcp = !mcp_events.is_empty();
                     // The upgrade itself is the WebSocket event. Later frames are
                     // counted, not emitted: per-frame events on /api/stream/live
                     // fed the live feed back into itself.
@@ -926,14 +1305,6 @@ impl StreamState {
                         "WebSocket"
                     } else {
                         "HTTP/1.1"
-                    };
-                    // The SSE body carries the JSON-RPC call. The raw TLS chunk
-                    // may be only the tail of the headers.
-                    let mcp_events = if is_mcp {
-                        let source: &[u8] = if resp.body.is_empty() { payload } else { &resp.body };
-                        parse_sse_events(source)
-                    } else {
-                        Vec::new()
                     };
                     let mut event = build_event(
                         self.account_id,
@@ -1046,20 +1417,29 @@ impl StreamState {
                     } else if !conn.responses.merge_trailers(stream_id, headers, max_total) {
                         continue;
                     }
-                    if end_stream || conn.responses.body_full(stream_id) {
+                    // Completion is END_STREAM only: a full preview must not end the stream
+                    // before its trailers (e.g. a final grpc-status) arrive (F17).
+                    if end_stream {
                         Self::finish_h2_response(conn, stream_id, ts_ms, account_id, &mut output);
                     }
                 }
                 H2Item::Data { stream_id, data, end_stream } => {
-                    if conn.responses.append(stream_id, &data, max_total)
-                        && (end_stream || conn.responses.body_full(stream_id))
-                    {
+                    if conn.responses.append(stream_id, &data, max_total) && end_stream {
                         Self::finish_h2_response(conn, stream_id, ts_ms, account_id, &mut output);
                     }
                 }
                 H2Item::Reset { stream_id } => {
                     conn.responses.take(stream_id);
                     conn.pending_requests.remove(&stream_id);
+                }
+                H2Item::GoAway { last_stream_id } => {
+                    // Streams the peer never processed will be retried elsewhere; they have no
+                    // response on this connection and must not wait to be paired.
+                    let dropped: Vec<u32> = conn.pending_requests.ids().filter(|id| *id > last_stream_id).collect();
+                    for id in dropped {
+                        conn.responses.take(id);
+                        conn.pending_requests.remove(&id);
+                    }
                 }
             }
         }
@@ -1168,7 +1548,7 @@ fn compute_anomaly_features(path: &str, query: &HashMap<String, String>, body_le
 /// that could otherwise overflow `usize`.
 fn reserve_memory(max_total: usize, additional: usize) -> bool {
     TOTAL_BUFFER_BYTES
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             match current.checked_add(additional) {
                 Some(next) if next <= max_total => Some(next),
                 _ => None,
@@ -1229,6 +1609,7 @@ pub fn build_ws_event(
         user_role: None,
         session_id: None,
         auth_session_id: None,
+        outcome: None,
     }
 }
 
@@ -1316,11 +1697,27 @@ pub fn build_event(
         dest_hostname: net_ctx.dest_hostname,
         metadata: None,
         anomaly_features: Some(anomaly),
+        // F04: identity claims (user_id, role, JWT `jti`) are attacker-controlled and
+        // unverified — apply the same redaction policy to every one of them. Do not treat
+        // an observed role/jti as authorization evidence.
         user_id: Some(redact_pii(&identity.user_id)),
-        user_role: Some(identity.user_role),
+        user_role: Some(redact_pii(&identity.user_role)),
         session_id: Some(identity.session_id),
-        auth_session_id: Some(identity.auth_session_id),
+        auth_session_id: Some(redact_pii(&identity.auth_session_id)),
+        outcome: None,
     }
+}
+
+/// A request whose response was never observed. The response stays empty (status 0, no
+/// latency) rather than being invented; `outcome` says why it is missing.
+pub fn build_incomplete_event(account_id: u64, req: ParsedRequest, protocol: &str, outcome: &str) -> ApiTrafficEvent {
+    let ts_ms = req.ts_ms;
+    let empty = HttpResponseParsed { status_code: 0, headers: HashMap::new(), body: Vec::new() };
+    let mut ev = build_event(account_id, ts_ms, req, empty, 0, protocol, "ebpf");
+    ev.response.latency_ms = None;
+    ev.outcome = Some(outcome.to_string());
+    TRANSACTIONS_INCOMPLETE.fetch_add(1, Ordering::Relaxed);
+    ev
 }
 
 #[cfg(test)]
@@ -1360,7 +1757,144 @@ mod tests {
             dst_ip4: u32::from_be_bytes([10, 244, 0, 1]),
             src_ip6: [0; 16],
             dst_ip6: [0; 16],
+            ..TlsEventHeader::blank()
         }
+    }
+
+    fn auto_state() -> ShardedStreamState {
+        crate::redaction::init_pii_hash_key_for_tests(&[0x11u8; 32]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (dtx, _drx) = tokio::sync::mpsc::channel(8);
+        ShardedStreamState::new(
+            1,
+            TrafficRole::Auto,
+            65_536,
+            Arc::new(ContainerResolver::new(tx, "test-node".into())),
+            10_485_760,
+            Arc::new(DnsResolver::new(dtx)),
+        )
+    }
+
+    fn ev_on(ssl_ptr: u64, direction: u8) -> TlsEventHeader {
+        TlsEventHeader { ssl_ptr, ..tls_event(direction) }
+    }
+
+    #[test]
+    fn auto_role_pairs_inbound_and_outbound_in_one_process() {
+        let state = auto_state();
+        // Inbound A→B on 0x1: request is read, response is written.
+        assert!(state.handle_event(&ev_on(0x1, 0), b"GET /inbound HTTP/1.1\r\nHost: b\r\n\r\n").is_empty());
+        // Outbound B→C on 0x2: request is written, response is read.
+        assert!(state.handle_event(&ev_on(0x2, 1), b"POST /outbound HTTP/1.1\r\nHost: c\r\nContent-Length: 0\r\n\r\n").is_empty());
+        let out = state.handle_event(&ev_on(0x2, 0), b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n");
+        let inb = state.handle_event(&ev_on(0x1, 1), b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].request.path.as_str(), out[0].response.status_code), ("/outbound", 201));
+        assert_eq!(inb.len(), 1);
+        assert_eq!((inb[0].request.path.as_str(), inb[0].response.status_code), ("/inbound", 200));
+    }
+
+    #[test]
+    fn source_is_the_client_whichever_side_captured_the_transaction() {
+        let state = auto_state();
+        let client = (u32::from_be_bytes([10, 0, 0, 5]), 51000u16);
+        let server = (u32::from_be_bytes([10, 0, 0, 9]), 8445u16);
+        // The kernel reports the local socket end as src: the server sees itself as src.
+        let on = |ssl_ptr, direction, local: (u32, u16), remote: (u32, u16)| TlsEventHeader {
+            src_ip4: local.0.to_be(), src_port: local.1, dst_ip4: remote.0.to_be(), dst_port: remote.1,
+            ..ev_on(ssl_ptr, direction)
+        };
+        assert!(state.handle_event(&on(0x1, 0, server, client), b"GET /in HTTP/1.1\r\nHost: s\r\n\r\n").is_empty());
+        let inbound = state.handle_event(&on(0x1, 1, server, client), b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert!(state.handle_event(&on(0x2, 1, client, server), b"GET /out HTTP/1.1\r\nHost: s\r\n\r\n").is_empty());
+        let outbound = state.handle_event(&on(0x2, 0, client, server), b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        for ev in [&inbound[0], &outbound[0]] {
+            assert_eq!(ev.source_ip.as_deref(), Some("10.0.0.5"), "{}", ev.request.path);
+            assert_eq!(ev.source_port, Some(51000), "{}", ev.request.path);
+            assert_eq!(ev.dest_ip.as_deref(), Some("10.0.0.9"), "{}", ev.request.path);
+            assert_eq!(ev.dest_port, Some(8445), "{}", ev.request.path);
+        }
+    }
+
+    #[test]
+    fn auto_role_uses_the_kernel_hint_when_syntax_is_inconclusive() {
+        assert_eq!(infer_request_direction(0, ROLE_HINT_SERVER, b"\x00\x01"), Some(0));
+        assert_eq!(infer_request_direction(1, ROLE_HINT_CLIENT, b"\x00\x01"), Some(1));
+        assert_eq!(infer_request_direction(0, ROLE_HINT_UNKNOWN, b"\x00\x01"), None);
+        // Syntax wins over a conflicting hint.
+        assert_eq!(infer_request_direction(1, ROLE_HINT_SERVER, b"GET / HTTP/1.1\r\n"), Some(1));
+    }
+
+    #[test]
+    fn truncated_chunk_is_not_joined_with_the_next_one() {
+        let state = test_state();
+        let before = CAPTURE_GAPS.load(Ordering::Relaxed);
+        let mut ev = tls_event(0);
+        ev.actual_len = 40_000;
+        ev.copied_len = 10;
+        ev.flags = TLS_FLAG_TRUNCATED;
+        // Headers promise 50 body bytes; the tail was never captured.
+        state.handle_event(&ev, b"POST /big HTTP/1.1\r\nContent-Length: 50\r\n\r\n");
+        // The next chunk is not the missing tail; it must not complete the old request.
+        state.handle_event(&tls_event(0), &[b'z'; 50]);
+        let resp = state.handle_event(&tls_event(1), b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert!(resp.is_empty(), "no request may be fabricated across a gap: {resp:?}");
+        assert!(CAPTURE_GAPS.load(Ordering::Relaxed) > before);
+        // A new message start resynchronises the direction.
+        state.handle_event(&tls_event(0), b"GET /after HTTP/1.1\r\n\r\n");
+        let ok = state.handle_event(&tls_event(1), b"HTTP/1.1 204 No Content\r\n\r\n");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].request.path, "/after");
+    }
+
+    #[test]
+    fn same_tls_pointer_in_two_processes_never_shares_state() {
+        let state = test_state();
+        let a = TlsEventHeader { pid: 100, proc_start_ns: 1, ..tls_event(0) };
+        let b = TlsEventHeader { pid: 200, proc_start_ns: 2, ..tls_event(1) };
+        state.handle_event(&a, b"GET /a HTTP/1.1\r\n\r\n");
+        let crossed = state.handle_event(&b, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert!(crossed.is_empty(), "process B's response paired with process A's request");
+    }
+
+    #[test]
+    fn stale_close_does_not_evict_a_reused_pointer() {
+        let state = test_state();
+        let gen1 = TlsEventHeader { conn_generation: 1, proc_start_ns: 7, ..tls_event(0) };
+        state.handle_event(&gen1, b"GET /reused HTTP/1.1\r\n\r\n");
+        // Close for generation 0 arrives late.
+        state.evict_connection(&ConnKey { pid: 42, ssl_ptr: 0x1000, born_ms: 0, proc_start_ns: 7, generation: 0 });
+        let resp = TlsEventHeader { conn_generation: 1, proc_start_ns: 7, ..tls_event(1) };
+        let out = state.handle_event(&resp, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(out.len(), 1, "generation 1 state must survive generation 0's close");
+    }
+
+    #[test]
+    fn transaction_sampling_keeps_pairs_intact_and_is_deterministic() {
+        let s = TransactionSampler { default_rate: 50, health_rate: 0 };
+        let mut kept = 0;
+        for i in 0..200u16 {
+            let ev = ApiTrafficEvent {
+                request: ApiRequest { method: "GET".into(), path: format!("/items/{i}"), ..Default::default() },
+                source_port: Some(i),
+                observed_at: 1,
+                ..Default::default()
+            };
+            let first = s.keep(&ev);
+            assert_eq!(first, s.keep(&ev), "decision must be deterministic");
+            if first { kept += 1; }
+        }
+        assert!((60..=140).contains(&kept), "≈50% expected, kept {kept}");
+        let health = ApiTrafficEvent {
+            request: ApiRequest { method: "GET".into(), path: "/healthz".into(), ..Default::default() },
+            ..Default::default()
+        };
+        assert!(!s.keep(&health));
+        let auth = ApiTrafficEvent {
+            request: ApiRequest { method: "POST".into(), path: "/login".into(), ..Default::default() },
+            ..Default::default()
+        };
+        assert!(TransactionSampler { default_rate: 0, health_rate: 0 }.keep(&auth));
     }
 
     #[test]
@@ -1404,6 +1938,34 @@ mod tests {
         let meta = events[0].metadata.as_ref().expect("mcp metadata");
         assert_eq!(meta.mcp_method.as_deref(), Some("tools/call"));
         assert_eq!(meta.mcp_tool_name.as_deref(), Some("read_file"));
+    }
+
+    #[test]
+    fn mcp_call_answered_with_plain_json_is_still_mcp() {
+        let state = test_state();
+        let body = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_file"}}"#;
+        let req = format!("POST /mcp HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        assert!(state.handle_event(&tls_event(0), req.as_bytes()).is_empty());
+        let resp_body = r#"{"jsonrpc":"2.0","id":7,"result":{}}"#;
+        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{resp_body}", resp_body.len());
+        let events = state.handle_event(&tls_event(1), resp.as_bytes());
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].protocol, "MCP");
+        let meta = events[0].metadata.as_ref().expect("mcp metadata");
+        assert_eq!(meta.mcp_method.as_deref(), Some("tools/call"));
+        assert_eq!(meta.mcp_tool_name.as_deref(), Some("read_file"));
+    }
+
+    #[test]
+    fn ordinary_json_request_is_not_labelled_mcp() {
+        let state = test_state();
+        let body = r#"{"method":"card","amount":5}"#;
+        let req = format!("POST /pay HTTP/1.1\r\nHost: h\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        assert!(state.handle_event(&tls_event(0), req.as_bytes()).is_empty());
+        let events = state.handle_event(&tls_event(1), b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].protocol, "HTTP/1.1");
+        assert!(events[0].metadata.is_none());
     }
 
     #[test]
@@ -1842,6 +2404,64 @@ mod tests {
     }
 
     #[test]
+    fn h2_preface_split_across_reads_is_still_detected() {
+        let req = client_bytes(&[h2_request(1, 2, "/split", &[], F_END_HEADERS | F_END_STREAM)]);
+        for split in [1usize, 3, 7, 13] {
+            let state = test_state();
+            assert!(state.handle_event(&ev_at(0), &req[..split]).is_empty());
+            assert!(state.handle_event(&ev_at(0), &req[split..]).is_empty());
+            let resp = h2_status_headers(1, 8, &[], F_END_HEADERS | F_END_STREAM);
+            let events = state.handle_event(&ev_at(1), &resp);
+            assert_eq!(events.len(), 1, "split at {split}");
+            assert_eq!(events[0].protocol, "HTTP/2");
+            assert_eq!(events[0].request.path, "/split");
+        }
+    }
+
+    #[test]
+    fn short_first_chunk_that_is_not_the_preface_stays_http1() {
+        let state = test_state();
+        state.handle_event(&ev_at(0), b"P");
+        state.handle_event(&ev_at(0), b"OST /p HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+        let events = state.handle_event(&ev_at(1), b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request.method, "POST");
+    }
+
+    #[test]
+    fn h2_response_past_the_preview_cap_waits_for_trailers() {
+        let state = test_state();
+        let req = client_bytes(&[h2_request(1, 2, "/grpc", &[], F_END_HEADERS | F_END_STREAM)]);
+        state.handle_event(&ev_at(0), &req);
+        state.handle_event(&ev_at(1), &h2_status_headers(1, 8, &[], F_END_HEADERS));
+        let big = vec![b'x'; MAX_BODY_CAPTURE_BYTES + 100];
+        let early = state.handle_event(&ev_at(1), &h2_frame(0x00, 0, 1, &big));
+        assert!(early.is_empty(), "a full preview must not complete the stream before END_STREAM");
+        let trailers = lit_new_name("grpc-status", "13");
+        let done = state.handle_event(&ev_at(1), &h2_frame(0x01, F_END_HEADERS | F_END_STREAM, 1, &trailers));
+        assert_eq!(done.len(), 1);
+    }
+
+    #[test]
+    fn goaway_releases_streams_the_peer_never_processed() {
+        let state = test_state();
+        let req = client_bytes(&[
+            h2_request(1, 2, "/one", &[], F_END_HEADERS | F_END_STREAM),
+            h2_request(3, 2, "/three", &[], F_END_HEADERS | F_END_STREAM),
+        ]);
+        state.handle_event(&ev_at(0), &req);
+        let mut goaway = 1u32.to_be_bytes().to_vec();
+        goaway.extend_from_slice(&0u32.to_be_bytes());
+        state.handle_event(&ev_at(1), &h2_frame(0x07, 0, 0, &goaway));
+        let pending: usize = state
+            .shards
+            .iter()
+            .map(|s| s.lock().unwrap().http2_state.values().map(|c| c.pending_requests.len()).sum::<usize>())
+            .sum();
+        assert_eq!(pending, 1, "stream 3 was above last-stream-id and must be released");
+    }
+
+    #[test]
     fn h2_request_body_is_captured_and_redacted() {
         let state = test_state();
         let ct = lit_new_name("content-type", "application/json");
@@ -1939,6 +2559,88 @@ mod tests {
     }
 
     #[test]
+    fn plain_server_sent_events_are_not_labelled_mcp() {
+        let state = test_state();
+        assert!(state.handle_event(&tls_event(0), b"GET /prices HTTP/1.1\r\nHost: h\r\n\r\n").is_empty());
+        let body = "data: {\"price\": 3}\n\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let events = state.handle_event(&tls_event(1), resp.as_bytes());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].protocol, "HTTP/1.1", "SSE without JSON-RPC 2.0 is not MCP");
+        assert!(events[0].metadata.is_none());
+    }
+
+    #[test]
+    fn a_websocket_frame_spanning_chunks_does_not_desynchronise_the_stream() {
+        let state = test_state();
+        let req = "GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        assert!(state.handle_event(&tls_event(0), req.as_bytes()).is_empty());
+        let resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        assert_eq!(state.handle_event(&tls_event(1), resp.as_bytes()).len(), 1);
+
+        let ev = tls_event(1);
+        let key = StreamKey::from_event(&ev);
+        let remaining = |s: &ShardedStreamState| -> Option<u64> {
+            s.shards.iter().find_map(|sh| sh.lock().unwrap().ws_remaining.get(&key).copied())
+        };
+        // 200-byte text frame (126 => 16-bit length), only 50 payload bytes in this chunk.
+        let mut first = vec![0x81, 126, 0, 200];
+        first.extend(std::iter::repeat(b'a').take(50));
+        state.handle_event(&ev, &first);
+        assert_eq!(remaining(&state), Some(150));
+
+        // The rest of that frame, then a complete 3-byte frame.
+        let mut second: Vec<u8> = std::iter::repeat(b'a').take(150).collect();
+        second.extend_from_slice(&[0x81, 3, b'h', b'i', b'!']);
+        state.handle_event(&ev, &second);
+        assert_eq!(remaining(&state), None, "both frames consumed exactly");
+    }
+
+    #[test]
+    fn a_request_whose_connection_closes_unanswered_is_reported_not_dropped() {
+        let state = test_state();
+        let ev = tls_event(0);
+        assert!(state.handle_event(&ev, b"GET /orders/7 HTTP/1.1\r\nHost: h\r\n\r\n").is_empty());
+        let close = ConnKey::from_event(&ev, 0);
+        let out = state.evict_connection(&close);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].request.path, "/orders/7");
+        assert_eq!(out[0].outcome.as_deref(), Some("connection_closed"));
+        assert_eq!(out[0].response.status_code, 0, "no status is invented");
+        assert!(out[0].response.latency_ms.is_none());
+        assert!(state.evict_connection(&close).is_empty(), "reported once");
+    }
+
+    #[test]
+    fn an_unanswered_request_expires_into_an_event_without_further_traffic() {
+        let state = test_state();
+        assert!(state.handle_event(&tls_event(0), b"POST /pay HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n").is_empty());
+        let later = wall_clock_ms() + STREAM_TTL_MS + 20_000;
+        let out: Vec<ApiTrafficEvent> = state
+            .shards
+            .iter()
+            .flat_map(|s| s.lock().unwrap().evict_stale(later))
+            .collect();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].request.method, "POST");
+        assert_eq!(out[0].outcome.as_deref(), Some("no_response_observed"));
+        assert!(state.drain_incomplete("sensor_shutdown").is_empty(), "nothing left pending");
+    }
+
+    #[test]
+    fn shutdown_reports_every_pending_request() {
+        let state = test_state();
+        assert!(state.handle_event(&tls_event(0), b"GET /a HTTP/1.1\r\nHost: h\r\n\r\nGET /b HTTP/1.1\r\nHost: h\r\n\r\n").is_empty());
+        let out = state.drain_incomplete("sensor_shutdown");
+        let paths: Vec<&str> = out.iter().map(|e| e.request.path.as_str()).collect();
+        assert_eq!(paths, vec!["/a", "/b"]);
+        assert!(out.iter().all(|e| e.outcome.as_deref() == Some("sensor_shutdown")));
+    }
+
+    #[test]
     fn http1_body_containing_the_h2_preface_cannot_blind_the_http1_parser() {
         let state = test_state();
         // An attacker (or any client) sends an HTTP/1 request whose BODY contains the HTTP/2
@@ -1980,7 +2682,7 @@ mod tests {
             })
             .sum();
         assert!(held > 0, "the partial frame should be buffered");
-        state.evict_connection(&ConnKey { pid: 42, ssl_ptr: 0x1000, born_ms: 0 });
+        state.evict_connection(&ConnKey { pid: 42, ssl_ptr: 0x1000, born_ms: 0, proc_start_ns: 0, generation: 0 });
         let left: usize = state.shards.iter().map(|s| s.lock().unwrap().http2_state.len()).sum();
         assert_eq!(left, 0);
     }
@@ -2120,7 +2822,7 @@ mod tests {
         let frame = server_settings_frame();
         assert!(state.handle_event(&ev_conn(1, 1), &frame).is_empty());
         assert_eq!(early_held(&state), (1, frame.len()));
-        state.evict_connection(&ConnKey { pid: 42, ssl_ptr: 0x5001, born_ms: 0 });
+        state.evict_connection(&ConnKey { pid: 42, ssl_ptr: 0x5001, born_ms: 0, proc_start_ns: 0, generation: 0 });
         assert_eq!(early_held(&state), (0, 0), "held bytes must go away with the connection");
     }
 

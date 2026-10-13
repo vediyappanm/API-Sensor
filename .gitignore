@@ -5,3 +5,4 @@ bpf/http_trace.bpf.o
 *.swp
 *.tmp
 api-sec-sensor
+__pycache__/

@@ -1,7 +1,12 @@
 version: "3.8"
 
 # APISentinel Sensor — Integration Test Harness
-# Usage: docker-compose up -d && cargo test --test integration
+# Usage:
+#   docker-compose up -d
+#   SENSOR_INTEGRATION=1 cargo test --manifest-path userspace/Cargo.toml \
+#     --test integration_test --locked -- --test-threads=1
+# Level 2 (live sensor, root required) additionally sets SENSOR_RUNNING=1 and
+# runs the sensor with --ingest http://localhost:19999/ingest (note /ingest).
 
 services:
 

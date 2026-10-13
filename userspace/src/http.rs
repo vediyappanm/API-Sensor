@@ -59,9 +59,10 @@ pub fn decode_chunked_body(data: &[u8]) -> Option<(Vec<u8>, usize)> {
             return Some((body, pos));
         }
 
-        if pos + chunk_size + 2 > data.len() { return None; }
+        let end = pos.checked_add(chunk_size)?.checked_add(2)?;
+        if end > data.len() { return None; }
         body.extend_from_slice(&data[pos..pos + chunk_size]);
-        pos += chunk_size + 2;
+        pos = end;
     }
 }
 
@@ -145,14 +146,364 @@ fn split_body(
 }
 
 pub fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> HashMap<String, String> {
-    let mut headers = HashMap::new();
+    let mut headers: HashMap<String, String> = HashMap::new();
     for line in lines {
         if line.is_empty() { break; }
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_lowercase(), v.trim().to_string());
+            let (k, v) = (k.trim().to_lowercase(), v.trim());
+            // Repeated fields are combined (RFC 9110 §5.3) rather than silently overwritten.
+            match headers.get_mut(&k) {
+                Some(existing) => {
+                    existing.push_str(if k == "set-cookie" { "\n" } else { ", " });
+                    existing.push_str(v);
+                }
+                None => {
+                    headers.insert(k, v.to_string());
+                }
+            }
         }
     }
     headers
+}
+
+// ---------------------------------------------------------------------------
+// Incremental HTTP/1.x framing (RFC 9112 §6–7)
+// ---------------------------------------------------------------------------
+
+/// Header blocks larger than this are treated as invalid framing.
+pub const MAX_HTTP1_HEADER_BYTES: usize = 64 * 1024;
+const MAX_CHUNK_LINE: usize = 1024;
+
+/// One decoded HTTP/1 message with body completeness evidence.
+#[derive(Debug)]
+pub struct Http1Message {
+    pub msg: HttpMessage,
+    /// Body bytes seen on the wire (after chunk decoding).
+    pub body_total: u64,
+    /// The retained body is shorter than `body_total` (preview cap).
+    pub body_truncated: bool,
+    /// The message ended before its framing said it should (close-delimited or upgraded).
+    pub partial: bool,
+}
+
+#[derive(Debug)]
+pub enum Http1Item {
+    Message(Http1Message),
+    /// Framing could not be parsed; the caller must resynchronise.
+    Invalid(&'static str),
+}
+
+#[derive(Debug)]
+enum Body {
+    Fixed(u64),
+    ChunkSize,
+    ChunkData(u64),
+    ChunkCrlf,
+    Trailers,
+}
+
+#[derive(Debug, Default)]
+enum Http1State {
+    #[default]
+    Head,
+    Body { pending: Box<Http1Message>, body: Body },
+    /// After `101 Switching Protocols` or a `CONNECT` 2xx: bytes are not HTTP/1.
+    Upgraded,
+    /// A response with no length: everything until close is body; never re-parsed as HTTP.
+    UntilClose,
+}
+
+/// Incremental per-direction HTTP/1 decoder. Feed bytes in order; it reports how many were
+/// consumed. Only an incomplete header line/block is left for the caller to retain, so body
+/// size does not drive buffer size: bodies are counted in full and previewed up to `preview_cap`.
+#[derive(Debug)]
+pub struct Http1Decoder {
+    state: Http1State,
+    preview_cap: usize,
+}
+
+impl Http1Decoder {
+    pub fn new(preview_cap: usize) -> Self {
+        Self { state: Http1State::Head, preview_cap }
+    }
+
+    pub fn is_idle(&self) -> bool {
+        matches!(self.state, Http1State::Head)
+    }
+
+    pub fn is_upgraded(&self) -> bool {
+        matches!(self.state, Http1State::Upgraded | Http1State::UntilClose)
+    }
+
+    /// Decode from `buf`. `response_to_head` says the next response answers a HEAD request
+    /// (and `response_to_connect` a CONNECT), which changes how its body is framed.
+    /// Returns (bytes consumed, completed items).
+    pub fn feed(
+        &mut self,
+        buf: &[u8],
+        response_to_head: bool,
+        response_to_connect: bool,
+    ) -> (usize, Vec<Http1Item>) {
+        let mut pos = 0usize;
+        let mut out = Vec::new();
+        loop {
+            match std::mem::take(&mut self.state) {
+                Http1State::Upgraded => {
+                    self.state = Http1State::Upgraded;
+                    return (buf.len(), out);
+                }
+                Http1State::UntilClose => {
+                    self.state = Http1State::UntilClose;
+                    return (buf.len(), out);
+                }
+                Http1State::Head => {
+                    let rest = &buf[pos..];
+                    let Some(end) = rest.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        if rest.len() > MAX_HTTP1_HEADER_BYTES {
+                            out.push(Http1Item::Invalid("header block too large"));
+                            return (buf.len(), out);
+                        }
+                        return (pos, out);
+                    };
+                    let head = &rest[..end + 4];
+                    pos += end + 4;
+                    match parse_head(head, response_to_head, response_to_connect) {
+                        Ok((msg, framing)) => {
+                            let pending = Box::new(Http1Message { msg, body_total: 0, body_truncated: false, partial: false });
+                            match framing {
+                                Framing::None => out.push(Http1Item::Message(*pending)),
+                                Framing::Upgrade => {
+                                    out.push(Http1Item::Message(*pending));
+                                    self.state = Http1State::Upgraded;
+                                    return (buf.len(), out);
+                                }
+                                Framing::Fixed(0) => out.push(Http1Item::Message(*pending)),
+                                Framing::Fixed(n) => self.state = Http1State::Body { pending, body: Body::Fixed(n) },
+                                Framing::Chunked => self.state = Http1State::Body { pending, body: Body::ChunkSize },
+                                Framing::UntilClose => {
+                                    let mut m = *pending;
+                                    let take = (buf.len() - pos).min(self.preview_cap);
+                                    append_body(&mut m.msg, &buf[pos..pos + take]);
+                                    m.body_total = (buf.len() - pos) as u64;
+                                    m.body_truncated = take < buf.len() - pos;
+                                    m.partial = true;
+                                    out.push(Http1Item::Message(m));
+                                    self.state = Http1State::UntilClose;
+                                    return (buf.len(), out);
+                                }
+                            }
+                        }
+                        Err(reason) => {
+                            out.push(Http1Item::Invalid(reason));
+                            return (buf.len(), out);
+                        }
+                    }
+                }
+                Http1State::Body { mut pending, body } => {
+                    let rest = &buf[pos..];
+                    match body {
+                        Body::Fixed(remaining) => {
+                            let take = (rest.len() as u64).min(remaining) as usize;
+                            self.preview(&mut pending, &rest[..take]);
+                            pos += take;
+                            let left = remaining - take as u64;
+                            if left == 0 {
+                                out.push(Http1Item::Message(*pending));
+                            } else {
+                                self.state = Http1State::Body { pending, body: Body::Fixed(left) };
+                                return (pos, out);
+                            }
+                        }
+                        Body::ChunkSize => {
+                            let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") else {
+                                if rest.len() > MAX_CHUNK_LINE {
+                                    out.push(Http1Item::Invalid("chunk size line too long"));
+                                    return (buf.len(), out);
+                                }
+                                self.state = Http1State::Body { pending, body: Body::ChunkSize };
+                                return (pos, out);
+                            };
+                            let line = std::str::from_utf8(&rest[..eol]).unwrap_or("");
+                            let hex = line.split(';').next().unwrap_or("").trim();
+                            let size = match u64::from_str_radix(hex, 16) {
+                                Ok(s) if !hex.is_empty() && hex.len() <= 16 => s,
+                                _ => {
+                                    out.push(Http1Item::Invalid("bad chunk size"));
+                                    return (buf.len(), out);
+                                }
+                            };
+                            pos += eol + 2;
+                            let body = if size == 0 { Body::Trailers } else { Body::ChunkData(size) };
+                            self.state = Http1State::Body { pending, body };
+                        }
+                        Body::ChunkData(remaining) => {
+                            let take = (rest.len() as u64).min(remaining) as usize;
+                            self.preview(&mut pending, &rest[..take]);
+                            pos += take;
+                            let left = remaining - take as u64;
+                            let body = if left == 0 { Body::ChunkCrlf } else { Body::ChunkData(left) };
+                            let stop = left != 0;
+                            self.state = Http1State::Body { pending, body };
+                            if stop {
+                                return (pos, out);
+                            }
+                        }
+                        Body::ChunkCrlf => {
+                            if rest.len() < 2 {
+                                self.state = Http1State::Body { pending, body: Body::ChunkCrlf };
+                                return (pos, out);
+                            }
+                            if &rest[..2] != b"\r\n" {
+                                out.push(Http1Item::Invalid("missing CRLF after chunk"));
+                                return (buf.len(), out);
+                            }
+                            pos += 2;
+                            self.state = Http1State::Body { pending, body: Body::ChunkSize };
+                        }
+                        Body::Trailers => {
+                            // Trailer section: zero or more fields, then an empty line.
+                            let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") else {
+                                if rest.len() > MAX_HTTP1_HEADER_BYTES {
+                                    out.push(Http1Item::Invalid("trailers too large"));
+                                    return (buf.len(), out);
+                                }
+                                self.state = Http1State::Body { pending, body: Body::Trailers };
+                                return (pos, out);
+                            };
+                            let line = &rest[..eol];
+                            pos += eol + 2;
+                            if line.is_empty() {
+                                out.push(Http1Item::Message(*pending));
+                            } else {
+                                if let Ok(s) = std::str::from_utf8(line) {
+                                    if let Some((k, v)) = s.split_once(':') {
+                                        let hdrs = headers_mut(&mut pending.msg);
+                                        hdrs.entry(k.trim().to_lowercase()).or_insert_with(|| v.trim().to_string());
+                                    }
+                                }
+                                self.state = Http1State::Body { pending, body: Body::Trailers };
+                            }
+                        }
+                    }
+                }
+            }
+            if pos >= buf.len() && matches!(self.state, Http1State::Head) {
+                return (pos, out);
+            }
+        }
+    }
+
+    fn preview(&self, m: &mut Http1Message, bytes: &[u8]) {
+        m.body_total = m.body_total.saturating_add(bytes.len() as u64);
+        let have = body_len(&m.msg);
+        let room = self.preview_cap.saturating_sub(have);
+        let take = bytes.len().min(room);
+        append_body(&mut m.msg, &bytes[..take]);
+        if take < bytes.len() {
+            m.body_truncated = true;
+        }
+    }
+}
+
+enum Framing {
+    None,
+    Fixed(u64),
+    Chunked,
+    UntilClose,
+    Upgrade,
+}
+
+fn body_len(msg: &HttpMessage) -> usize {
+    match msg {
+        HttpMessage::Request(r) => r.body.len(),
+        HttpMessage::Response(r) => r.body.len(),
+    }
+}
+
+fn append_body(msg: &mut HttpMessage, bytes: &[u8]) {
+    match msg {
+        HttpMessage::Request(r) => r.body.extend_from_slice(bytes),
+        HttpMessage::Response(r) => r.body.extend_from_slice(bytes),
+    }
+}
+
+fn headers_mut(msg: &mut HttpMessage) -> &mut HashMap<String, String> {
+    match msg {
+        HttpMessage::Request(r) => &mut r.headers,
+        HttpMessage::Response(r) => &mut r.headers,
+    }
+}
+
+/// Body framing per RFC 9112 §6.3. Conflicting or ambiguous lengths are rejected rather than
+/// guessed, because a guess is exactly what request smuggling exploits.
+fn body_framing(headers: &HashMap<String, String>, is_request: bool) -> Result<Framing, &'static str> {
+    let te = headers.get("transfer-encoding");
+    let cl = headers.get("content-length");
+    if te.is_some() && cl.is_some() {
+        return Err("both transfer-encoding and content-length");
+    }
+    if let Some(te) = te {
+        let last = te.rsplit(',').next().unwrap_or("").trim().to_ascii_lowercase();
+        if last == "chunked" {
+            return Ok(Framing::Chunked);
+        }
+        return if is_request { Err("request transfer-encoding without final chunked") } else { Ok(Framing::UntilClose) };
+    }
+    if let Some(cl) = cl {
+        let mut value: Option<u64> = None;
+        for part in cl.split(',') {
+            let n: u64 = part.trim().parse().map_err(|_| "invalid content-length")?;
+            if value.is_some_and(|v| v != n) {
+                return Err("conflicting content-length");
+            }
+            value = Some(n);
+        }
+        return Ok(Framing::Fixed(value.unwrap_or(0)));
+    }
+    Ok(if is_request { Framing::None } else { Framing::UntilClose })
+}
+
+fn parse_head(head: &[u8], response_to_head: bool, response_to_connect: bool) -> Result<(HttpMessage, Framing), &'static str> {
+    let text = std::str::from_utf8(head).map_err(|_| "non-UTF-8 header block")?;
+    let mut lines = text.split("\r\n");
+    let first = lines.next().unwrap_or("");
+    if let Some(rest) = first.strip_prefix("HTTP/") {
+        let mut parts = rest.split_whitespace();
+        let _version = parts.next();
+        let status: i32 = parts.next().and_then(|s| s.parse().ok()).ok_or("bad status line")?;
+        if !(100..=999).contains(&status) {
+            return Err("bad status code");
+        }
+        let headers = parse_headers(lines);
+        let framing = if status == 101 || (response_to_connect && (200..300).contains(&status)) {
+            Framing::Upgrade
+        } else if (100..200).contains(&status) || status == 204 || status == 304 || response_to_head {
+            Framing::None
+        } else {
+            body_framing(&headers, false)?
+        };
+        return Ok((HttpMessage::Response(HttpResponseParsed { status_code: status, headers, body: Vec::new() }), framing));
+    }
+    let mut parts = first.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().ok_or("missing request target")?;
+    let version = parts.next().unwrap_or("");
+    if !is_http_method(method) || !version.starts_with("HTTP/1.") {
+        return Err("not an HTTP/1 request line");
+    }
+    let headers = parse_headers(lines);
+    let host = headers.get("host").cloned();
+    let framing = body_framing(&headers, true)?;
+    Ok((
+        HttpMessage::Request(HttpRequestParsed {
+            method: method.to_string(),
+            path: path.to_string(),
+            host,
+            headers,
+            body: Vec::new(),
+        }),
+        framing,
+    ))
 }
 
 pub fn is_http_method(method: &str) -> bool {
@@ -381,6 +732,133 @@ mod tests {
         assert!(!is_usable_http_request("UNKNOWN", "/"));
         assert!(!is_usable_http_request("TEXT", "/ws"));
         assert!(!is_usable_http_request("GET", ""));
+    }
+
+    fn decode_all(chunks: &[&[u8]], head: bool, cap: usize) -> Vec<Http1Item> {
+        let mut d = Http1Decoder::new(cap);
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        for c in chunks {
+            buf.extend_from_slice(c);
+            let (n, items) = d.feed(&buf, head, false);
+            buf.drain(..n);
+            out.extend(items);
+        }
+        out
+    }
+
+    fn messages(items: Vec<Http1Item>) -> Vec<Http1Message> {
+        items
+            .into_iter()
+            .map(|i| match i {
+                Http1Item::Message(m) => m,
+                Http1Item::Invalid(r) => panic!("unexpected invalid: {r}"),
+            })
+            .collect()
+    }
+
+    fn body_of(m: &Http1Message) -> &[u8] {
+        match &m.msg {
+            HttpMessage::Request(r) => &r.body,
+            HttpMessage::Response(r) => &r.body,
+        }
+    }
+
+    const PIPELINE: &[u8] = b"POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\nHost: h\r\n\r\nPUT /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3;ext=1\r\nabc\r\n2\r\nde\r\n0\r\nX-Trailer: t\r\n\r\n";
+
+    #[test]
+    fn every_split_point_yields_identical_messages() {
+        let whole = messages(decode_all(&[PIPELINE], false, 1024));
+        assert_eq!(whole.len(), 3);
+        for split in 1..PIPELINE.len() {
+            let got = messages(decode_all(&[&PIPELINE[..split], &PIPELINE[split..]], false, 1024));
+            assert_eq!(got.len(), 3, "split at {split}");
+            for (a, b) in whole.iter().zip(&got) {
+                assert_eq!(body_of(a), body_of(b), "split at {split}");
+            }
+        }
+        assert_eq!(body_of(&whole[0]), b"hello");
+        assert_eq!(body_of(&whole[2]), b"abcde");
+        if let HttpMessage::Request(r) = &whole[2].msg {
+            assert_eq!(r.headers.get("x-trailer").map(String::as_str), Some("t"));
+        }
+    }
+
+    #[test]
+    fn byte_at_a_time_feeding_matches() {
+        let chunks: Vec<&[u8]> = PIPELINE.chunks(1).collect();
+        assert_eq!(messages(decode_all(&chunks, false, 1024)).len(), 3);
+    }
+
+    #[test]
+    fn interim_100_then_final_response() {
+        let got = messages(decode_all(&[b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"], false, 64));
+        let codes: Vec<i32> = got
+            .iter()
+            .map(|m| match &m.msg { HttpMessage::Response(r) => r.status_code, _ => 0 })
+            .collect();
+        assert_eq!(codes, vec![100, 200]);
+        assert_eq!(body_of(&got[1]), b"ok");
+    }
+
+    #[test]
+    fn head_204_and_304_responses_have_no_body() {
+        let head = messages(decode_all(&[b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\nHTTP/1.1 200 OK\r\n"], true, 64));
+        assert_eq!(head.len(), 1, "HEAD response must not wait for 999 body bytes");
+        for status in ["204 No Content", "304 Not Modified"] {
+            let raw = format!("HTTP/1.1 {status}\r\nContent-Length: 10\r\n\r\n");
+            assert_eq!(messages(decode_all(&[raw.as_bytes()], false, 64)).len(), 1);
+        }
+    }
+
+    #[test]
+    fn body_larger_than_preview_is_consumed_and_flagged() {
+        let mut raw = b"POST /up HTTP/1.1\r\nContent-Length: 100000\r\n\r\n".to_vec();
+        raw.extend(std::iter::repeat(b'x').take(100_000));
+        raw.extend_from_slice(b"GET /next HTTP/1.1\r\n\r\n");
+        let got = messages(decode_all(&raw.chunks(4096).collect::<Vec<_>>(), false, 8192));
+        assert_eq!(got.len(), 2, "the following request must not be swallowed");
+        assert_eq!(got[0].body_total, 100_000);
+        assert!(got[0].body_truncated);
+        assert_eq!(body_of(&got[0]).len(), 8192);
+    }
+
+    #[test]
+    fn ambiguous_or_hostile_framing_is_invalid() {
+        for raw in [
+            &b"POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n"[..],
+            b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFFF\r\n",
+            b"POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
+        ] {
+            let items = decode_all(&[raw], false, 64);
+            assert!(matches!(items.last(), Some(Http1Item::Invalid(_))), "{:?}", String::from_utf8_lossy(raw));
+        }
+    }
+
+    #[test]
+    fn huge_but_valid_chunk_length_does_not_overflow() {
+        let items = decode_all(&[b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\nab"], false, 64);
+        assert!(items.is_empty(), "incomplete chunk must wait, not panic or complete");
+    }
+
+    #[test]
+    fn close_delimited_response_is_partial_and_never_reparsed() {
+        let mut d = Http1Decoder::new(64);
+        let (_, items) = d.feed(b"HTTP/1.1 200 OK\r\n\r\nstream-start", false, false);
+        let m = messages(items);
+        assert!(m[0].partial);
+        let (n, items) = d.feed(b"HTTP/1.1 200 OK\r\n\r\n", false, false);
+        assert_eq!(n, 19);
+        assert!(items.is_empty(), "bytes after a close-delimited body are body, not a new response");
+    }
+
+    #[test]
+    fn repeated_headers_are_combined() {
+        let got = messages(decode_all(&[b"GET / HTTP/1.1\r\nAccept: a\r\nAccept: b\r\n\r\n"], false, 64));
+        if let HttpMessage::Request(r) = &got[0].msg {
+            assert_eq!(r.headers.get("accept").map(String::as_str), Some("a, b"));
+        }
     }
 
     #[test]

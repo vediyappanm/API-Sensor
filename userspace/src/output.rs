@@ -119,7 +119,7 @@ fn event_to_value(ev: ApiTrafficEvent) -> Value {
 
     // Log metadata
     m.insert("LogVersion".into(), json!("v4"));
-    m.insert("Id".into(), json!(make_event_id(ev.observed_at, ev.source_port.unwrap_or(0))));
+    m.insert("Id".into(), json!(make_event_id(ev.observed_at)));
 
     // SessionStats.StartTime: prefer wall-clock epoch ms from userspace.
     // Legacy events stored BPF ktime (ns or ms since boot) and need conversion.
@@ -146,7 +146,8 @@ fn event_to_value(ev: ApiTrafficEvent) -> Value {
     m.insert("L7Protocol".into(), json!(l7_proto_name(&ev.protocol)));
 
     // HTTP Request fields
-    let (uri, query_str) = split_uri_query(&ev.request.path);
+    let (uri, path_query) = split_uri_query(&ev.request.path);
+    let query_str = query_string(&ev, &path_query);
     let req_body_bytes = ev.request.body.as_deref().unwrap_or("").as_bytes();
     m.insert("HTTPReq.Method".into(),     json!(ev.request.method));
     m.insert("HTTPReq.Uri".into(),        json!(uri));
@@ -235,7 +236,17 @@ fn event_to_value(ev: ApiTrafficEvent) -> Value {
         if let Some(ref p) = c.pod_name      { meta.insert("pod_name".into(), json!(p)); }
         if let Some(ref n) = c.pod_namespace { meta.insert("namespace".into(), json!(n)); }
         if let Some(ref s) = c.service_name  { meta.insert("service_name".into(), json!(s)); }
+        if let Some(ref n) = c.container_name { meta.insert("container_name".into(), json!(n)); }
+        if let Some(ref w) = c.workload_type { meta.insert("workload_type".into(), json!(w)); }
+        if c.container_id != "unknown" { meta.insert("container_id".into(), json!(c.container_id)); }
+        meta.insert("node_name".into(), json!(c.node_name));
     }
+    if let Some(ref md) = ev.metadata {
+        if let Some(ref mm) = md.mcp_method { meta.insert("mcp_method".into(), json!(mm)); }
+        if let Some(ref t) = md.mcp_tool_name { meta.insert("mcp_tool_name".into(), json!(t)); }
+    }
+    meta.insert("transport".into(), json!(if ev.protocol == "HTTP/3" || ev.protocol == "QUIC" { "udp" } else { "tcp" }));
+    if let Some(ref o) = ev.outcome { meta.insert("transaction_outcome".into(), json!(o)); }
     if let Some(ref p) = ev.process_name   { meta.insert("process_name".into(), json!(p)); }
     if let Some(ref sh) = ev.source_hostname { meta.insert("source_hostname".into(), json!(sh)); }
     if let Some(ref dh) = ev.dest_hostname   { meta.insert("dest_hostname".into(), json!(dh)); }
@@ -283,9 +294,10 @@ fn format_message_time(ms: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{:03}", ms % 1000)
 }
 
+/// RFC 3339 UTC with nanosecond-width fraction (millisecond precision).
 fn format_iso8601(ms: u64) -> String {
     let (y, mo, d, h, mi, s) = unix_secs_to_dt(ms / 1000);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{:06}000", ms % 1000)
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{:03}000000Z", ms % 1000)
 }
 
 /// Proleptic Gregorian calendar from Unix epoch seconds → (year, month, day, hour, min, sec).
@@ -338,8 +350,40 @@ fn stable_api_id(method: &str, path: &str) -> u32 {
     (h & 0x7FFF_FFFF).max(1)
 }
 
-fn make_event_id(ts_ms: u64, src_port: u16) -> String {
-    format!("{:08x}-{:016x}{:04x}", ts_ms >> 32, ts_ms, src_port)
+static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PROCESS_NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Distinguishes sensor incarnations, so IDs from a restarted sensor never repeat earlier ones.
+fn process_nonce() -> u64 {
+    *PROCESS_NONCE.get_or_init(|| {
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+        let mut h = t ^ ((std::process::id() as u64) << 32);
+        // splitmix64 finaliser
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^ (h >> 31)
+    })
+}
+
+/// Unique per event within this sensor incarnation and across restarts. The ID is fixed when
+/// the batch is serialised, so retries of the same batch carry the same IDs.
+fn make_event_id(ts_ms: u64) -> String {
+    let n = EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:016x}-{:012x}-{:010x}", process_nonce(), ts_ms & 0xffff_ffff_ffff, n & 0xff_ffff_ffff)
+}
+
+/// Query string for the wire: the parsed (already redacted) parameters in a stable order.
+fn query_string(ev: &ApiTrafficEvent, from_path: &str) -> String {
+    if !from_path.is_empty() {
+        return from_path.to_string();
+    }
+    let mut pairs: Vec<(&String, &String)> = ev.request.query.iter().collect();
+    pairs.sort();
+    pairs
+        .iter()
+        .map(|(k, v)| if v.is_empty() { k.to_string() } else { format!("{k}={v}") })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Standard base64 encoder (RFC 4648). No external crate.
@@ -394,6 +438,54 @@ mod tests {
         assert_eq!(l7_proto_name("HTTP/1.1"), "HTTP11");
         assert_eq!(l7_proto_name("HTTP/2"),   "HTTP2");
         assert_eq!(l7_proto_name("gRPC"),     "GRPC");
+    }
+
+    #[test]
+    fn start_time_is_rfc3339_utc_with_the_right_milliseconds() {
+        // 2026-08-17T21:33:20.123Z
+        assert_eq!(format_iso8601(1_787_002_400_123), "2026-08-17T21:33:20.123000000Z");
+        assert_eq!(format_iso8601(5), "1970-01-01T00:00:00.005000000Z");
+    }
+
+    #[test]
+    fn events_in_the_same_millisecond_get_distinct_ids() {
+        let ids: std::collections::HashSet<String> = (0..1000).map(|_| make_event_id(1_787_000_000_000)).collect();
+        assert_eq!(ids.len(), 1000);
+    }
+
+    #[test]
+    fn wire_event_keeps_query_container_mcp_and_outcome() {
+        let mut ev = ApiTrafficEvent::default();
+        ev.request.method = "POST".into();
+        ev.request.path = "/mcp".into();
+        ev.request.query.insert("b".into(), "2".into());
+        ev.request.query.insert("a".into(), "1".into());
+        ev.container = Some(crate::types::ContainerContext {
+            pod_name: Some("pod".into()),
+            pod_namespace: Some("prod".into()),
+            container_id: "abc123".into(),
+            container_name: Some("app".into()),
+            node_name: "node-1".into(),
+            service_name: None,
+            workload_type: Some("Deployment".into()),
+        });
+        ev.metadata = Some(crate::types::EventMetadata {
+            mcp_method: Some("tools/call".into()),
+            mcp_tool_name: Some("search".into()),
+            ..Default::default()
+        });
+        ev.outcome = Some("timed_out".into());
+        let v = event_to_value(ev);
+        assert_eq!(v["HTTPReq.Query"], "a=1&b=2");
+        let meta = &v["MetaDataMap"];
+        assert_eq!(meta["namespace"], "prod");
+        assert_eq!(meta["container_id"], "abc123");
+        assert_eq!(meta["container_name"], "app");
+        assert_eq!(meta["node_name"], "node-1");
+        assert_eq!(meta["mcp_method"], "tools/call");
+        assert_eq!(meta["mcp_tool_name"], "search");
+        assert_eq!(meta["transport"], "tcp");
+        assert_eq!(meta["transaction_outcome"], "timed_out");
     }
 
     #[test]

@@ -28,6 +28,7 @@ spec:
       # The sensor never talks to the Kubernetes API (pod metadata comes from the CRI socket), so it
       # gets no service-account token.
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ add (int .Values.sensor.shutdownTimeoutSecs) 10 }}
       containers:
         - name: sensor
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -45,6 +46,7 @@ spec:
             - --metrics-port=$(METRICS_PORT)
             - --sample-default=$(SAMPLE_DEFAULT)
             - --sample-health=$(SAMPLE_HEALTH)
+            - --shutdown-timeout-secs={{ .Values.sensor.shutdownTimeoutSecs }}
             - --discover-libs
           envFrom:
             - configMapRef:

@@ -29,6 +29,17 @@ ok()   { echo -e "${GREEN}[PASS]${RESET} $1"; PASS=$((PASS + 1)); }
 fail() { echo -e "${RED}[FAIL]${RESET} $1"; FAIL=$((FAIL + 1)); }
 info() { echo -e "${YELLOW}[INFO]${RESET} $1"; }
 
+# Archive the identities this run actually tested (audit F20: results without
+# source/kernel identity are not evidence).
+GIT_REV=$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 2>/dev/null || echo "unknown")
+{
+  echo "source=${GIT_REV}"
+  echo "kernel=$(uname -r 2>/dev/null || echo unknown)"
+  echo "arch=$(uname -m 2>/dev/null || echo unknown)"
+  echo "date_utc=$(date -u +%FT%TZ 2>/dev/null || echo unknown)"
+} > /tmp/api-sensor-verification-identity.txt 2>/dev/null || true
+info "Source: ${GIT_REV} | Kernel: $(uname -r 2>/dev/null) | $(uname -m 2>/dev/null)"
+
 SKIP_STRESS=false
 SKIP_GOTLS=false
 for arg in "$@"; do
@@ -66,47 +77,30 @@ else
 fi
 echo ""
 
-# ── Check 2: Start ingest stub ────────────────────────────────────────────
-echo "── Starting ingest stub on :${INGEST_PORT} ─────────────────────────────"
-python3 - <<'PYEOF' &
-import sys, json, datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-captured = []
-
-class H(BaseHTTPRequestHandler):
-    def do_POST(self):
-        n = int(self.headers.get('Content-Length', 0))
-        body = json.loads(self.rfile.read(n))
-        events = body.get('events', [])
-        captured.extend(events)
-        for e in events:
-            proto = e.get('protocol', '?')
-            req   = e.get('request', {})
-            resp  = e.get('response', {})
-            meta  = e.get('metadata', {})
-            ts    = datetime.datetime.now().strftime('%H:%M:%S')
-            print(f"[{ts}] {proto} {req.get('method','?')} "
-                  f"{req.get('path','?')} → {resp.get('status_code','?')} "
-                  f"injection={meta.get('has_injection',False)}", flush=True)
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'{"ok":true}')
-    def log_message(self, *a): pass
-
-print(f"Ingest stub on :{9999}", flush=True)
-HTTPServer(('', 9999), H).serve_forever()
-PYEOF
+# ── Check 2: Start ingest validator (real MsgHeader/Batch schema, gzip OK) ─
+echo "── Starting ingest validator on :${INGEST_PORT} ─────────────────────────"
+VALIDATOR_PY="${SCRIPT_DIR}/../tests/test-servers/validator/server.py"
+if [[ ! -f "$VALIDATOR_PY" ]]; then
+  fail "Validator script missing at ${VALIDATOR_PY} — the verification suite requires the schema-validating ingest validator (F20)"
+  exit 1
+fi
+VALIDATOR_PORT="${INGEST_PORT}" python3 "$VALIDATOR_PY" &
 INGEST_PID=$!
 sleep 1
-info "Ingest stub PID=$INGEST_PID"
+if curl -sf "http://localhost:${INGEST_PORT}/health" | grep -q '"status": "ok"'; then
+  ok "Ingest validator running (MsgHeader/Batch schema, gzip accepted)"
+else
+  fail "Ingest validator failed to start on :${INGEST_PORT}"
+  exit 1
+fi
+echo ""
 
 # ── Check 2: Start sensor ─────────────────────────────────────────────────
 echo ""
 echo "── Check 2: Sensor starts and loads BPF programs ───────────────"
 "$SENSOR_BIN" \
   --bpf "$BPF_OBJ" \
-  --ingest "http://localhost:${INGEST_PORT}" \
+  --ingest "http://localhost:${INGEST_PORT}/ingest" \
   --api-key test-verify \
   --account-id 1001 \
   --role client \
@@ -163,6 +157,31 @@ if [[ "${CAPTURED:-0}" -gt 0 ]]; then
   ok "Events captured: ${CAPTURED} (OpenSSL uprobe working)"
 else
   fail "0 events captured after curl — OpenSSL uprobe may not be attached"
+fi
+
+# The metric alone is not audit evidence: the validator must have ACCEPTED
+# schema-valid MsgHeader/Batch payloads (F20 — a wire-schema regression or a
+# gzip the validator cannot decode must fail this check, not pass silently).
+SUMMARY=$(curl -sf "http://localhost:${INGEST_PORT}/summary" 2>/dev/null || echo "")
+ACCEPTED=$(echo "$SUMMARY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('accepted_total', 0))" 2>/dev/null || echo "0")
+if [[ "${ACCEPTED:-0}" -gt 0 ]]; then
+  ok "Validator accepted ${ACCEPTED} schema-valid events (MsgHeader/Batch contract holds)"
+else
+  fail "Validator accepted 0 events — wire-schema regression or delivery failure (see GET /summary last_rejection)"
+fi
+
+# Request-side PII check against schema-accepted events only. (Response-body
+# previews are audited under F19, package 2 — not asserted here.)
+EVENTS_JSON=$(curl -sf "http://localhost:${INGEST_PORT}/events" 2>/dev/null || echo "")
+if echo "$EVENTS_JSON" | grep -q "alice@example.com"; then
+  fail "Raw email found in a captured request line (PII redaction failed)"
+elif [[ "${ACCEPTED:-0}" -gt 0 ]]; then
+  ok "Raw email NOT present in accepted request lines (PII redacted)"
+fi
+if echo "$EVENTS_JSON" | grep -q "PII_EMAIL_"; then
+  ok "PII token present in accepted events"
+elif [[ "${ACCEPTED:-0}" -gt 0 ]]; then
+  fail "No PII token in accepted events although ${ACCEPTED} events were accepted"
 fi
 echo ""
 
@@ -309,9 +328,14 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Results: ${PASS} passed  •  ${FAIL} failed"
+echo "  Identity: /tmp/api-sensor-verification-identity.txt (source ${GIT_REV})"
 echo "═══════════════════════════════════════════════════════════════"
 if [[ "$FAIL" -eq 0 ]]; then
-  echo -e "${GREEN}  ALL CHECKS PASSED — sensor is production ready${RESET}"
+  echo -e "${GREEN}  All mechanical checks passed in THIS run on THIS kernel.${RESET}"
+  echo -e "${YELLOW}  This is a smoke test, not a production-readiness certification.${RESET}"
+  echo -e "${YELLOW}  See docs/PRODUCTION-READINESS-AUDIT.md for the release contract.${RESET}"
+  exit 0
 else
   echo -e "${RED}  ${FAIL} check(s) failed — see output above${RESET}"
+  exit 1
 fi

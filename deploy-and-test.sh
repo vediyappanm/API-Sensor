@@ -112,10 +112,13 @@ phase_deploy() {
   # sensor never serves, and could not discover any workload's TLS library). The chart refuses to
   # render without an explicit capture scope.
   : "${SENSOR_SCOPE_NAMESPACES:?set SENSOR_SCOPE_NAMESPACES to the comma-separated namespaces to capture, e.g. my-apps,payments}"
-  log_info "Deploying sensor via Helm (scope: $SENSOR_SCOPE_NAMESPACES)..."
+  : "${SENSOR_INGEST_URL:?set SENSOR_INGEST_URL to the backend ingest endpoint, e.g. https://ingest.example.com/v1/events}"
+  log_info "Deploying sensor via Helm (scope: $SENSOR_SCOPE_NAMESPACES, ingest: $SENSOR_INGEST_URL)..."
   helm upgrade --install api-sentinel-sensor deploy/helm/api-sentinel-sensor \
     --namespace "$SENSOR_NAMESPACE" \
-    --set "sensor.onlyNamespaces={${SENSOR_SCOPE_NAMESPACES}}" || log_error "Sensor deployment failed"
+    --set "sensor.onlyNamespaces={${SENSOR_SCOPE_NAMESPACES}}" \
+    --set "sensor.ingestUrl=${SENSOR_INGEST_URL}" \
+    --set "sensor.allowInsecureHttp=${SENSOR_ALLOW_INSECURE_HTTP:-false}" || log_error "Sensor deployment failed"
 
   # Wait for rollout
   log_info "Waiting for DaemonSet rollout (timeout: 5m)..."

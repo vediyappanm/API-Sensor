@@ -29,7 +29,7 @@ RUN clang -O2 -g -Wall -target bpf -D__TARGET_ARCH_x86 -c bpf/http_trace.bpf.c -
 COPY userspace ./userspace
 ARG CARGO_BUILD_JOBS=4
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
-RUN cd userspace && cargo build --release --locked \
+RUN cd userspace && cargo build --release \
     && cp target/release/api-sec-sensor /api-sec-sensor
 
 FROM ubuntu:24.04

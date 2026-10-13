@@ -214,31 +214,69 @@ fn verhoeff_valid(digits: &str) -> bool {
     c == 0
 }
 
+// Tokens generated during one redaction call are wrapped in these private-use characters,
+// so later passes of the same call can tell the sensor's own output from input text that
+// merely looks like a token. Input copies of the markers are stripped on entry and the
+// markers are removed before any result leaves this module.
+const MARK_OPEN: char = '\u{E000}';
+const MARK_CLOSE: char = '\u{E001}';
+
+fn marked(token: String) -> String {
+    format!("{MARK_OPEN}{token}{MARK_CLOSE}")
+}
+
+fn is_marked(s: &str) -> bool {
+    s.len() > 2 * MARK_OPEN.len_utf8() && s.starts_with(MARK_OPEN) && s.ends_with(MARK_CLOSE)
+}
+
+fn strip_markers(s: &str) -> String {
+    s.chars().filter(|c| *c != MARK_OPEN && *c != MARK_CLOSE).collect()
+}
+
+/// Byte ranges of tokens generated earlier in this call.
+fn marked_spans(s: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut open = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            MARK_OPEN => open = Some(i),
+            MARK_CLOSE => {
+                if let Some(start) = open.take() {
+                    spans.push((start, i + c.len_utf8()));
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
 pub fn redact_pii(text: &str) -> String {
+    strip_markers(&redact_pii_marked(&strip_markers(text)))
+}
+
+fn redact_pii_marked(text: &str) -> String {
     let patterns = PII_PATTERNS.get_or_init(init_pii_patterns);
     let mut result = text.to_string();
     for (pii_type, pattern) in patterns {
-        // Collect all matches first (owned), so the borrow of `result` ends before
-        // we mutate it below.
+        // Never re-redact a token generated earlier in this call: the generic Bearer matcher
+        // would otherwise swallow a specific token (`Bearer <stripe token>` → PII_TOKEN_),
+        // and a digit run inside a token's hash could be mistaken for a phone number.
+        let protected = marked_spans(&result);
         let ranges: Vec<(usize, usize, String)> = pattern
             .find_iter(&result)
             .filter(|m| {
-                let s = m.as_str();
-                // Don't re-redact already-redacted tokens. Without this guard
-                // a generic regex like the Bearer matcher would swallow
-                // earlier-replaced specific tokens (e.g. `Bearer PII_STRIPE_…`
-                // → `PII_TOKEN_…`), losing the precise classification.
-                if s.contains("PII_") {
+                if protected.iter().any(|&(s, e)| m.start() < e && s < m.end()) {
                     return false;
                 }
-                // Apply Luhn validation for credit card matches
+                let s = m.as_str();
                 match pii_type {
                     PiiType::CreditCard => luhn_check(s),
                     PiiType::Aadhaar => verhoeff_valid(s),
                     _ => true,
                 }
             })
-            .map(|m| (m.start(), m.end(), pii_token(pii_type, m.as_str())))
+            .map(|m| (m.start(), m.end(), marked(pii_token(pii_type, m.as_str()))))
             .collect();
         // Replace in reverse order to preserve offsets
         for (start, end, token) in ranges.into_iter().rev() {
@@ -291,14 +329,98 @@ fn is_strong_name(name: &str) -> bool {
     STRONG_NAME_EXACT.contains(&n.as_str()) || STRONG_NAME_PARTS.iter().any(|p| n.contains(p))
 }
 
+/// Bounded decode of a JSON string key before name matching (F04). An attacker can hide a
+/// sensitive key behind a JSON escape: `{"pass\u0077ord":"…"}` is exactly `password`, but the
+/// regex captures the raw escaped text `pass\u0077ord`, which `is_sensitive_name` does not
+/// recognise. This decodes the standard JSON string escapes (and `\uXXXX` code points) into
+/// the canonical name. It is not a full JSON parser: unknown escapes are passed through
+/// literally, and output is bounded to the input length so a pathological sequence cannot
+/// allocate without limit.
+fn json_unescape_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000C}'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                // \uXXXX — exactly four hex digits. Lone surrogates / invalid code points
+                // are dropped (key names that denote secrets are ASCII in practice).
+                let mut code = 0u32;
+                let mut ok = true;
+                for _ in 0..4 {
+                    match chars.next().and_then(|h| h.to_digit(16)) {
+                        Some(d) => code = code * 16 + d,
+                        None => { ok = false; break; }
+                    }
+                }
+                if ok {
+                    if let Some(ch) = char::from_u32(code) {
+                        out.push(ch);
+                    }
+                }
+            }
+            Some(other) => { out.push('\\'); out.push(other); }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Bounded percent-decode (+ → space) for form/query field names (F04):
+/// `pass%77ord` decodes to `password`. Invalid sequences are passed through unchanged and
+/// the result is bounded to the input length.
+fn percent_decode_name(raw: &str) -> String {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                (Some(h), Some(l)) => { out.push((h << 4) | l); i += 3; }
+                _ => { out.push(bytes[i]); i += 1; }
+            },
+            b'+' => { out.push(b' '); i += 1; }
+            b => { out.push(b); i += 1; }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Canonicalised field name for name matching: JSON-unescape then (for form/query names)
+/// percent-decode. JSON keys are not percent-encoded and form names are not JSON-escaped, so
+/// applying both in sequence is a no-op on the channel that does not use them.
+fn canonical_field_name(raw: &str, percent: bool) -> String {
+    let unescaped = json_unescape_name(raw);
+    if percent { percent_decode_name(&unescaped) } else { unescaped }
+}
+
 fn secret_token(value: &str) -> String {
-    pii_token(&PiiType::Secret, value)
+    marked(pii_token(&PiiType::Secret, value))
 }
 
 /// 16 hex chars of the keyed hash of `value`: a stable, non-reversible identifier for
 /// a session/credential that can be correlated across events without exposing it.
 pub fn fingerprint(value: &str) -> String {
-    let t = secret_token(value);
+    let t = pii_token(&PiiType::Secret, value);
     t.trim_start_matches("PII_SECRET_").chars().take(16).collect()
 }
 
@@ -331,37 +453,46 @@ fn scrubbers() -> &'static SecretScrubbers {
 /// run the value-shape patterns; callers that want both use `redact_text`.
 fn scrub_secrets(text: &str) -> String {
     let s = scrubbers();
-    let out = s.pem.replace_all(text, "PII_PRIVATE_KEY_REDACTED");
+    let pem_token = marked("PII_PRIVATE_KEY_REDACTED".to_string());
+    let out = s.pem.replace_all(text, pem_token.as_str());
     let out = s.url_userinfo.replace_all(&out, |c: &regex::Captures| {
         format!("{}{}{}", &c[1], secret_token(&c[2]), &c[3])
     });
     let out = s.json_kv.replace_all(&out, |c: &regex::Captures| {
         let (key, val) = (&c[1], &c[2]);
-        if !is_sensitive_name(key) || val.starts_with('{') || val.starts_with('[') || val.starts_with("PII_") {
+        // F04: the raw captured key may be JSON-escaped (`"pass\u0077ord"` → `password`);
+        // match the canonicalised name so the escape cannot hide a sensitive key.
+        let canon = canonical_field_name(key, false);
+        if !is_sensitive_name(&canon) || val.starts_with('{') || val.starts_with('[') || is_marked(val) {
             return c[0].to_string();
         }
         let quoted = val.starts_with('"');
         // Numbers/booleans/null under a merely-"token-ish" name (e.g. `tokens_used: 42`)
         // are metrics, not secrets. Strong names (password, pin, otp...) are always redacted.
-        if !quoted && !is_strong_name(key) {
+        if !quoted && !is_strong_name(&canon) {
             return c[0].to_string();
         }
         let inner = val.trim_matches('"');
-        if inner.is_empty() || inner.starts_with("PII_") {
+        // F04: only a token generated earlier in this call is skipped; input text shaped
+        // like a token is still redacted.
+        if inner.is_empty() || is_marked(inner) {
             return c[0].to_string();
         }
         let key_end = c[0].len() - val.len();
         format!("{}\"{}\"", &c[0][..key_end], secret_token(inner))
     });
     let out = s.form_kv.replace_all(&out, |c: &regex::Captures| {
-        if is_sensitive_name(&c[2]) && !c[3].is_empty() && !c[3].starts_with("PII_") {
+        // F04: percent-encoded form/query names (`pass%77ord` → `password`) must match
+        // after decoding, otherwise the encoding hides a sensitive field.
+        let canon = canonical_field_name(&c[2], true);
+        if is_sensitive_name(&canon) && !c[3].is_empty() && !is_marked(&c[3]) {
             format!("{}{}={}", &c[1], &c[2], secret_token(&c[3]))
         } else {
             c[0].to_string()
         }
     });
     let out = s.xml_el.replace_all(&out, |c: &regex::Captures| {
-        if c[1] == c[3] && is_sensitive_name(&c[1]) && !c[2].trim().is_empty() && !c[2].starts_with("PII_") {
+        if c[1] == c[3] && is_sensitive_name(&c[1]) && !c[2].trim().is_empty() && !is_marked(c[2].trim()) {
             format!("<{0}>{1}</{0}>", &c[1], secret_token(c[2].trim()))
         } else {
             c[0].to_string()
@@ -373,7 +504,11 @@ fn scrub_secrets(text: &str) -> String {
 /// Full redaction for free text (bodies, URLs, non-sensitive header values):
 /// name-keyed secrets first, then value-shape PII.
 pub fn redact_text(text: &str) -> String {
-    redact_pii(&scrub_secrets(text))
+    strip_markers(&redact_text_marked(&strip_markers(text)))
+}
+
+fn redact_text_marked(text: &str) -> String {
+    redact_pii_marked(&scrub_secrets(text))
 }
 
 /// Redact a request target (`/path?query`): `?token=...&api_key=...`, `user:pass@`, PII.
@@ -403,15 +538,16 @@ fn cookie_pairs(value: &str, redact_all_values: bool) -> String {
 /// Multi-valued headers joined with newlines are handled line by line.
 pub fn redact_header_value(name: &str, value: &str) -> String {
     let lname = name.to_ascii_lowercase();
-    value
+    let out = strip_markers(value)
         .split('\n')
         .map(|line| redact_header_line(&lname, line))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    strip_markers(&out)
 }
 
 fn redact_header_line(lname: &str, value: &str) -> String {
-    if value.trim().is_empty() || value.starts_with("PII_") {
+    if value.trim().is_empty() {
         return value.to_string();
     }
     match lname {
@@ -425,7 +561,7 @@ fn redact_header_line(lname: &str, value: &str) -> String {
             None => cookie_pairs(value, true),
         },
         _ if is_sensitive_name(lname) => secret_token(value.trim()),
-        _ => redact_text(value),
+        _ => redact_text_marked(value),
     }
 }
 
@@ -764,10 +900,13 @@ mod name_aware_tests {
     }
 
     #[test]
-    fn already_redacted_values_are_not_double_wrapped() {
+    fn a_token_from_an_earlier_pass_of_the_same_call_keeps_its_classification() {
         key();
-        let once = redact_body(r#"{"password":"hunter2-correct-horse"}"#);
-        assert_eq!(redact_body(&once), once);
+        // Built at runtime for the same push-protection reason as test_pii_redact_stripe_key.
+        let stripe = format!("sk_{}_{}", "live", "0123456789abcdefghijklmnop");
+        let out = redact_text(&format!("Bearer {stripe}"));
+        assert!(out.contains("PII_STRIPE_") && !out.contains("PII_TOKEN_"), "{out}");
+        assert!(!out.contains(MARK_OPEN) && !out.contains(MARK_CLOSE), "markers leaked: {out:?}");
     }
 
     #[test]
@@ -806,5 +945,80 @@ mod name_aware_tests {
         let start = std::time::Instant::now();
         let _ = redact_body(&nasty);
         assert!(start.elapsed().as_secs() < 5, "redaction too slow: {:?}", start.elapsed());
+    }
+
+    // ── F04: redaction bypass regressions ───────────────────────────────────
+    //
+    // Each test encodes a bypass from the audit (docs/PRODUCTION-READINESS-AUDIT.md
+    // §F04). They reach the production redaction boundary (`redact_body` /
+    // `redact_header_value`), not a re-implementation of the helpers.
+
+    #[test]
+    fn f04_json_escaped_sensitive_key_is_redacted() {
+        // `"pass\u0077ord"` is exactly `password`. The regex captures the raw escaped
+        // key; without canonicalisation `is_sensitive_name` misses it and the secret
+        // is exported in the clear.
+        key();
+        let body = r#"{"pass\u0077ord":"opaque-secret"}"#;
+        let out = redact_body(body);
+        assert!(!out.contains("opaque-secret"), "escaped JSON key bypassed redaction: {out}");
+        assert!(out.contains("PII_SECRET_"), "escaped key value not redacted: {out}");
+    }
+
+    #[test]
+    fn f04_percent_encoded_form_name_is_redacted() {
+        // `pass%77ord` decodes to `password`.
+        key();
+        let out = redact_body("pass%77ord=opaque-secret");
+        assert!(!out.contains("opaque-secret"), "percent-encoded name bypassed redaction: {out}");
+        assert!(out.contains("PII_SECRET_"), "percent-encoded name value not redacted: {out}");
+    }
+
+    #[test]
+    fn f04_attacker_forged_pii_prefix_is_not_trusted() {
+        // A value that merely starts with `PII_` is attacker-controlled and must be
+        // redacted, not passed through as if it were one of our tokens.
+        key();
+        let json_out = redact_body(r#"{"password":"PII_attacker-supplied"}"#);
+        assert!(!json_out.contains("attacker-supplied"),
+                "forged PII_ prefix in JSON bypassed redaction: {json_out}");
+        let hdr = redact_header_value("X-Api-Key", "PII_attacker-supplied");
+        assert!(!hdr.contains("attacker-supplied"),
+                "forged PII_ prefix in header bypassed redaction: {hdr}");
+        let form_out = redact_body("password=PII_attacker-supplied");
+        assert!(!form_out.contains("attacker-supplied"),
+                "forged PII_ prefix in form bypassed redaction: {form_out}");
+    }
+
+    #[test]
+    fn f04_attacker_supplied_value_in_the_exact_token_shape_is_still_redacted() {
+        // A secret the client chose to format exactly like one of our tokens
+        // (`PII_<TYPE>_<32 hex>`) proves nothing about where it came from.
+        key();
+        let forged = "PII_SECRET_0123456789abcdef0123456789abcdef";
+        let json_out = redact_body(&format!(r#"{{"password":"{forged}"}}"#));
+        assert!(!json_out.contains(forged), "token-shaped JSON secret passed through: {json_out}");
+        assert!(json_out.contains("PII_SECRET_"), "{json_out}");
+        let hdr = redact_header_value("X-Api-Key", forged);
+        assert!(!hdr.contains(forged), "token-shaped header secret passed through: {hdr}");
+        let auth = redact_header_value("authorization", &format!("Bearer {forged}"));
+        assert!(!auth.contains(forged), "token-shaped bearer credential passed through: {auth}");
+        let form = redact_body(&format!("password={forged}"));
+        assert!(!form.contains(forged), "token-shaped form secret passed through: {form}");
+        let xml = redact_body(&format!("<password>{forged}</password>"));
+        assert!(!xml.contains(forged), "token-shaped XML secret passed through: {xml}");
+        let pem = redact_body("PII_PRIVATE_KEY_REDACTED and Bearer PII_TOKEN_0123456789abcdef0123456789abcdef");
+        assert!(!pem.contains("PII_TOKEN_0123456789abcdef0123456789abcdef"), "{pem}");
+    }
+
+    #[test]
+    fn f04_input_cannot_forge_the_internal_markers() {
+        key();
+        let forged = format!("{MARK_OPEN}opaque-secret{MARK_CLOSE}");
+        let out = redact_body(&format!(r#"{{"password":"{forged}"}}"#));
+        assert!(!out.contains("opaque-secret"), "marker-wrapped input skipped redaction: {out:?}");
+        let hdr = redact_header_value("cookie", &format!("sid={forged}"));
+        assert!(!hdr.contains("opaque-secret"), "{hdr:?}");
+        assert!(!out.contains(MARK_OPEN) && !hdr.contains(MARK_OPEN));
     }
 }

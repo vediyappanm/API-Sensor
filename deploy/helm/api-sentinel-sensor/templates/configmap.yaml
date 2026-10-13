@@ -13,9 +13,18 @@ metadata:
 {{- if and (empty .Values.sensor.onlyNamespaces) (not .Values.sensor.captureAllWorkloads) }}
 {{- fail "Set sensor.onlyNamespaces (the namespaces to capture) or, on a node dedicated to monitored workloads, sensor.captureAllWorkloads=true" }}
 {{- end }}
+{{- $ingest := .Values.sensor.ingestUrl | default "" }}
+{{- if not (or (hasPrefix "https://" $ingest) (hasPrefix "http://" $ingest)) }}
+{{- fail "Set sensor.ingestUrl to the backend ingest endpoint (https://...)" }}
+{{- end }}
+{{- if and (hasPrefix "http://" $ingest) (not .Values.sensor.allowInsecureHttp) }}
+{{- fail "sensor.ingestUrl is plain http://, which sends the API key unencrypted. Use https://, or set sensor.allowInsecureHttp=true for an in-cluster/test backend" }}
+{{- end }}
 data:
   ONLY_NAMESPACES: {{ join "," .Values.sensor.onlyNamespaces | quote }}
-  INGEST_URL: {{ .Values.sensor.ingestUrl | quote }}
+  INGEST_URL: {{ $ingest | quote }}
+  APISEC_ALLOW_HTTP: {{ .Values.sensor.allowInsecureHttp | ternary "true" "false" | quote }}
+  APISEC_ALLOW_CAPTURE_ALL: {{ and (empty .Values.sensor.onlyNamespaces) .Values.sensor.captureAllWorkloads | ternary "true" "false" | quote }}
   ACCOUNT_ID: {{ .Values.sensor.accountId | quote }}
   TENANT_ID: {{ .Values.sensor.tenantId | quote }}
   POLICY_VERSION: {{ .Values.sensor.policyVersion | quote }}
@@ -24,6 +33,8 @@ data:
   ROLE: {{ .Values.sensor.role | quote }}
   MAX_BUFFER_BYTES: {{ .Values.sensor.maxBufferBytes | quote }}
   MAX_TOTAL_BUFFER_BYTES: {{ .Values.sensor.maxTotalBufferBytes | quote }}
+  MAX_QUEUE_BYTES: {{ .Values.sensor.maxQueueBytes | quote }}
+  MAX_BATCH_BYTES: {{ .Values.sensor.maxBatchBytes | quote }}
   METRICS_PORT: {{ .Values.sensor.metricsPort | quote }}
   SAMPLE_DEFAULT: {{ .Values.sensor.sampleDefault | quote }}
   SAMPLE_HEALTH: {{ .Values.sensor.sampleHealth | quote }}

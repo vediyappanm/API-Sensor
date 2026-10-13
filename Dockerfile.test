@@ -1,0 +1,19 @@
+# Test-only Dockerfile - builds and runs Rust tests
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang llvm libbpf-dev libelf-dev zlib1g-dev libzstd-dev pkg-config libssl-dev \
+        build-essential curl ca-certificates protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG RUST_VERSION=1.99.0
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION}
+ENV PATH=/root/.cargo/bin:${PATH}
+
+WORKDIR /src
+COPY bpf ./bpf
+COPY userspace ./userspace
+
+WORKDIR /src/userspace
+RUN cargo test --release --no-run
+CMD ["cargo", "test", "--release"]

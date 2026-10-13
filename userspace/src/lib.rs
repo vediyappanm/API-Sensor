@@ -4,6 +4,7 @@ pub mod http2;
 pub mod identity;
 pub mod ingest;
 pub mod output;
+pub mod export;
 pub mod quic;
 pub mod websocket;
 pub mod grpc;

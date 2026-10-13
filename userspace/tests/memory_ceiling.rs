@@ -65,6 +65,7 @@ fn event(pid: u32, ssl_ptr: u64) -> TlsEventHeader {
         dst_ip4: u32::from_be_bytes([10, 0, 0, 1]),
         src_ip6: [0; 16],
         dst_ip6: [0; 16],
+        ..TlsEventHeader::blank()
     }
 }
 
@@ -95,8 +96,12 @@ fn queued_requests_stay_inside_the_ceiling_and_are_all_released() {
         Arc::new(DnsResolver::new(dtx)),
     );
 
-    let heap_before = live();
     let req = request(20_000); // 20 KB body, far above the 8 KiB that is ever shipped
+    // Closing a connection exports its unanswered requests, which compiles the redaction
+    // patterns once. Do that before the baseline so only per-connection state is measured.
+    state.handle_event(&event(999, 0xdead), &req);
+    drop(state.evict_connection(&ConnKey { pid: 999, ssl_ptr: 0xdead, born_ms: 0, proc_start_ns: 0, generation: 0 }));
+    let heap_before = live();
 
     // 200 connections x 120 pipelined requests that never get a response:
     // before the fix ~ 200 x 100 queued x ~20 KB = ~400 MB of untracked heap.
@@ -126,7 +131,7 @@ fn queued_requests_stay_inside_the_ceiling_and_are_all_released() {
 
     // Closing the connections must give every byte back, whatever path removed the queues.
     for conn in 0..200u64 {
-        state.evict_connection(&ConnKey { pid: 1000 + (conn % 50) as u32, ssl_ptr: 0x10_000 + conn, born_ms: 0 });
+        state.evict_connection(&ConnKey { pid: 1000 + (conn % 50) as u32, ssl_ptr: 0x10_000 + conn, born_ms: 0, proc_start_ns: 0, generation: 0 });
     }
     let after = TOTAL_BUFFER_BYTES.load(Ordering::Relaxed);
     assert_eq!(after, 0, "{after} bytes still accounted after every connection was evicted");

@@ -20,12 +20,49 @@ check() {
     fi
 }
 
-OUT="$(helm template test-release "$CHART_DIR")" || {
+BASE=(--set "sensor.onlyNamespaces={apps}" --set sensor.ingestUrl=https://ingest.example.com/v1/events)
+
+OUT="$(helm template test-release "$CHART_DIR" "${BASE[@]}")" || {
     echo "FAIL: helm template renders without error"
     exit 1
 }
 
-check "helm lint passes" helm lint --quiet "$CHART_DIR"
+check "helm lint passes" helm lint --quiet "$CHART_DIR" "${BASE[@]}"
+
+# --- Render-time policy matches the sensor's startup checks ---------------
+rejects() {
+    local desc=$1 reason=$2
+    shift 2
+    local err
+    if err="$(helm template test-release "$CHART_DIR" "$@" 2>&1 >/dev/null)"; then
+        echo "FAIL: $desc (rendered, expected rejection)"
+        FAIL=$((FAIL + 1))
+    elif grep -q -- "$reason" <<<"$err"; then
+        echo "PASS: $desc"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: $desc (wrong reason: $err)"
+        FAIL=$((FAIL + 1))
+    fi
+}
+rejects "missing ingestUrl is refused" "Set sensor.ingestUrl" \
+    --set "sensor.onlyNamespaces={apps}"
+rejects "http ingestUrl without allowInsecureHttp is refused" "allowInsecureHttp" \
+    --set "sensor.onlyNamespaces={apps}" --set sensor.ingestUrl=http://ingest:8080/v1/events
+rejects "no scope and no captureAllWorkloads is refused" "sensor.onlyNamespaces" \
+    --set sensor.ingestUrl=https://ingest.example.com/v1/events
+check "https ingest renders with APISEC_ALLOW_HTTP false" \
+    grep -q 'APISEC_ALLOW_HTTP: "false"' <<<"$OUT"
+check "a namespace scope renders with APISEC_ALLOW_CAPTURE_ALL false" \
+    grep -q 'APISEC_ALLOW_CAPTURE_ALL: "false"' <<<"$OUT"
+OUT_HTTP="$(helm template test-release "$CHART_DIR" --set "sensor.onlyNamespaces={apps}" \
+    --set sensor.ingestUrl=http://ingest:8080/v1/events --set sensor.allowInsecureHttp=true)"
+check "allowInsecureHttp=true passes APISEC_ALLOW_HTTP=true to the sensor" \
+    grep -q 'APISEC_ALLOW_HTTP: "true"' <<<"$OUT_HTTP"
+OUT_ALL="$(helm template test-release "$CHART_DIR" --set sensor.captureAllWorkloads=true \
+    --set sensor.ingestUrl=https://ingest.example.com/v1/events)"
+check "captureAllWorkloads=true passes APISEC_ALLOW_CAPTURE_ALL=true to the sensor" \
+    grep -q 'APISEC_ALLOW_CAPTURE_ALL: "true"' <<<"$OUT_ALL"
 
 # --- PII_HASH_KEY: mandatory at startup (main.rs bails without it) ---------
 check "PII_HASH_KEY env is defined" \
@@ -54,8 +91,14 @@ check "--tenant-id arg wired to env" \
 check "--policy-version arg wired to env" \
     grep -q -- '--policy-version=$(POLICY_VERSION)' <<<"$OUT"
 
+# --- Export byte budgets reach the sensor's env (clap reads MAX_*_BYTES) ---
+check "MAX_QUEUE_BYTES present in ConfigMap" \
+    grep -q 'MAX_QUEUE_BYTES: "67108864"' <<<"$OUT"
+check "MAX_BATCH_BYTES present in ConfigMap" \
+    grep -q 'MAX_BATCH_BYTES: "4194304"' <<<"$OUT"
+
 # --- Overrides flow through ------------------------------------------------
-OUT2="$(helm template test-release "$CHART_DIR" \
+OUT2="$(helm template test-release "$CHART_DIR" "${BASE[@]}" \
     --set sensor.tenantId=acme --set sensor.criSocket=/run/k3s/containerd/containerd.sock)"
 check "sensor.tenantId override reaches the ConfigMap" \
     grep -q 'TENANT_ID: "acme"' <<<"$OUT2"

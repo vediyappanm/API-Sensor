@@ -40,6 +40,46 @@ fn jittered_backoff_ms(attempt: u32) -> u64 {
     base.saturating_sub(1).min(mix % base.max(1))
 }
 
+const MAX_ERROR_BODY_BYTES: usize = 512;
+
+/// At most `limit` bytes of an error response, read chunk by chunk. A body without
+/// Content-Length (chunked or close-delimited) can be arbitrarily large, so it is never
+/// buffered whole; the rest is abandoned with the connection.
+async fn read_error_body(mut resp: reqwest::Response, limit: usize) -> String {
+    let mut buf = Vec::with_capacity(limit.min(4096));
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = chunk.len().min(limit - buf.len());
+                buf.extend_from_slice(&chunk[..take]);
+                if buf.len() >= limit {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) if buf.is_empty() => return "[error reading body]".to_string(),
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Encode a serialized batch envelope for the wire. Payloads above the
+/// threshold are gzip-compressed and labelled `Content-Encoding: gzip`; the
+/// validator on the receiving side (tests/test-servers/validator/server.py)
+/// accepts exactly this contract.
+pub fn encode_batch_payload(json_bytes: &[u8]) -> Result<(Vec<u8>, Option<&'static str>)> {
+    use std::io::Write as IoWrite;
+
+    if json_bytes.len() > COMPRESS_THRESHOLD_BYTES {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(json_bytes)?;
+        Ok((encoder.finish()?, Some("gzip")))
+    } else {
+        Ok((json_bytes.to_vec(), None))
+    }
+}
+
 async fn try_send_batch(
     client: &reqwest::Client,
     url: &str,
@@ -48,19 +88,10 @@ async fn try_send_batch(
     policy_version: &str,
     events: Vec<ApiTrafficEvent>,
 ) -> Result<()> {
-    use std::io::Write as IoWrite;
-
     let event_count = events.len() as u64;
     let batch = to_sensor_batch(events, tenant_id, policy_version);
     let json_bytes = serde_json::to_vec(&batch)?;
-
-    let (payload, content_encoding) = if json_bytes.len() > COMPRESS_THRESHOLD_BYTES {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&json_bytes)?;
-        (encoder.finish()?, Some("gzip"))
-    } else {
-        (json_bytes, None)
-    };
+    let (payload, content_encoding) = encode_batch_payload(&json_bytes)?;
 
     let mut last_err: Option<String> = None;
     for attempt in 0..MAX_ATTEMPTS {
@@ -98,12 +129,9 @@ async fn try_send_batch(
                     continue;
                 }
                 SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
-                let text = resp
-                    .text()
-                    .await
-                    .map(|s| s.chars().take(512).collect::<String>())
-                    .unwrap_or_default();
-                return Err(anyhow::anyhow!("ingest HTTP {}: {}", status, text));
+                let text = read_error_body(resp, MAX_ERROR_BODY_BYTES).await;
+                let redacted_text = crate::redaction::redact_text(&text);
+                return Err(anyhow::anyhow!("ingest HTTP {}: {}", status, redacted_text));
             }
             Err(e) => {
                 if attempt + 1 < MAX_ATTEMPTS {
@@ -140,5 +168,88 @@ pub async fn send_batch_with_client(
             record_send_failure(count);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decompress(data: &[u8]) -> Vec<u8> {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut out = Vec::new();
+        GzDecoder::new(data).read_to_end(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn small_payload_is_plain_json_without_encoding() {
+        let (payload, enc) = encode_batch_payload(b"{\"MsgHeader\":{},\"Batch\":[]}").unwrap();
+        assert_eq!(enc, None, "below threshold nothing must be compressed");
+        assert_eq!(payload, b"{\"MsgHeader\":{},\"Batch\":[]}");
+    }
+
+    #[test]
+    fn large_payload_is_gzip_and_round_trips() {
+        // Just above the 4096-byte threshold the sensor must switch to gzip —
+        // this is the contract the integration validator enforces.
+        let big = serde_json::to_vec(&serde_json::json!({
+            "filler": "A".repeat(COMPRESS_THRESHOLD_BYTES + 256)
+        }))
+        .unwrap();
+        let (payload, enc) = encode_batch_payload(&big).unwrap();
+        assert_eq!(enc, Some("gzip"), "above threshold payload must be gzip");
+        assert_eq!(
+            payload[..2],
+            [0x1f, 0x8b],
+            "gzip magic must be present for servers that ignore the header"
+        );
+        assert!(payload.len() < big.len(), "compression must shrink the payload");
+        assert_eq!(decompress(&payload), big, "gzip must round-trip losslessly");
+    }
+
+    #[tokio::test]
+    async fn an_endless_chunked_error_body_is_read_only_up_to_the_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sent_srv = sent.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = sock.read(&mut req).await;
+            let head = b"HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\n\r\n";
+            if sock.write_all(head).await.is_err() {
+                return;
+            }
+            let chunk = format!("{:x}\r\n{}\r\n", 64 * 1024, "e".repeat(64 * 1024));
+            // 1 GiB if nobody stops reading; the client must give up long before.
+            for _ in 0..16 * 1024 {
+                if sock.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+                sent_srv.fetch_add(64 * 1024, Ordering::Relaxed);
+            }
+        });
+        let client = reqwest::Client::new();
+        let resp = client.post(format!("http://{addr}/")).body("x").send().await.unwrap();
+        let text = tokio::time::timeout(Duration::from_secs(10), read_error_body(resp, MAX_ERROR_BODY_BYTES))
+            .await
+            .expect("reading a capped error body must not wait for the whole stream");
+        assert_eq!(text.len(), MAX_ERROR_BODY_BYTES);
+        assert!(
+            sent.load(Ordering::Relaxed) < 64 * 1024 * 1024,
+            "client consumed {} bytes for a 512-byte log line",
+            sent.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn exactly_threshold_is_not_compressed() {
+        let exact = vec![b'x'; COMPRESS_THRESHOLD_BYTES];
+        let (_, enc) = encode_batch_payload(&exact).unwrap();
+        assert_eq!(enc, None, "threshold boundary itself stays uncompressed");
     }
 }

@@ -38,7 +38,10 @@ docker build -t api-sentinel:latest .
 
 ### Step 3: Deploy to Kubernetes
 ```bash
-helm upgrade --install api-sentinel-sensor deploy/helm/api-sentinel-sensor -n api-sensor --set 'sensor.onlyNamespaces={YOUR_NAMESPACES}'
+helm upgrade --install api-sentinel-sensor deploy/helm/api-sentinel-sensor -n api-sensor \
+  --set 'sensor.onlyNamespaces={YOUR_NAMESPACES}' \
+  --set sensor.ingestUrl=https://YOUR_INGEST_HOST/v1/events
+# In-cluster plain-HTTP backend (test only): also add --set sensor.allowInsecureHttp=true
 ```
 
 ### Step 4: Verify Deployment

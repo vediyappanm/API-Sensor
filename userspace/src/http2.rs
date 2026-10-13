@@ -278,12 +278,25 @@ pub fn extract_data_frames(buffer: &[u8], stream_id: u32) -> Vec<u8> {
 /// (a corrupt length would otherwise stall the stream waiting for megabytes that never come).
 pub const H2_MAX_ACCEPTED_FRAME: usize = 1 << 20;
 
+/// Total decoded-bytes budget for ONE header block, summed across its HEADERS/PUSH_PROMISE
+/// fragment and every CONTINUATION frame that follows (F01). Each individual frame is already
+/// bounded by `max_frame`, but a stream of valid-size CONTINUATION frames without END_HEADERS
+/// would otherwise grow `HeaderBlock.bytes` without limit while `buffered()` — which counts
+/// only the trailing-frame buffer, not the open block — reports those bytes as released.
+/// RFC 9113 recommends a header list under 8 KiB; we allow a generous ceiling and fail the
+/// direction (an unrecoverable HPACK desync) on violation rather than accumulate unbounded
+/// memory. `H2_MAX_ACCEPTED_FRAME` alone cannot bound a multi-frame block, hence this
+/// separate aggregate cap.
+pub const H2_MAX_HEADER_BLOCK_BYTES: usize = 128 * 1024;
+
 /// Something completed by the bytes fed to an [`Http2Direction`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum H2Item {
     Headers { stream_id: u32, headers: HashMap<String, String>, end_stream: bool },
     Data { stream_id: u32, data: Vec<u8>, end_stream: bool },
     Reset { stream_id: u32 },
+    /// Streams above `last_stream_id` were never processed by the sender of GOAWAY.
+    GoAway { last_stream_id: u32 },
 }
 
 struct HeaderBlock {
@@ -320,9 +333,10 @@ impl Http2Direction {
         }
     }
 
-    /// Bytes currently held (an incomplete trailing frame).
+    /// Bytes currently held: an incomplete trailing frame plus any open header block.
+    /// The caller keeps exactly this amount charged against the global budget.
     pub fn buffered(&self) -> usize {
-        self.buf.len()
+        self.buf.len() + self.continuation.as_ref().map_or(0, |b| b.bytes.len())
     }
 
     pub fn is_broken(&self) -> bool {
@@ -418,6 +432,14 @@ impl Http2Direction {
                 self.fail();
                 return;
             }
+            // F01: bound the aggregate header block across all CONTINUATION frames. A per-frame
+            // cap does not bound a multi-frame block, so check the running total BEFORE the
+            // append and fail the direction (unrecoverable HPACK desync) rather than grow
+            // unbounded memory that `buffered()` would not account for.
+            if open.bytes.len().saturating_add(payload.len()) > H2_MAX_HEADER_BLOCK_BYTES {
+                self.fail();
+                return;
+            }
             open.bytes.extend_from_slice(&payload);
             if flags & 0x04 != 0 {
                 self.finish_block(open, out);
@@ -449,6 +471,12 @@ impl Http2Direction {
                     }
                     frag = &frag[5..];
                 }
+                // F01: the initial fragment already counts toward the block budget, so a single
+                // near-max HEADERS frame cannot open a block that a later CONTINUATION would
+                // then push arbitrarily far past the ceiling.
+                if frag.len() > H2_MAX_HEADER_BLOCK_BYTES {
+                    return self.fail();
+                }
                 let block = HeaderBlock { stream_id, bytes: frag.to_vec(), end_stream: flags & 0x01 != 0, promise: false };
                 if flags & 0x04 != 0 {
                     self.finish_block(block, out);
@@ -477,7 +505,7 @@ impl Http2Direction {
                 // PUSH_PROMISE: promised stream id (4 bytes) then a header block that mutates the
                 // HPACK table, so it must be decoded even though its headers are not reported.
                 let Some(frag) = Self::unpad(flags, &payload) else { return self.fail() };
-                if frag.len() < 4 {
+                if frag.len() < 4 || frag.len() - 4 > H2_MAX_HEADER_BLOCK_BYTES {
                     return self.fail();
                 }
                 let block = HeaderBlock { stream_id, bytes: frag[4..].to_vec(), end_stream: false, promise: true };
@@ -487,8 +515,16 @@ impl Http2Direction {
                     self.continuation = Some(block);
                 }
             }
+            0x07 => {
+                // GOAWAY: last-stream-id (31 bits) + error code + optional debug data
+                if stream_id != 0 || payload.len() < 8 {
+                    return self.fail();
+                }
+                let last = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) & 0x7fff_ffff;
+                out.push(H2Item::GoAway { last_stream_id: last });
+            }
             0x09 => self.fail(), // CONTINUATION with no open header block
-            _ => {}               // PRIORITY, PING, GOAWAY, WINDOW_UPDATE, unknown: nothing to report
+            _ => {}               // PRIORITY, PING, WINDOW_UPDATE, unknown: nothing to report
         }
     }
 
@@ -1073,5 +1109,93 @@ mod direction_tests {
         let items = peer.feed(&frame(0x00, END_STREAM, 1, &big));
         assert!(matches!(&items[0], H2Item::Data { data, .. } if data.len() == 50_000));
         assert!(!peer.is_broken());
+    }
+
+    // ── F01: bounded header-block state ──────────────────────────────────────
+
+    /// Many valid-size CONTINUATION frames without END_HEADERS used to grow
+    /// `HeaderBlock.bytes` without limit while `buffered()` (which counts only the
+    /// trailing-frame buffer) reported the bytes as released. The direction must fail
+    /// and stop accumulating instead of exceeding the header-block budget.
+    #[test]
+    fn continuation_frames_cannot_exceed_the_header_block_budget() {
+        // Raise the per-frame ceiling so the frames are individually "valid"; only the
+        // aggregate block budget should trip. Each CONTINUATION carries max_frame bytes.
+        let mut d = Http2Direction::new(true);
+        d.set_max_frame(H2_MAX_ACCEPTED_FRAME);
+        // Open a header block: HEADERS without END_HEADERS, tiny initial fragment.
+        d.feed(&client_stream(&[frame(0x01, 0, 1, &[0x82])]));
+        assert!(!d.is_broken(), "opening HEADERS must not break the direction");
+
+        // Keep feeding CONTINUATION frames (no END_HEADERS) sized just under the budget.
+        // Together they must exceed H2_MAX_HEADER_BLOCK_BYTES and trip the guard.
+        let chunk = vec![b'a'; 8 * 1024];
+        let mut fed_bytes = 0usize;
+        // budget/8KiB frames is enough to overflow 128 KiB; add margin and stop early.
+        for _ in 0..(H2_MAX_HEADER_BLOCK_BYTES / (8 * 1024)) + 2 {
+            if d.is_broken() {
+                break;
+            }
+            d.feed(&frame(0x09, 0, 1, &chunk));
+            fed_bytes += chunk.len();
+            assert!(
+                fed_bytes <= H2_MAX_HEADER_BLOCK_BYTES + chunk.len(),
+                "must stop accumulating at/just past the budget"
+            );
+        }
+        assert!(
+            d.is_broken(),
+            "an unbounded CONTINUATION stream must fail the direction, not grow past the budget"
+        );
+    }
+
+    /// A single HEADERS fragment larger than the block budget must break the direction
+    /// immediately, so it cannot be used to seed an over-budget block.
+    #[test]
+    fn an_oversized_single_headers_fragment_is_rejected() {
+        let mut d = Http2Direction::new(true);
+        d.set_max_frame(H2_MAX_ACCEPTED_FRAME);
+        let oversized = vec![0x40u8; H2_MAX_HEADER_BLOCK_BYTES + 1];
+        d.feed(&client_stream(&[frame(0x01, 0, 1, &oversized)]));
+        assert!(
+            d.is_broken(),
+            "a HEADERS fragment past the block budget must fail the direction"
+        );
+    }
+
+    #[test]
+    fn an_open_header_block_is_reported_as_buffered_until_it_completes() {
+        let mut d = Http2Direction::new(true);
+        d.feed(&client_stream(&[frame(0x01, 0, 1, &[0x82])]));
+        d.feed(&frame(0x09, 0, 1, &vec![0x84u8; 4000]));
+        assert!(d.buffered() >= 4001, "retained header bytes must stay charged, got {}", d.buffered());
+        d.feed(&frame(0x09, END_HEADERS, 1, &[]));
+        assert_eq!(d.buffered(), 0, "a finished block releases its bytes");
+    }
+
+    #[test]
+    fn an_oversized_push_promise_fragment_is_rejected() {
+        let mut d = Http2Direction::new(false);
+        d.set_max_frame(H2_MAX_ACCEPTED_FRAME);
+        let mut payload = 2u32.to_be_bytes().to_vec();
+        payload.extend(vec![0x40u8; H2_MAX_HEADER_BLOCK_BYTES + 1]);
+        d.feed(&frame(0x05, 0, 1, &payload));
+        assert!(d.is_broken(), "PUSH_PROMISE must obey the same header-block budget as HEADERS");
+        assert_eq!(d.buffered(), 0);
+    }
+
+    /// A normal header block split across a HEADERS frame plus one CONTINUATION frame,
+    /// within budget, must still decode — the cap must not reject legitimate traffic.
+    #[test]
+    fn a_within_budget_continued_block_still_decodes() {
+        let mut d = Http2Direction::new(true);
+        let h = frame(0x01, 0, 1, &[0x82]); // HEADERS, no END_HEADERS: ":method: GET"
+        let c = frame(0x09, END_HEADERS, 1, &[0x84]); // CONTINUATION + END_HEADERS: ":path: /"
+        let items = d.feed(&client_stream(&[h, c]));
+        let hs = headers(&items);
+        assert_eq!(hs.len(), 1, "the continued block must produce one header set");
+        assert_eq!(hs[0].1[":method"], "GET");
+        assert_eq!(hs[0].1[":path"], "/");
+        assert!(!d.is_broken());
     }
 }

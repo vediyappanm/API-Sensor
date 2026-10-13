@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install BPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libbpf-dev libelf-dev zlib1g-dev libzstd-dev pkg-config libssl-dev protobuf-compiler
+
+      - name: Compile BPF object (production flags)
+        run: clang -O2 -g -Wall -Werror -target bpf -D__TARGET_ARCH_x86 -c bpf/http_trace.bpf.c -o /tmp/http_trace.bpf.o
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: userspace
+
+      - name: Unit and integration tests
+        working-directory: userspace
+        run: cargo test --locked --no-fail-fast
+
+  chart-and-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Helm lint, render and policy checks
+        run: bash deploy/helm/test-chart.sh
+      - name: Dockerfile lint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+      - name: Shell lint
+        run: shellcheck -S error scripts/*.sh deploy/helm/test-chart.sh
+      - name: Live harness self-test
+        run: bash scripts/test-live-harness.sh

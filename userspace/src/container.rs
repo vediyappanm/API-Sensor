@@ -31,6 +31,19 @@ pub struct CgroupInfo {
 struct ContainerCacheEntry {
     context: ContainerContext,
     last_seen: Instant,
+    /// Full container id still waiting for CRI metadata; `None` once resolved or not a container.
+    unresolved_id: Option<String>,
+    retry_at: Instant,
+    attempts: u32,
+}
+
+const LOOKUP_RETRY_BASE: Duration = Duration::from_secs(1);
+const LOOKUP_RETRY_MAX: Duration = Duration::from_secs(60);
+
+fn lookup_backoff(attempts: u32) -> Duration {
+    LOOKUP_RETRY_BASE
+        .saturating_mul(1u32 << attempts.min(6))
+        .min(LOOKUP_RETRY_MAX)
 }
 
 #[derive(Debug)]
@@ -167,7 +180,22 @@ impl ContainerResolver {
             if let Some(entry) = cache.get_mut(&ev.cgroup_id) {
                 if now.duration_since(entry.last_seen) < self.ttl {
                     entry.last_seen = now;
-                    return Some(entry.context.clone());
+                    let context = entry.context.clone();
+                    // A busy workload keeps hitting the cache; without this its failed first
+                    // lookup would never be retried and namespace scoping would drop it forever.
+                    let retry = match &entry.unresolved_id {
+                        Some(id) if now >= entry.retry_at => {
+                            entry.attempts = entry.attempts.saturating_add(1);
+                            entry.retry_at = now + lookup_backoff(entry.attempts);
+                            Some(id.clone())
+                        }
+                        _ => None,
+                    };
+                    drop(cache);
+                    if let Some(id) = retry {
+                        self.request_lookup(ev.cgroup_id, id);
+                    }
+                    return Some(context);
                 }
             }
             // Evict stale entries if cache is too large
@@ -205,30 +233,43 @@ impl ContainerResolver {
                 ContainerCacheEntry {
                     context: context.clone(),
                     last_seen: now,
+                    unresolved_id: container_id_full.clone(),
+                    retry_at: now + lookup_backoff(0),
+                    attempts: 0,
                 },
             );
         }
 
         if let Some(full_id) = container_id_full {
-            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            // Drop oldest pending lookups when at capacity. A bounded set
-            // prevents permanently-failing cgroups (e.g. container exited
-            // before our CRI lookup landed) from accumulating forever.
-            if !pending.contains(&ev.cgroup_id) {
-                if pending.len() >= MAX_PENDING_LOOKUPS {
-                    if let Some(victim) = pending.iter().next().copied() {
-                        pending.remove(&victim);
-                    }
-                }
-                pending.insert(ev.cgroup_id);
-                let _ = self.lookup_tx.try_send(ContainerLookupRequest {
-                    cgroup_id: ev.cgroup_id,
-                    container_id_full: full_id,
-                });
-            }
+            self.request_lookup(ev.cgroup_id, full_id);
         }
 
         Some(context)
+    }
+
+    /// Queue a CRI lookup unless one is already in flight. A full queue undoes the pending mark
+    /// so the retry deadline can try again.
+    fn request_lookup(&self, cgroup_id: u64, container_id_full: String) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.contains(&cgroup_id) {
+            return;
+        }
+        // Drop oldest pending lookups when at capacity. A bounded set
+        // prevents permanently-failing cgroups (e.g. container exited
+        // before our CRI lookup landed) from accumulating forever.
+        if pending.len() >= MAX_PENDING_LOOKUPS {
+            if let Some(victim) = pending.iter().next().copied() {
+                pending.remove(&victim);
+            }
+        }
+        pending.insert(cgroup_id);
+        if self
+            .lookup_tx
+            .try_send(ContainerLookupRequest { cgroup_id, container_id_full })
+            .is_err()
+        {
+            pending.remove(&cgroup_id);
+        }
     }
 
     pub fn update_from_cri(&self, cgroup_id: u64, metadata: ContainerMetadata) {
@@ -240,6 +281,7 @@ impl ContainerResolver {
             entry.context.service_name = metadata.service_name;
             entry.context.workload_type = metadata.workload_type;
             entry.last_seen = Instant::now();
+            entry.unresolved_id = None;
         }
         drop(cache);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -503,6 +545,7 @@ mod tests {
             ts_ns: 1, pid, tid: pid, ssl_ptr: 1, data_len: 0, direction: 0, ip_family: 0, _pad16: 0,
             comm: [0; 16], cgroup_id, netns_ino: 0, src_port: 0, dst_port: 0, src_ip4: 0, dst_ip4: 0,
             src_ip6: [0; 16], dst_ip6: [0; 16],
+            ..TlsEventHeader::blank()
         }
     }
 
@@ -525,6 +568,50 @@ mod tests {
 
         let ctx = resolver(&root).resolve(&event_for(cgroup_id, 3_250_818)).expect("context");
         assert_eq!(ctx.container_id, &id[..12], "container must be identified from the cgroup tree");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_busy_workload_whose_first_lookup_failed_is_resolved_without_a_restart() {
+        let root = scratch("retry");
+        let leaf = root.join(format!("kubepods.slice/crio-{}.scope", "ef".repeat(32)));
+        fs::create_dir_all(&leaf).unwrap();
+        let cg = fs::metadata(&leaf).unwrap().ino();
+        let (tx, mut rx) = mpsc::channel(1);
+        // Fill the queue so the first submission fails.
+        tx.try_send(ContainerLookupRequest { cgroup_id: 1, container_id_full: "x".into() }).unwrap();
+        let r = ContainerResolver::new(tx, "n".into()).with_cgroup_root(&root);
+        let unresolved = r.resolve(&event_for(cg, 1)).expect("context");
+        assert!(unresolved.pod_namespace.is_none());
+        assert!(!r.pending.lock().unwrap().contains(&cg), "a failed submission must not stay pending");
+        rx.try_recv().unwrap();
+
+        // Before the retry deadline the busy workload does not hammer the CRI.
+        r.resolve(&event_for(cg, 1));
+        assert!(rx.try_recv().is_err());
+
+        // Once the deadline passes, ordinary traffic requeues the lookup.
+        r.cache.lock().unwrap().get_mut(&cg).unwrap().retry_at = Instant::now();
+        r.resolve(&event_for(cg, 1));
+        let req = rx.try_recv().expect("lookup must be retried");
+        assert_eq!(req.cgroup_id, cg);
+
+        // The CRI call fails, then a later retry succeeds.
+        r.mark_lookup_failed(cg);
+        r.cache.lock().unwrap().get_mut(&cg).unwrap().retry_at = Instant::now();
+        r.resolve(&event_for(cg, 1));
+        rx.try_recv().expect("retried after failure");
+        r.update_from_cri(cg, ContainerMetadata {
+            pod_name: Some("p".into()),
+            pod_namespace: Some("prod".into()),
+            container_name: None,
+            service_name: None,
+            workload_type: None,
+        });
+        assert_eq!(r.resolve(&event_for(cg, 1)).unwrap().pod_namespace.as_deref(), Some("prod"));
+        r.cache.lock().unwrap().get_mut(&cg).unwrap().retry_at = Instant::now();
+        r.resolve(&event_for(cg, 1));
+        assert!(rx.try_recv().is_err(), "a resolved container is not looked up again");
         let _ = fs::remove_dir_all(&root);
     }
 

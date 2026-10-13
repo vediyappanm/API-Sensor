@@ -23,34 +23,52 @@ pub fn parse_sse_events(body: &[u8]) -> Vec<McpEvent> {
         let data = match line.strip_prefix("data: ") { Some(d) => d.trim(), None => continue };
         if data.is_empty() || data == "[DONE]" { continue; }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
-            if val.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") { continue; }
-            let method    = val.get("method").and_then(|v| v.as_str()).map(String::from);
-            let id        = val.get("id").cloned();
-            let tool_name = val.pointer("/params/name").and_then(|v| v.as_str()).map(String::from);
-            let json_str  = val.to_string().to_lowercase();
-
-            let injection_patterns = [
-                "ignore previous instructions", "ignore all previous",
-                "you are now", "disregard the above", "system prompt",
-                "jailbreak", "act as", "\n\nhuman:", "\n\nassistant:",
-                "<|im_start|>", "[inst]",
-            ];
-            let has_injection = injection_patterns.iter().any(|p| json_str.contains(p));
-
-            let permission_keywords = [
-                "execute", "admin", "root", "sudo", "chmod", "write",
-                "delete", "drop", "truncate", "shell", "cmd", "bash",
-                "system", "eval", "exec", "spawn",
-            ];
-            let permission_flags: Vec<String> = permission_keywords.iter()
-                .filter(|&&kw| json_str.contains(kw))
-                .map(|&kw| kw.to_string())
-                .collect();
-
-            events.push(McpEvent { method, id, tool_name, has_injection, permission_flags });
+            events.extend(analyse_jsonrpc(&val));
         }
     }
     events
+}
+
+/// MCP over Streamable HTTP: the client POSTs a JSON-RPC 2.0 call (or a batch),
+/// and the server may answer with plain JSON, so the request alone identifies MCP.
+pub fn parse_jsonrpc_request(body: &[u8]) -> Vec<McpEvent> {
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) else { return vec![] };
+    let calls: Vec<&serde_json::Value> = match &val {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    calls.into_iter()
+        .filter(|v| v.get("method").and_then(|m| m.as_str()).is_some())
+        .filter_map(analyse_jsonrpc)
+        .collect()
+}
+
+fn analyse_jsonrpc(val: &serde_json::Value) -> Option<McpEvent> {
+    if val.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") { return None; }
+    let method    = val.get("method").and_then(|v| v.as_str()).map(String::from);
+    let id        = val.get("id").cloned();
+    let tool_name = val.pointer("/params/name").and_then(|v| v.as_str()).map(String::from);
+    let json_str  = val.to_string().to_lowercase();
+
+    let injection_patterns = [
+        "ignore previous instructions", "ignore all previous",
+        "you are now", "disregard the above", "system prompt",
+        "jailbreak", "act as", "\n\nhuman:", "\n\nassistant:",
+        "<|im_start|>", "[inst]",
+    ];
+    let has_injection = injection_patterns.iter().any(|p| json_str.contains(p));
+
+    let permission_keywords = [
+        "execute", "admin", "root", "sudo", "chmod", "write",
+        "delete", "drop", "truncate", "shell", "cmd", "bash",
+        "system", "eval", "exec", "spawn",
+    ];
+    let permission_flags: Vec<String> = permission_keywords.iter()
+        .filter(|&&kw| json_str.contains(kw))
+        .map(|&kw| kw.to_string())
+        .collect();
+
+    Some(McpEvent { method, id, tool_name, has_injection, permission_flags })
 }
 
 pub fn is_mcp_response(headers: &HashMap<String, String>) -> bool {

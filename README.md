@@ -269,6 +269,7 @@ helm install api-sentinel-sensor deploy/helm/api-sentinel-sensor/ \
   --set image.repository=ghcr.io/api-sentinel-team/sensor \
   --set image.tag=v1.0.0 \
   --set sensor.ingestUrl=https://ingest.example.com/v1/events \
+  --set 'sensor.onlyNamespaces={my-apps}' \
   --set sensor.accountId="1000000"
 ```
 
@@ -280,11 +281,11 @@ helm install api-sentinel-sensor deploy/helm/api-sentinel-sensor/ \
   --set image.repository=ghcr.io/api-sentinel-team/sensor \
   --set image.tag=v1.0.0 \
   --set sensor.ingestUrl=https://ingest.example.com/v1/events \
+  --set 'sensor.onlyNamespaces={my-apps}' \
   --set sensor.accountId="1000000" \
   --set sensor.batchSize="500" \
   --set sensor.sampleDefault="50" \
   --set sensor.sampleHealth="1" \
-  --set sensor.role=server \
   --set resources.limits.cpu=1000m \
   --set resources.limits.memory=512Mi \
   --set resources.requests.cpu=200m \
@@ -307,10 +308,13 @@ helm install api-sentinel-sensor deploy/helm/api-sentinel-sensor/ \
 | `image.repository` | `ghcr.io/api-sentinel-team/sensor` | Container image repository |
 | `image.tag` | `latest` | Image tag |
 | `image.pullPolicy` | `IfNotPresent` | Image pull policy |
-| `sensor.ingestUrl` | `http://api-sentinel-ingest:8080/v1/events` | Backend ingest endpoint |
+| `sensor.ingestUrl` | none (required) | Backend ingest endpoint, `https://...` |
+| `sensor.allowInsecureHttp` | `false` | Allow an `http://` ingestUrl (sets `APISEC_ALLOW_HTTP=true`); in-cluster/test only |
+| `sensor.onlyNamespaces` | `[]` | Namespaces to capture; required unless `captureAllWorkloads` |
+| `sensor.captureAllWorkloads` | `false` | Capture every workload on the node (sets `APISEC_ALLOW_CAPTURE_ALL=true`) |
 | `sensor.accountId` | `1000000` | Account ID for event metadata |
 | `sensor.batchSize` | `200` | Events per batch |
-| `sensor.role` | `server` | Traffic role (`server` or `client`) |
+| `sensor.role` | `auto` | Request direction per connection (`auto`); `server`/`client` force one direction |
 | `sensor.sampleDefault` | `100` | Default sampling rate (0-100) |
 | `sensor.sampleHealth` | `5` | Health endpoint sampling rate |
 | `sensor.metricsPort` | `9090` | Prometheus metrics port |

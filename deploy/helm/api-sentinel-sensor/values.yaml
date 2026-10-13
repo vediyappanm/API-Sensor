@@ -13,14 +13,26 @@ resources:
 
 sensor:
   bpfObjectPath: /app/bpf/http_trace.bpf.o
-  ingestUrl: http://api-sentinel-ingest:8080/v1/events
+  # REQUIRED. The backend ingest endpoint, e.g. https://ingest.example.com/v1/events.
+  ingestUrl: ""
+  # The API key is sent with every batch. An http:// ingestUrl is refused (by the chart and by
+  # the sensor at startup) unless this is true. Only for an in-cluster or test backend.
+  allowInsecureHttp: false
   accountId: "1000000"
   tenantId: "default"
   policyVersion: "1"
   batchSize: "200"
-  role: server
+  # auto: decide request/response direction per connection (inbound and outbound in one pod).
+  # server / client force one direction for every connection (diagnostics only).
+  role: auto
+  # Export drain budget on SIGTERM; the pod's grace period is set 10s above it.
+  shutdownTimeoutSecs: 20
   maxBufferBytes: "65536"
   maxTotalBufferBytes: "104857600"
+  # Export memory: events waiting to be sent (dropped and counted beyond this), and the size at
+  # which a batch is sent early. Keep buffers + queue + ~3x batch well under resources.limits.memory.
+  maxQueueBytes: "67108864"
+  maxBatchBytes: "4194304"
   metricsPort: 9090
   sampleDefault: "100"
   sampleHealth: "5"
@@ -30,6 +42,7 @@ sensor:
   # whose namespace is not yet known) is skipped before it is buffered.
   onlyNamespaces: []          # e.g. ["aegis-sentinel", "my-apps"]
   # Only for a node dedicated to the monitored workloads. Captures EVERYTHING on the node.
+  # Sets APISEC_ALLOW_CAPTURE_ALL=true, the sensor's own opt-in for running without a scope.
   captureAllWorkloads: false
   # containerd CRI socket on the node — required for pod/namespace enrichment.
   # k3s nodes use /run/k3s/containerd/containerd.sock.

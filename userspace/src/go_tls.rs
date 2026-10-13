@@ -14,7 +14,6 @@ pub struct GoTlsOffsets {
     pub read_offset:   usize,
     pub read_rets:     Vec<usize>,
     pub go_version:    String,
-    pub goid_offset:   u64,
 }
 
 pub fn find_go_tls_offsets(binary_path: &str) -> Option<GoTlsOffsets> {
@@ -22,7 +21,11 @@ pub fn find_go_tls_offsets(binary_path: &str) -> Option<GoTlsOffsets> {
     let elf_file = elf::ElfBytes::<elf::endian::AnyEndian>::minimal_parse(&data).ok()?;
 
     let go_version = parse_go_version_from_binary(&data).unwrap_or_else(|| "unknown".to_string());
-    let goid_offset = goid_offset_for_version(&go_version);
+    if !uses_register_abi(&go_version) {
+        tracing::warn!(binary = %binary_path, version = %go_version,
+            "Go TLS skipped: goroutine identity needs the Go >= 1.17 register ABI");
+        return None;
+    }
 
     let write_offset = find_elf_symbol(&elf_file, "crypto/tls.(*Conn).Write")
         .or_else(|| find_elf_symbol_dyn(&elf_file, "crypto/tls.(*Conn).Write"));
@@ -62,7 +65,7 @@ pub fn find_go_tls_offsets(binary_path: &str) -> Option<GoTlsOffsets> {
         write_rets,
         read_offset: read_file_off,
         read_rets,
-        go_version, goid_offset,
+        go_version,
     })
 }
 
@@ -203,38 +206,13 @@ fn parse_go_version_from_binary(data: &[u8]) -> Option<String> {
     None
 }
 
-/// Offset of the `goid` field inside `runtime.g` for each Go release.
-///
-/// The struct `g` was reorganized in Go 1.17 alongside the register-based
-/// calling convention; goid moved from 192 (1.13–1.16 layout) to 152 and has
-/// stayed there through Go 1.24. We keep an explicit per-version mapping
-/// rather than a single default so future Go releases that move the field
-/// will produce a clear miss instead of silently corrupting attribution.
-///
-/// Cross-referenced against:
-/// - eCapture (gojue/ecapture) — uses 152 for Go 1.18+
-/// - gspy (Mutasem-mk4/gspy) — validated for 1.21.x–1.23.x with 152
-/// - outrigdev/goid — universal fallback at 152 for 1.23–1.25
-/// - Go runtime source: src/runtime/runtime2.go `type g struct`
-fn goid_offset_for_version(version: &str) -> u64 {
-    // Strip patch/extra to get the base "go1.NN".
-    let base = version.split('.').take(2).collect::<Vec<_>>().join(".");
-    match base.as_str() {
-        // Pre-1.17 layout — goid sat after a wider sched/preempt block.
-        "go1.13" | "go1.14" | "go1.15" | "go1.16" => 192,
-        // Modern layout, stable from 1.17 onwards.
-        "go1.17" | "go1.18" | "go1.19" | "go1.20"
-        | "go1.21" | "go1.22" | "go1.23" | "go1.24" => 152,
-        // Unknown / future version — assume modern layout but log so an
-        // operator can investigate if attribution drifts.
-        other => {
-            tracing::warn!(
-                version = %other,
-                "Go TLS: unknown Go release; using goid offset 152 (modern layout)"
-            );
-            152
-        }
-    }
+/// The BPF probes take the current goroutine from the ABIInternal `g` register (R14 on amd64,
+/// R28 on arm64), which exists from Go 1.17. Older or unidentifiable binaries are refused rather
+/// than paired by thread id, which mixes up goroutines that migrate between threads.
+pub fn uses_register_abi(version: &str) -> bool {
+    let Some(rest) = version.strip_prefix("go1.") else { return false };
+    let minor: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    minor.parse::<u32>().is_ok_and(|m| m >= 17)
 }
 
 /// Maximum file size to read when scanning for Go binaries (200 MB).
@@ -352,20 +330,28 @@ pub fn detect_go_binary(pid: i32) -> Option<String> {
     None
 }
 
+/// Attach every Go TLS probe for one binary. An entry probe without all of its return probes
+/// would leave calls unpaired, so any failure detaches what was attached for this binary and
+/// is reported to the caller.
 pub fn attach_go_tls_probes(
     obj: &mut libbpf_rs::Object,
     offsets: &GoTlsOffsets,
     links: &mut Vec<libbpf_rs::Link>,
     pid: i32,
-) {
-    let _ = attach_at_offset(obj, "go_tls_write_entry", &offsets.binary_path, offsets.write_offset, false, pid, links);
-    for &ret in &offsets.write_rets {
-        let _ = attach_at_offset(obj, "go_tls_write_exit", &offsets.binary_path, ret, false, pid, links);
+) -> anyhow::Result<usize> {
+    let mut mine = Vec::new();
+    let bin = &offsets.binary_path;
+    let plan = std::iter::once(("go_tls_write_entry", offsets.write_offset))
+        .chain(offsets.write_rets.iter().map(|&r| ("go_tls_write_exit", r)))
+        .chain(std::iter::once(("go_tls_read_entry", offsets.read_offset)))
+        .chain(offsets.read_rets.iter().map(|&r| ("go_tls_read_exit", r)));
+    for (prog, off) in plan {
+        // Dropping `mine` on error detaches the partial set.
+        attach_at_offset(obj, prog, bin, off, false, pid, &mut mine)?;
     }
-    let _ = attach_at_offset(obj, "go_tls_read_entry", &offsets.binary_path, offsets.read_offset, false, pid, links);
-    for &ret in &offsets.read_rets {
-        let _ = attach_at_offset(obj, "go_tls_read_exit", &offsets.binary_path, ret, false, pid, links);
-    }
+    let n = mine.len();
+    links.extend(mine);
+    Ok(n)
 }
 
 pub fn attach_at_offset(
@@ -391,6 +377,16 @@ pub fn attach_at_offset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_register_abi_go_releases_are_attached() {
+        for v in ["go1.17", "go1.21.5", "go1.24rc1", "go1.30"] {
+            assert!(uses_register_abi(v), "{v}");
+        }
+        for v in ["go1.16.15", "go1.9", "unknown", "devel", ""] {
+            assert!(!uses_register_abi(v), "{v}");
+        }
+    }
 
     #[test]
     fn node_wide_scan_respects_a_zero_limit() {

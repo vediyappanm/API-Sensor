@@ -25,6 +25,13 @@ pub static EVENTS_LOST_SEND:   AtomicU64 = AtomicU64::new(0);
 pub static EVENTS_SENT:        AtomicU64 = AtomicU64::new(0);
 pub static SEND_ERRORS:        AtomicU64 = AtomicU64::new(0);
 pub static RINGBUF_DROPS:      AtomicU64 = AtomicU64::new(0);
+// F02, F09: Producer-side loss counters from BPF (per-CPU aggregated in userspace)
+pub static BPF_ATTEMPTED:      AtomicU64 = AtomicU64::new(0);
+pub static BPF_SUBMITTED:      AtomicU64 = AtomicU64::new(0);
+pub static BPF_RESERVE_FAIL:   AtomicU64 = AtomicU64::new(0);
+pub static BPF_COPY_FAIL:      AtomicU64 = AtomicU64::new(0);
+pub static BPF_SAMPLED:        AtomicU64 = AtomicU64::new(0);
+pub static BPF_MAP_FAIL:       AtomicU64 = AtomicU64::new(0);
 pub static PROTO_HTTP1:        AtomicU64 = AtomicU64::new(0);
 pub static PROTO_HTTP2:        AtomicU64 = AtomicU64::new(0);
 pub static PROTO_GRPC:         AtomicU64 = AtomicU64::new(0);
@@ -35,6 +42,29 @@ pub static PROTO_GO_TLS:       AtomicU64 = AtomicU64::new(0);
 pub static ACTIVE_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 pub static START_TIME_SECS:    AtomicU64 = AtomicU64::new(0);
 pub static CHANNEL_WATERMARK_PCT: AtomicU64 = AtomicU64::new(0);
+/// Captured TLS chunks with missing bytes (kernel truncation or buffer overflow); the stream
+/// is not parsed across the gap (F08).
+pub static CAPTURE_GAPS:       AtomicU64 = AtomicU64::new(0);
+/// Chunks skipped because `--role auto` could not yet determine which direction carries requests.
+pub static ROLE_AMBIGUOUS:     AtomicU64 = AtomicU64::new(0);
+/// Completed transactions intentionally dropped by sampling (not a loss) (F07).
+pub static TRANSACTIONS_SAMPLED: AtomicU64 = AtomicU64::new(0);
+/// Ring records whose ABI version does not match this binary; dropped unparsed.
+pub static ABI_MISMATCH:       AtomicU64 = AtomicU64::new(0);
+/// HTTP/1 messages whose body exceeded the preview cap or ended without framing.
+pub static BODIES_TRUNCATED:   AtomicU64 = AtomicU64::new(0);
+/// HTTP/1 framing violations (ambiguous lengths, bad chunk syntax, non-HTTP bytes).
+pub static H1_PARSE_ERRORS:    AtomicU64 = AtomicU64::new(0);
+/// Provider attach attempts that failed and left that binary or library uncaptured.
+pub static PROBE_ATTACH_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Requests exported without a response (expired, connection closed, or sensor shutdown).
+pub static TRANSACTIONS_INCOMPLETE: AtomicU64 = AtomicU64::new(0);
+/// Bytes of events waiting in the export queue (charged size, see `ApiTrafficEvent::approx_bytes`).
+pub static EXPORT_QUEUE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Events refused because the export queue's byte budget was full (also in EVENTS_DROPPED).
+pub static EXPORT_QUEUE_BYTE_DROPS: AtomicU64 = AtomicU64::new(0);
+/// Events larger than the whole batch byte budget, dropped (also in EVENTS_DROPPED).
+pub static EXPORT_OVERSIZED_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// Startup grace period: /readyz returns 200 during this window even without events, and
 /// /healthz tolerates a capture loop that has not polled yet while probes are still attaching.
@@ -165,6 +195,30 @@ apisec_active_connections {}
 # TYPE apisec_ringbuf_drops_total counter
 apisec_ringbuf_drops_total {}
 
+# HELP apisec_bpf_attempted_total BPF producer attempted records
+# TYPE apisec_bpf_attempted_total counter
+apisec_bpf_attempted_total {}
+
+# HELP apisec_bpf_submitted_total BPF producer successfully submitted records
+# TYPE apisec_bpf_submitted_total counter
+apisec_bpf_submitted_total {}
+
+# HELP apisec_bpf_reserve_fail_total BPF producer ring buffer reserve failures
+# TYPE apisec_bpf_reserve_fail_total counter
+apisec_bpf_reserve_fail_total {}
+
+# HELP apisec_bpf_copy_fail_total BPF producer memory copy failures
+# TYPE apisec_bpf_copy_fail_total counter
+apisec_bpf_copy_fail_total {}
+
+# HELP apisec_bpf_sampled_total BPF producer intentionally sampled (not a loss)
+# TYPE apisec_bpf_sampled_total counter
+apisec_bpf_sampled_total {}
+
+# HELP apisec_bpf_map_fail_total BPF producer map lookup failures
+# TYPE apisec_bpf_map_fail_total counter
+apisec_bpf_map_fail_total {}
+
 # HELP apisec_protocol_events_total Events by protocol
 # TYPE apisec_protocol_events_total counter
 apisec_protocol_events_total{{protocol=\"http1\"}} {}
@@ -179,6 +233,50 @@ apisec_protocol_events_total{{protocol=\"go_tls\"}} {}
 # TYPE apisec_channel_watermark_pct gauge
 apisec_channel_watermark_pct {}
 
+# HELP apisec_capture_gaps_total TLS chunks with missing bytes; stream not joined across the gap
+# TYPE apisec_capture_gaps_total counter
+apisec_capture_gaps_total {}
+
+# HELP apisec_role_ambiguous_total Chunks skipped because connection role was not yet known
+# TYPE apisec_role_ambiguous_total counter
+apisec_role_ambiguous_total {}
+
+# HELP apisec_transactions_sampled_total Completed transactions dropped by sampling (not a loss)
+# TYPE apisec_transactions_sampled_total counter
+apisec_transactions_sampled_total {}
+
+# HELP apisec_abi_mismatch_total Ring records rejected for BPF/userspace ABI version mismatch
+# TYPE apisec_abi_mismatch_total counter
+apisec_abi_mismatch_total {}
+
+# HELP apisec_bodies_truncated_total HTTP/1 bodies cut at the preview cap or close-delimited
+# TYPE apisec_bodies_truncated_total counter
+apisec_bodies_truncated_total {}
+
+# HELP apisec_http1_parse_errors_total HTTP/1 framing violations; stream resynchronised
+# TYPE apisec_http1_parse_errors_total counter
+apisec_http1_parse_errors_total {}
+
+# HELP apisec_probe_attach_failures_total Provider attachments that failed; that target is not captured
+# TYPE apisec_probe_attach_failures_total counter
+apisec_probe_attach_failures_total {}
+
+# HELP apisec_transactions_incomplete_total Requests exported with an outcome instead of a response
+# TYPE apisec_transactions_incomplete_total counter
+apisec_transactions_incomplete_total {}
+
+# HELP apisec_export_queue_bytes Bytes of events waiting in the export queue
+# TYPE apisec_export_queue_bytes gauge
+apisec_export_queue_bytes {}
+
+# HELP apisec_export_queue_byte_drops_total Events dropped because the export queue byte budget was full
+# TYPE apisec_export_queue_byte_drops_total counter
+apisec_export_queue_byte_drops_total {}
+
+# HELP apisec_export_oversized_drops_total Events dropped because one event exceeded the batch byte budget
+# TYPE apisec_export_oversized_drops_total counter
+apisec_export_oversized_drops_total {}
+
 # HELP apisec_uptime_seconds Sensor uptime
 # TYPE apisec_uptime_seconds gauge
 apisec_uptime_seconds {uptime}
@@ -188,6 +286,12 @@ apisec_uptime_seconds {uptime}
         SEND_ERRORS.load(Ordering::Relaxed),
         ACTIVE_CONNECTIONS.load(Ordering::Relaxed),
         RINGBUF_DROPS.load(Ordering::Relaxed),
+        BPF_ATTEMPTED.load(Ordering::Relaxed),
+        BPF_SUBMITTED.load(Ordering::Relaxed),
+        BPF_RESERVE_FAIL.load(Ordering::Relaxed),
+        BPF_COPY_FAIL.load(Ordering::Relaxed),
+        BPF_SAMPLED.load(Ordering::Relaxed),
+        BPF_MAP_FAIL.load(Ordering::Relaxed),
         PROTO_HTTP1.load(Ordering::Relaxed),
         PROTO_HTTP2.load(Ordering::Relaxed),
         PROTO_GRPC.load(Ordering::Relaxed),
@@ -196,6 +300,17 @@ apisec_uptime_seconds {uptime}
         PROTO_HTTP3.load(Ordering::Relaxed),
         PROTO_GO_TLS.load(Ordering::Relaxed),
         CHANNEL_WATERMARK_PCT.load(Ordering::Relaxed),
+        CAPTURE_GAPS.load(Ordering::Relaxed),
+        ROLE_AMBIGUOUS.load(Ordering::Relaxed),
+        TRANSACTIONS_SAMPLED.load(Ordering::Relaxed),
+        ABI_MISMATCH.load(Ordering::Relaxed),
+        BODIES_TRUNCATED.load(Ordering::Relaxed),
+        H1_PARSE_ERRORS.load(Ordering::Relaxed),
+        PROBE_ATTACH_FAILURES.load(Ordering::Relaxed),
+        TRANSACTIONS_INCOMPLETE.load(Ordering::Relaxed),
+        EXPORT_QUEUE_BYTES.load(Ordering::Relaxed),
+        EXPORT_QUEUE_BYTE_DROPS.load(Ordering::Relaxed),
+        EXPORT_OVERSIZED_DROPS.load(Ordering::Relaxed),
     )
 }
 

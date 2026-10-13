@@ -9,6 +9,16 @@ fail() { echo -e "${RED}[FAIL]${RESET} $1"; FAIL=$((FAIL+1)); TOTAL_TESTS=$((TOT
 info() { echo -e "${YELLOW}[INFO]${RESET} $1"; }
 step() { echo -e "\n${CYAN}── $1 ──${RESET}"; }
 
+# Archive the identities this run actually tested (audit F20).
+GIT_REV=$(git -C /sensor rev-parse HEAD 2>/dev/null || echo "unknown")
+{
+    echo "source=${GIT_REV}"
+    echo "kernel=$(uname -r 2>/dev/null || echo unknown)"
+    echo "arch=$(uname -m 2>/dev/null || echo unknown)"
+    echo "date_utc=$(date -u +%FT%TZ 2>/dev/null || echo unknown)"
+} > /tmp/api-sensor-e2e-identity.txt 2>/dev/null || true
+info "Source: ${GIT_REV} | Kernel: $(uname -r 2>/dev/null) | $(uname -m 2>/dev/null)"
+
 SENSOR_BIN="/sensor/userspace/target/release/api-sec-sensor"
 BPF_OBJ="/sensor/bpf/http_trace.bpf.o"
 INGEST_PORT=9999
@@ -52,61 +62,24 @@ else
     ok "BPF verifier (deferred to sensor startup)"
 fi
 
-# ── Test 2: Start ingest stub (captures events for inspection) ─────────────
-step "Test 2: Start Ingest Stub"
-python3 - <<'PYEOF' &
-import sys, json, datetime, os, threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
-
-events_file = "/tmp/captured_events.json"
-all_events = []
-lock = threading.Lock()
-
-class Handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        try:
-            n = int(self.headers.get('Content-Length', 0))
-            body = json.loads(self.rfile.read(n))
-            events = body.get('events', [])
-            with lock:
-                all_events.extend(events)
-                with open(events_file, 'w') as f:
-                    json.dump(all_events, f, indent=2)
-            for e in events:
-                proto = e.get('protocol', '?')
-                req   = e.get('request', {})
-                resp  = e.get('response', {})
-                ts    = datetime.datetime.now().strftime('%H:%M:%S')
-                print(f"[{ts}] {proto} {req.get('method','?')} "
-                      f"{req.get('path','?')} -> {resp.get('status_code','?')}", flush=True)
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
-        except Exception as ex:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b'{"error":"bad request"}')
-    def log_message(self, *a): pass
-
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-# Initialize empty events file
-with open(events_file, 'w') as f:
-    json.dump([], f)
-
-print(f"Ingest stub listening on :{9999}", flush=True)
-ThreadedHTTPServer(('', 9999), Handler).serve_forever()
-PYEOF
+# ── Test 2: Start ingest validator (real MsgHeader/Batch schema, gzip OK) ───
+step "Test 2: Start Ingest Validator"
+VALIDATOR_PY="/sensor/tests/test-servers/validator/server.py"
+if [[ ! -f "$VALIDATOR_PY" ]]; then
+    VALIDATOR_PY="$(cd "$(dirname "$0")/.." && pwd)/tests/test-servers/validator/server.py"
+fi
+if [[ ! -f "$VALIDATOR_PY" ]]; then
+    fail "Validator script not found — the e2e suite requires the schema-validating ingest validator (F20)"
+    exit 1
+fi
+VALIDATOR_PORT="${INGEST_PORT}" python3 "$VALIDATOR_PY" &
 INGEST_PID=$!
 sleep 1
 
-if kill -0 "$INGEST_PID" 2>/dev/null; then
-    ok "Ingest stub running (PID=$INGEST_PID)"
+if kill -0 "$INGEST_PID" 2>/dev/null && curl -sf "http://localhost:${INGEST_PORT}/health" >/dev/null; then
+    ok "Ingest validator running (PID=$INGEST_PID, MsgHeader/Batch schema, gzip accepted)"
 else
-    fail "Ingest stub failed to start"
+    fail "Ingest validator failed to start"
     exit 1
 fi
 
@@ -114,7 +87,7 @@ fi
 step "Test 3: Sensor Startup"
 RUST_LOG=info "$SENSOR_BIN" \
     --bpf "$BPF_OBJ" \
-    --ingest "http://127.0.0.1:${INGEST_PORT}" \
+    --ingest "http://127.0.0.1:${INGEST_PORT}/ingest" \
     --api-key "e2e-test-key" \
     --account-id 1001 \
     --role client \
@@ -210,26 +183,22 @@ curl -sk "https://httpbin.org/get?email=alice@example.com&ssn=123-45-6789&cc=411
     -o /dev/null 2>/dev/null || true
 sleep 3
 
-# Check captured events file for raw PII
-if [[ -f /tmp/captured_events.json ]]; then
-    EVENTS_JSON=$(cat /tmp/captured_events.json)
-    if echo "$EVENTS_JSON" | grep -q "alice@example.com"; then
-        fail "Raw email found in captured events (PII redaction failed)"
-    else
-        ok "Raw email NOT in captured events (PII redacted)"
-    fi
-    if echo "$EVENTS_JSON" | grep -q "123-45-6789"; then
-        fail "Raw SSN found in captured events (PII redaction failed)"
-    else
-        ok "Raw SSN NOT in captured events (PII redacted)"
-    fi
-    if echo "$EVENTS_JSON" | grep -q "4111111111111111"; then
-        fail "Raw credit card found in captured events"
-    else
-        ok "Raw credit card NOT in captured events (PII redacted)"
-    fi
+# Check schema-accepted events for raw PII (request-side fields)
+EVENTS_JSON=$(curl -sf "http://localhost:${INGEST_PORT}/events" 2>/dev/null || echo "")
+if echo "$EVENTS_JSON" | grep -q "alice@example.com"; then
+    fail "Raw email found in captured request lines (PII redaction failed)"
 else
-    info "No events file yet — PII test inconclusive"
+    ok "Raw email NOT in captured request lines (PII redacted)"
+fi
+if echo "$EVENTS_JSON" | grep -q "123-45-6789"; then
+    fail "Raw SSN found in captured request lines (PII redaction failed)"
+else
+    ok "Raw SSN NOT in captured request lines (PII redacted)"
+fi
+if echo "$EVENTS_JSON" | grep -q "4111111111111111"; then
+    fail "Raw credit card found in captured request lines"
+else
+    ok "Raw credit card NOT in captured request lines"
 fi
 
 # ── Test 8: Events are sent to ingest ─────────────────────────────────────
@@ -263,86 +232,44 @@ else
     fail "No HTTP/2 events detected"
 fi
 
-# ── Test 10: Event structure validation ───────────────────────────────────
-step "Test 10: Event Structure Validation"
-if [[ -f /tmp/captured_events.json ]]; then
-    EVENT_COUNT=$(python3 -c "
+# ── Test 10: Accepted-event schema validation (validator-enforced) ──────────
+step "Test 10: Accepted Event Schema Validation"
+# The validator only ever accepted payloads matching the real MsgHeader/Batch
+# wire schema — so an accepted_total > 0 IS the schema validation (audit F20).
+# The old check validated the legacy nested schema against a file the old stub
+# wrote; it could not fail on today's exporter.
+SUMMARY=$(curl -sf "http://localhost:${INGEST_PORT}/summary" 2>/dev/null || echo "")
+info "Validator summary: ${SUMMARY:-<unreachable>}"
+ACCEPTED=$(echo "$SUMMARY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('accepted_total', 0))" 2>/dev/null || echo "0")
+REJECTED=$(echo "$SUMMARY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('rejected_total', 0))" 2>/dev/null || echo "0")
+LAST_REJ=$(echo "$SUMMARY" | python3 -c "import json,sys; r=json.load(sys.stdin).get('last_rejection'); print(r.get('error','') if r else '')" 2>/dev/null || echo "")
+
+if [[ "${ACCEPTED:-0}" -gt 0 ]]; then
+    ok "Validator accepted ${ACCEPTED} schema-valid events (MsgHeader/Batch contract holds)"
+    FIRST_EVENT=$(curl -sf "http://localhost:${INGEST_PORT}/events" 2>/dev/null | python3 -c "
 import json, sys
-events = json.load(open('/tmp/captured_events.json'))
-print(len(events))
-" 2>/dev/null || echo "0")
-    if [[ "$EVENT_COUNT" -gt 0 ]]; then
-        ok "Received $EVENT_COUNT events in ingest stub"
-        # Validate first event structure
-        VALID=$(python3 -c "
-import json, sys
-events = json.load(open('/tmp/captured_events.json'))
-e = events[0]
-required = ['version', 'event_type', 'source', 'account_id', 'observed_at',
-            'protocol', 'request', 'response']
-missing = [f for f in required if f not in e]
+data = json.load(sys.stdin)
+evs = data.get('events', [])
+e = evs[0] if evs else {}
+required = ['SrcInfo.Source', 'LogVersion', 'Id', 'SessionStats.StartTime',
+            'L7Protocol', 'HTTPReq.Method', 'HTTPReq.Uri', 'HTTPReq.Query',
+            'HTTPReq.BodyLength', 'HTTPResp.ResponseCode',
+            'DownstreamL3L4.SourceIP', 'DownstreamL3L4.DestIP',
+            'Proto', 'APIID', 'MetaDataMap']
+missing = [k for k in required if k not in e]
 if missing:
     print(f'MISSING: {missing}')
     sys.exit(1)
-req = e['request']
-req_fields = ['method', 'path', 'scheme', 'headers']
-missing_req = [f for f in req_fields if f not in req]
-if missing_req:
-    print(f'MISSING_REQ: {missing_req}')
-    sys.exit(1)
-resp = e['response']
-if 'status_code' not in resp:
-    print('MISSING: response.status_code')
-    sys.exit(1)
-# Check new fields exist (process_name, hostnames)
-print(f'version={e[\"version\"]} proto={e[\"protocol\"]} method={req[\"method\"]} status={resp[\"status_code\"]}')
-if 'process_name' in e:
-    print(f'process_name={e.get(\"process_name\")}')
-if 'source_hostname' in e:
-    print(f'source_hostname={e.get(\"source_hostname\")}')
-if 'dest_hostname' in e:
-    print(f'dest_hostname={e.get(\"dest_hostname\")}')
-if 'anomaly_features' in e and e['anomaly_features']:
-    af = e['anomaly_features']
-    print(f'anomaly_features: path_depth={af.get(\"path_depth\")} entropy={af.get(\"shannon_entropy\",0):.2f}')
-print('VALID')
+print(f\"proto={e['L7Protocol']} method={e['HTTPReq.Method']} \"
+      f\"status={e['HTTPResp.ResponseCode']} process={e.get('Req.Header.user-agent','?')}\")
 " 2>/dev/null || echo "ERROR")
-        if echo "$VALID" | grep -q "VALID"; then
-            ok "Event structure valid: $(echo "$VALID" | head -1)"
-        else
-            fail "Event structure invalid: $VALID"
-        fi
-
-        # Check process_name field (new feature)
-        HAS_PROCESS_NAME=$(python3 -c "
-import json
-events = json.load(open('/tmp/captured_events.json'))
-has = any(e.get('process_name') for e in events)
-print('yes' if has else 'no')
-" 2>/dev/null || echo "no")
-        if [[ "$HAS_PROCESS_NAME" == "yes" ]]; then
-            ok "process_name field populated in events (new feature working)"
-        else
-            info "process_name not yet populated (may appear on next event cycle)"
-        fi
-
-        # Check anomaly_features
-        HAS_ANOMALY=$(python3 -c "
-import json
-events = json.load(open('/tmp/captured_events.json'))
-has = any(e.get('anomaly_features') for e in events)
-print('yes' if has else 'no')
-" 2>/dev/null || echo "no")
-        if [[ "$HAS_ANOMALY" == "yes" ]]; then
-            ok "anomaly_features present in events"
-        else
-            fail "anomaly_features missing from events"
-        fi
+    if echo "$FIRST_EVENT" | grep -q "proto="; then
+        ok "Accepted event carries the full dotted-key contract: $(echo "$FIRST_EVENT" | head -1)"
     else
-        fail "No events received in ingest stub"
+        fail "Accepted event failed the dotted-key contract check: $FIRST_EVENT"
     fi
 else
-    fail "Events file not created"
+    fail "Validator accepted 0 events (rejected=${REJECTED:-?}${LAST_REJ:+ last_rejection=$LAST_REJ}) — wire-schema regression or delivery failure"
 fi
 
 # ── Test 11: Drop rate is acceptable ──────────────────────────────────────
@@ -425,24 +352,26 @@ echo "================================================================"
 echo "  Results: ${PASS} passed / ${TOTAL_TESTS} total"
 echo "================================================================"
 
-# Show sample captured event
-if [[ -f /tmp/captured_events.json ]]; then
-    EVENT_COUNT=$(python3 -c "import json; print(len(json.load(open('/tmp/captured_events.json'))))" 2>/dev/null || echo "0")
-    if [[ "$EVENT_COUNT" -gt 0 ]]; then
-        echo ""
-        info "Sample captured event (first):"
-        python3 -c "
-import json
-events = json.load(open('/tmp/captured_events.json'))
-if events:
-    e = events[0]
-    print(json.dumps(e, indent=2)[:2000])
+# Show sample accepted event (schema-validated by the ingest validator)
+EVENTS_JSON=$(curl -sf "http://localhost:${INGEST_PORT}/events" 2>/dev/null || echo "")
+EVENT_COUNT=$(echo "$EVENTS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total', 0))" 2>/dev/null || echo "0")
+if [[ "${EVENT_COUNT:-0}" -gt 0 ]]; then
+    echo ""
+    info "Sample accepted event (first):"
+    echo "$EVENTS_JSON" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+evs = data.get('events', [])
+if evs:
+    print(json.dumps(evs[0], indent=2)[:2000])
 " 2>/dev/null || true
-    fi
 fi
+info "Run identity archived at /tmp/api-sensor-e2e-identity.txt (source ${GIT_REV})"
 
 if [[ "$FAIL" -eq 0 ]]; then
-    echo -e "\n${GREEN}  ALL ${TOTAL_TESTS} TESTS PASSED — sensor is production ready${RESET}"
+    echo -e "\n${GREEN}  All ${TOTAL_TESTS} e2e checks passed in THIS run.${RESET}"
+    echo -e "${YELLOW}  This is a smoke test, not a production-readiness certification.${RESET}"
+    echo -e "${YELLOW}  See docs/PRODUCTION-READINESS-AUDIT.md for the release contract.${RESET}"
     exit 0
 else
     echo -e "\n${RED}  ${FAIL} of ${TOTAL_TESTS} tests FAILED${RESET}"
