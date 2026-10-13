@@ -468,7 +468,7 @@ Environment: Windows 11 + Docker Desktop, build image `api-sensor-build:dev` (Ub
 
 | Command | Result |
 |---------|--------|
-| `cargo test --no-fail-fast` (Docker build image) | **494 passed, 0 failed, 0 ignored**: lib 215, bin 224, adversarial 27, delivery 2, enforcement 9, integration 9, memory_ceiling 1, producer_stats 3, schema_contract 4 |
+| `cargo test --no-fail-fast` (Docker build image) | **496 passed, 0 failed, 0 ignored**: lib 216, bin 225, adversarial 27, delivery 2, enforcement 9, integration 9, memory_ceiling 1, producer_stats 3, schema_contract 4 |
 | `export::tests` batch ceiling: overflow flushes first, exact fit after a flush, oversized dropped and counted, and no sent batch exceeds its budget over 500 mixed sizes | PASS |
 | `enforcement::an_export_byte_budget_too_small_for_one_event_is_rejected` | PASS |
 | `bash scripts/test-live-harness.sh`: relative `SENSOR_BIN`/`BPF_OBJ` resolve against the caller's directory, not `$WORK`; a missing file fails with status 2 | 5/5 PASS |
@@ -541,6 +541,49 @@ Events are counted per `rid` query value at the schema-validating validator.
 
 ---
 
+## Canary 1 — single sensor pod, aegis cluster (2026-10-13): HOLD at one pod
+
+**Build and rollout:** fine. **Delivery:** not stable. The ingest API (`aegis-sentinel-api`, one replica) answers after the sensor's 10 s request timeout.
+
+| Metric (over ~2 min) | Start | End | Change |
+|---|---|---|---|
+| `apisec_events_sent_total` | 87 | 105 | +18 |
+| `apisec_events_lost_send_total` | 49 | 64 | +15 |
+| `apisec_send_errors_total` | 23 | 30 | +7 |
+| `apisec_consecutive_send_failures` | 0 | 3 | — |
+| `apisec_seconds_since_last_send_ok` | 21 | 107 | — |
+| `apisec_export_queue_bytes` | 5,739,965 | 7,096,276 | +1.4 MB |
+| `apisec_export_queue_byte_drops_total` | 0 | 0 | — |
+
+`events_captured_total` counts raw BPF records, so it is not comparable with `sent`. The four marked demo requests (CANARYAPP-092053-1…4) were not found in `request_logs`.
+
+**Backend findings (ingest service, outside this repo):**
+- A 321-byte plain batch took 16.8 s. A 30-event gzip batch got no answer within 20 s, yet all 30 rows were committed later.
+- Postgres sessions were blocked on `UPDATE sensors SET lines_shipped…, last_heartbeat…`, waiting on `transactionid`. A request that times out leaves the transaction open, and the next batch for the same sensor row waits behind it. There was also a deadlock on `UPDATE api_endpoints SET last_seen…`, and some transactions ended in ROLLBACK.
+- `JWT decode error: Not enough segments` is logged once per request because the rate limiter parses the API key as a JWT. It is noise, not a 401.
+
+**Sensor-side consequences:**
+- `apisec_events_lost_send_total` means "not acknowledged within the timeout", not "never stored". During this canary the backend committed some of those batches. On retry the same event `Id`s are resent, so **without backend deduplication on `Id` a slow commit plus a retry stores duplicates.** This is point 1 of the ACK contract.
+- The sensor timeout is deliberately **not** raised. A longer timeout would hide the ingest latency and let more requests pile up on the locked row.
+
+**Fixed in the sensor:** `MetaDataMap.direction` was never set, so every stored row had an empty direction. Events now carry `incoming` (the observed process received the request) or `outgoing` (it sent it), and the field is omitted when the direction is unknown. Unanswered and shutdown events keep their direction. Tests: `output::tests::wire_event_carries_direction_only_when_known`, `stream::tests::source_is_the_client_whichever_side_captured_the_transaction`, `stream::tests::shutdown_reports_every_pending_request`. This needs a new image before it reaches the canary.
+
+**Backend changes needed before widening:**
+1. Do not hold the `sensors` row lock across the whole batch insert. Update the heartbeat and counters in a separate short transaction, or as an atomic increment after the commit.
+2. Write `api_endpoints.last_seen` in a stable key order, or as one upsert per batch, to remove the deadlock.
+3. Make the server abandon the transaction when the client disconnects or a server-side deadline passes, so a timed-out request cannot leave a transaction open.
+4. Deduplicate on event `Id` (ACK contract point 1).
+5. Skip JWT parsing for API-key requests in the rate limiter.
+6. Add a second API replica only after items 1–3; with a hot row lock, more replicas only add contention.
+
+**Exit criteria for widening past one pod** (all must hold on the canary):
+- Batches are accepted well inside the 10 s timeout. Watch `apisec_consecutive_send_failures` = 0 and `apisec_seconds_since_last_send_ok` staying low.
+- `apisec_export_queue_bytes` drains back to baseline.
+- `apisec_events_lost_send_total` stops increasing.
+- A marked demo request appears in `request_logs` with a non-empty direction.
+
+---
+
 ## ACK contract (proposal — needs backend sign-off before durable replay)
 
 Durable replay is **not implemented**. A disk spool replays the right thing only once the backend's answer per batch is defined. This is the current sensor behaviour (`ingest.rs`) and a proposed contract to agree first.
@@ -592,7 +635,7 @@ Do not claim "collects all traffic".
 
 ### Test totals (Docker build image, this session)
 
-- `cargo test --no-fail-fast`: 494 passed, 0 failed, 0 ignored. The suites are lib 215, bin 224, adversarial 27, delivery 2, enforcement 9, integration 9, memory_ceiling 1, producer_stats 3 and schema_contract 4.
+- `cargo test --no-fail-fast`: 496 passed, 0 failed, 0 ignored. The suites are lib 216, bin 225, adversarial 27, delivery 2, enforcement 9, integration 9, memory_ceiling 1, producer_stats 3 and schema_contract 4.
 - The BPF object compiles with `clang -O2 -g -Wall` and loads through the 6.6 verifier.
 
 ### VPS validation checklist (run as root on a Linux host)

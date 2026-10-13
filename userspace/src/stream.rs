@@ -916,6 +916,7 @@ impl StreamState {
             std::mem::swap(&mut ctx.source_ip, &mut ctx.dest_ip);
             std::mem::swap(&mut ctx.source_port, &mut ctx.dest_port);
         }
+        ctx.direction = Some(if ev.direction == 0 { "incoming" } else { "outgoing" });
         ctx.container = self.container_resolver.resolve(ev);
 
         // Process name from BPF comm field (with /proc fallback)
@@ -1610,6 +1611,7 @@ pub fn build_ws_event(
         session_id: None,
         auth_session_id: None,
         outcome: None,
+        direction: net_ctx.direction,
     }
 }
 
@@ -1705,6 +1707,7 @@ pub fn build_event(
         session_id: Some(identity.session_id),
         auth_session_id: Some(redact_pii(&identity.auth_session_id)),
         outcome: None,
+        direction: net_ctx.direction,
     }
 }
 
@@ -1808,6 +1811,8 @@ mod tests {
         let inbound = state.handle_event(&on(0x1, 1, server, client), b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
         assert!(state.handle_event(&on(0x2, 1, client, server), b"GET /out HTTP/1.1\r\nHost: s\r\n\r\n").is_empty());
         let outbound = state.handle_event(&on(0x2, 0, client, server), b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(inbound[0].direction, Some("incoming"), "the server side received the request");
+        assert_eq!(outbound[0].direction, Some("outgoing"), "the client side sent the request");
         for ev in [&inbound[0], &outbound[0]] {
             assert_eq!(ev.source_ip.as_deref(), Some("10.0.0.5"), "{}", ev.request.path);
             assert_eq!(ev.source_port, Some(51000), "{}", ev.request.path);
@@ -2638,6 +2643,7 @@ mod tests {
         let paths: Vec<&str> = out.iter().map(|e| e.request.path.as_str()).collect();
         assert_eq!(paths, vec!["/a", "/b"]);
         assert!(out.iter().all(|e| e.outcome.as_deref() == Some("sensor_shutdown")));
+        assert!(out.iter().all(|e| e.direction == Some("incoming")), "unanswered requests keep their direction");
     }
 
     #[test]

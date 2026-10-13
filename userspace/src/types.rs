@@ -243,6 +243,10 @@ pub struct ApiTrafficEvent {
     /// `capture_gap`. The response is then absent, never fabricated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
+    /// `incoming` when the observed process received the request (it is the server),
+    /// `outgoing` when it sent it. Absent when the request direction is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<&'static str>,
 }
 
 impl ApiTrafficEvent {
@@ -317,6 +321,7 @@ pub struct NetContext {
     pub process_name: Option<String>,
     pub source_hostname: Option<String>,
     pub dest_hostname: Option<String>,
+    pub direction: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

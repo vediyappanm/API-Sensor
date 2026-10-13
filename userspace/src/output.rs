@@ -247,6 +247,7 @@ fn event_to_value(ev: ApiTrafficEvent) -> Value {
     }
     meta.insert("transport".into(), json!(if ev.protocol == "HTTP/3" || ev.protocol == "QUIC" { "udp" } else { "tcp" }));
     if let Some(ref o) = ev.outcome { meta.insert("transaction_outcome".into(), json!(o)); }
+    if let Some(d) = ev.direction { meta.insert("direction".into(), json!(d)); }
     if let Some(ref p) = ev.process_name   { meta.insert("process_name".into(), json!(p)); }
     if let Some(ref sh) = ev.source_hostname { meta.insert("source_hostname".into(), json!(sh)); }
     if let Some(ref dh) = ev.dest_hostname   { meta.insert("dest_hostname".into(), json!(dh)); }
@@ -486,6 +487,15 @@ mod tests {
         assert_eq!(meta["mcp_tool_name"], "search");
         assert_eq!(meta["transport"], "tcp");
         assert_eq!(meta["transaction_outcome"], "timed_out");
+    }
+
+    #[test]
+    fn wire_event_carries_direction_only_when_known() {
+        let mut ev = ApiTrafficEvent::default();
+        ev.direction = Some("incoming");
+        assert_eq!(event_to_value(ev)["MetaDataMap"]["direction"], "incoming");
+        let unknown = event_to_value(ApiTrafficEvent::default());
+        assert!(unknown["MetaDataMap"].get("direction").is_none(), "an unknown direction is not invented");
     }
 
     #[test]
